@@ -70,13 +70,12 @@ curl -H 'X-Auth-Token: <local token>' http://127.0.0.1:8765/v1/peers
 | GET | `/v1/peers` | `X-Auth-Token` | 已知节点及在线状态 |
 | POST | `/v1/send` | `X-Auth-Token` | 发消息（点对点 / `"*"` 广播）；body 无需 Content-Type |
 | POST | `/v1/send-file` | `X-Auth-Token` | 传本地文件（`to` + `file_path`） |
-| POST | `/v1/ack-inbox` | `X-Auth-Token` | 确认已读的本机消息 |
-| POST | `/v1/send-file` | `X-Auth-Token` | 传本地文件（`to` + `file_path`） |
+| POST | `/v1/send-file-upload` | `X-Auth-Token` | 上传字节流发文件（`?to=` + 头 `X-File-Name`），供 `/web` 页面使用 |
 | POST | `/v1/ack-inbox` | `X-Auth-Token` | 确认已读的本机消息 |
 | GET/POST/DELETE | `/v1/agents` | `X-Auth-Token` | 注册/查看/注销本机 Agent（多 Agent，能力标签） |
 | GET | `/v1/fleet/agents` | `X-Auth-Token` | 全网 Agent 目录（节点间自动同步） |
 | GET | `/v1/history` | `X-Auth-Token` | 最近对话记录（环形缓冲） |
-| GET | `/web?token=…` | query token | **人工可看页面**：节点 / Agent / 对话历史 |
+| GET | `/web?token=…` | query token | **人工可看页面**：节点 / Agent / 对话历史（含发送消息与文件） |
 | WS | `/v1/ws?token=…&client=…` | query token | 订阅本机入站消息（`client` 即 agent_id，按 `to_agent` 定向投递）与 join/leave 事件 |
 | WS | `/peer/ws` | cluster token（握手） | 对等节点消息连接 |
 | WS | `/peer/file/ws` | cluster token（握手） | 对等节点文件传输连接 |

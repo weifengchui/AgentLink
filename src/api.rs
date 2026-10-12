@@ -77,6 +77,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/peers", get(peers))
         .route("/v1/send", post(send))
         .route("/v1/send-file", post(send_file))
+        .route("/v1/send-file-upload", post(send_file_upload))
         .route("/v1/ack-inbox", post(ack_inbox))
         .route(
             "/v1/agents",
@@ -249,6 +250,97 @@ async fn send_file(
         Ok(file_id) => (
             StatusCode::OK,
             Json(json!({ "ok": true, "file_id": file_id, "to": to })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
+    }
+}
+
+/// Browser-style file upload: raw bytes in the body, file name in `X-File-Name`.
+#[derive(Debug, Deserialize)]
+struct UploadParams {
+    to: String,
+    #[serde(default)]
+    to_agent: Option<String>,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+}
+
+async fn send_file_upload(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(params): Query<UploadParams>,
+    body: Bytes,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    if body.len() > state.config.files.max_file_size as usize {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "ok": false, "error": format!(
+                "file too large: {} bytes (limit {})", body.len(), state.config.files.max_file_size
+            ) })),
+        );
+    }
+    let to = match resolve_target(&state, &params.to) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+    if to == "*" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "cannot send a file to broadcast" })),
+        );
+    }
+    let _ = params.to_agent; // files are node-level delivery for now
+    let raw_name = headers
+        .get("x-file-name")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("upload.bin")
+        .to_string();
+    let Some(name) = crate::file::sanitize_name(&raw_name) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "unsafe file name" })),
+        );
+    };
+
+    let dir = state
+        .config
+        .data_dir
+        .join("uploads")
+        .join(&crate::proto::new_id()[..8]);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        );
+    }
+    // Keep the original name as the file's basename so the receiver stores it
+    // under the correct name (uniqueness comes from the directory).
+    let path = dir.join(&name);
+    if let Err(e) = tokio::fs::write(&path, body.as_ref()).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        );
+    }
+
+    let result = crate::file::send_transfer(&state, &to, &path, params.ttl_seconds).await;
+    let _ = tokio::fs::remove_file(&path).await;
+    let _ = tokio::fs::remove_dir(&dir).await;
+    match result {
+        Ok(file_id) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "file_id": file_id, "to": to, "file_name": name })),
         ),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -440,9 +532,28 @@ table{border-collapse:collapse;width:100%;font-size:12px}
 td,th{text-align:left;padding:4px 8px;border-bottom:1px solid #21262d;white-space:nowrap}
 .msg{border-left:3px solid #30363d;padding:6px 10px;margin:6px 0;font-size:12px;background:#0d1117;border-radius:0 6px 6px 0}
 .msg .meta{color:#8b949e;font-size:11px}.msg .pay{color:#79c0ff;word-break:break-all;white-space:pre-wrap}
+.row{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap}
+.row input,.row textarea,.row button{box-sizing:border-box}
+input,textarea,button{background:#0d1117;color:#d7dde6;border:1px solid #30363d;border-radius:6px;padding:6px 8px;font-size:12px;font-family:inherit}
+button{cursor:pointer;background:#1f6feb;border-color:#1f6feb;color:#fff}
+button:active{opacity:.8}
+.full{width:100%}
+label{font-size:11px;color:#8b949e}
 </style></head><body>
-<h1>AgentLink</h1><div class="sub">局域网 Agent 通信总线 · 人类可看视图 · 每 2 秒刷新</div>
+<h1>AgentLink</h1><div class="sub">局域网 Agent 通信总线 · 每 2 秒刷新</div>
 <div id="status" class="sub">加载中…</div>
+<div class="card"><h2>发送消息 / 文件</h2>
+<div class="row"><label>目标(to)</label><input id="to" list="peers-list" placeholder="node_id 或节点名；* = 广播">
+<datalist id="peers-list"></datalist>
+<label>Agent(to_agent)</label><input id="to_agent" placeholder="可选，如 reviewer"></div>
+<div class="row"><textarea id="payload" rows="2" class="full" placeholder='payload JSON，如 {"content":"你好"}'></textarea></div>
+<div class="row">
+<button onclick="doSend()">发送消息</button>
+<input type="file" id="file">
+<button onclick="doFile()">发送文件</button>
+</div>
+<div id="sendres" class="sub"></div>
+</div>
 <div class="card"><h2>节点 / Peers</h2><table id="peers"></table></div>
 <div class="card"><h2>Agent（全网）</h2><table id="agents"></table></div>
 <div class="card"><h2>对话记录（环形缓冲 __LEN__ 条）</h2><div id="history"></div></div>
@@ -452,12 +563,37 @@ const HDR={"X-Auth-Token":TOKEN};
 async function j(p){const r=await fetch(p,{headers:HDR});return r.json();}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(ts){try{return new Date(ts).toLocaleString();}catch{return ts;}}
+function input(id){return (document.getElementById(id).value||'').trim();}
+async function doSend(){
+ const to=input('to'); if(!to){alert('请填目标 to');return;}
+ const to_agent=input('to_agent')||undefined;
+ let raw=input('payload'), payload;
+ try{payload=raw?JSON.parse(raw):{};}catch{payload={content:raw};}
+ try{
+  const r=await fetch('/v1/send',{method:'POST',headers:HDR,body:JSON.stringify({to,to_agent,type:'text',action:'send',payload})});
+  document.getElementById('sendres').textContent=JSON.stringify(await r.json());
+ }catch(e){document.getElementById('sendres').textContent='发送失败: '+e;}
+}
+async function doFile(){
+ const f=document.getElementById('file').files[0]; if(!f){alert('请选择文件');return;}
+ const to=input('to'); if(!to){alert('请填目标 to');return;}
+ const q=new URLSearchParams({to});
+ if(input('to_agent'))q.set('to_agent',input('to_agent'));
+ try{
+  const r=await fetch('/v1/send-file-upload?'+q.toString(),{method:'POST',headers:{...HDR,'X-File-Name':f.name},body:f});
+  document.getElementById('sendres').textContent=JSON.stringify(await r.json());
+ }catch(e){document.getElementById('sendres').textContent='发送失败: '+e;}
+}
 async function refresh(){
  try{
   const [st,peers,agents,hist]=await Promise.all([j('/v1/status'),j('/v1/peers'),j('/v1/fleet/agents'),j('/v1/history')]);
   let pe='<tr><th>名称</th><th>node_id</th><th>地址</th><th>标签tags</th><th>状态</th></tr>';
   if(peers&&peers.ok)for(const p of peers.peers)pe+=`<tr><td>${esc(p.name)}</td><td>${esc(p.node_id)}</td><td>${esc(p.addr)}</td><td>${esc((p.tags||[]).join(', '))}</td><td><span class="badge ${p.online?'on':'off'}">${p.online?'在线':'离线'}</span></td></tr>`;
   document.getElementById('peers').innerHTML=pe;
+  let dl='';
+  if(peers&&peers.ok)for(const p of peers.peers)dl+=`<option value="${esc(p.node_id)}">${esc(p.name)}</option>`;
+  if(agents&&agents.ok)for(const a of agents.agents)dl+=`<option value="${esc(a.node_id)}">${esc(a.node_name)} / agent ${esc(a.agent_id)}</option>`;
+  const dlEl=document.getElementById('peers-list'); if(dlEl)dlEl.innerHTML=dl;
   let ag='<tr><th>node</th><th>agent_id</th><th>名字</th><th>能力</th><th>状态</th></tr>';
   if(agents&&agents.ok)for(const a of agents.agents)ag+=`<tr><td>${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td>${esc(a.name)}</td><td>${esc((a.capabilities||[]).join(', '))}</td><td><span class="badge ${a.online?'on':'off'}">${a.online?'在线':'离线'}</span></td></tr>`;
   document.getElementById('agents').innerHTML=ag;

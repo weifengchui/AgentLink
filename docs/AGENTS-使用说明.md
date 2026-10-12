@@ -35,7 +35,8 @@
 | GET | `/v1/status` | 节点状态与指标 |
 | GET | `/v1/peers` | 已知节点（含在线状态） |
 | POST | `/v1/send` | 发消息（点对点 / 广播） |
-| POST | `/v1/send-file` | 发文件 |
+| POST | `/v1/send-file` | 发文件（传本机路径） |
+| POST | `/v1/send-file-upload` | 发文件（**上传字节流**，浏览器/脚本用；`?to=` + 头 `X-File-Name`） |
 | POST | `/v1/ack-inbox` | 确认本机已消费某条消息（可选） |
 | GET/POST/DELETE | `/v1/agents` | 注册 / 查看 / 注销**本机 Agent**（`agent_id`、名字、能力标签） |
 | GET | `/v1/fleet/agents` | 全网 Agent 目录（本机 + 各在线节点同步的） |
@@ -157,6 +158,18 @@ DELETE /v1/agents  { "agent_id": "reviewer" }
 - 对端落盘位置：对方配置的 `files.recv_dir`（默认 `<运行目录>/data/files`），文件名做了净化、大小受 `max_file_size` 限制（默认 100MB）。
 - 进度：轮询 `/v1/status` 的 `active_transfers`（0 = 无进行中）。
 - **注意**：文件完成不会推送到你的 WS。接收方 Agent 需要（自己决定）轮询 `data/files` 或让发送方回一条确认消息。
+
+### 没有本机文件路径时（浏览器/远端脚本）：上传字节流
+
+```jsonc
+POST /v1/send-file-upload?to=<node_id|name>&to_agent=<可选>&ttl_seconds=<可选>
+Headers: X-Auth-Token: <local_api.token>
+         X-File-Name: report.pdf          // 原始文件名（会做净化）
+Body: <文件原始字节>                        // 不是 JSON，直接二进制
+// → { "ok": true, "file_id": "...", "to": "0caf...", "file_name": "report.pdf" }
+```
+
+接口会先把字节写到本机临时目录、传输完成后自动清理；接收方仍按原文件名落在 `files.recv_dir`。
 
 ## 8. 状态与节点：GET /v1/status、GET /v1/peers
 

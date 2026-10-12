@@ -122,6 +122,31 @@ pub async fn send_file(
     Ok(file_id)
 }
 
+/// Send a file and await completion (used by the web upload endpoint so the
+/// temporary upload can be removed once the transfer finished).
+pub async fn send_transfer(
+    state: &SharedState,
+    to: &str,
+    path: &Path,
+    ttl_seconds: Option<u64>,
+) -> anyhow::Result<String> {
+    let addr = state
+        .router
+        .peer_addr(to)
+        .ok_or_else(|| anyhow::anyhow!("peer '{to}' is not online"))?;
+    if !path.is_file() {
+        return Err(anyhow::anyhow!("file not found: {}", path.display()));
+    }
+    let file_id = crate::proto::new_id();
+    state.files.begin();
+    let result = run_sender(state, &addr, to, path, &file_id, ttl_seconds).await;
+    state.files.end();
+    result.map(|saved| {
+        tracing::info!(file_id = %file_id, peer = %to, saved = %saved, "file: transfer complete");
+        file_id
+    })
+}
+
 /// Inbound entry point for `/peer/file/ws`.
 pub async fn handle_inbound(socket: WebSocket, state: SharedState, remote: std::net::SocketAddr) {
     let (out_tx, in_rx) = conn::spawn_axum_bridge(socket);
@@ -634,7 +659,7 @@ async fn hash_file(path: &Path) -> anyhow::Result<(u64, String)> {
 
 /// Take a file name from any path-ish input, strip separators and drop
 /// directory traversal / absolute paths.
-fn sanitize_name(raw: &str) -> Option<String> {
+pub fn sanitize_name(raw: &str) -> Option<String> {
     let normalized = raw.replace('\\', "/");
     let base = Path::new(&normalized).file_name()?.to_str()?;
     let cleaned: String = base
