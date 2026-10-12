@@ -85,6 +85,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/fleet/agents", get(fleet_agents))
         .route("/v1/history", get(history_get))
         .route("/web", get(web_page))
+        .route("/v1/web", get(web_page))
         .route("/v1/ws", get(subscribe_ws))
         .route("/peer/ws", get(peer_ws))
         .route("/peer/file/ws", get(file_ws))
