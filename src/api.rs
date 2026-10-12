@@ -140,6 +140,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/config", get(config_get).put(config_put))
         .route("/web", get(web_page))
         .route("/v1/web", get(web_page))
+        .route("/web/setup", get(web_setup))
         .route("/v1/ws", get(subscribe_ws))
         .route("/peer/ws", get(peer_ws))
         .route("/peer/file/ws", get(file_ws))
@@ -714,6 +715,27 @@ async fn config_put(
     )
 }
 
+/// Auto-provision the local API token for the browser, but ONLY for requests
+/// coming from the loopback interface (the same machine). Remote clients get
+/// 403, so a LAN visitor cannot read it.
+async fn web_setup(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<SharedState>,
+) -> Response {
+    if !addr.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "remote address; token is not exposed" })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "token": state.config.local_api.token })),
+    )
+        .into_response()
+}
+
 /// Human-friendly dashboard page (no assets; token is entered in-session and
 /// sent via `X-Auth-Token` header, never in the URL).
 async fn web_page(State(state): State<SharedState>) -> Response {
@@ -870,8 +892,19 @@ let TOKEN=sessionStorage.getItem(LS_KEY)||'';
 const HDR=()=>({'X-Auth-Token':TOKEN});
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(ts){try{return new Date(ts).toLocaleString();}catch{return ts;}}
-function saveToken(){TOKEN=$('token-input').value.trim();sessionStorage.setItem(LS_KEY,TOKEN);$('modal').classList.add('hidden');$('app').classList.remove('hidden');refresh();}
-(function(){ if(TOKEN){$('modal').classList.add('hidden');$('app').classList.remove('hidden');} })();
+function saveToken(){TOKEN=$('token-input').value.trim();sessionStorage.setItem(LS_KEY,TOKEN);enter();}
+function enter(){$('modal').classList.add('hidden');$('app').classList.remove('hidden');refresh();loadConfig();}
+async function boot(){
+ // 自动取本机 token（仅 127.0.0.1 可成功）；失败则退回手动输入
+ try{
+  const r=await fetch('/web/setup');
+  const d=await r.json();
+  if(d&&d.ok){TOKEN=d.token;sessionStorage.setItem(LS_KEY,TOKEN);enter();return;}
+ }catch(e){}
+ if(TOKEN){enter();return;}
+ $('modal').classList.remove('hidden');
+}
+boot();
 async function j(p,opt){const o=opt||{};const r=await fetch(p,{...o,headers:{...HDR(),...(o.headers||{})}});const d=await r.json().catch(()=>({}));if(r.status===401){alert('token 无效，请重新输入');sessionStorage.removeItem(LS_KEY);location.reload();throw new Error('401');}return d;}
 function show(panel){document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.p===panel));document.querySelectorAll('.content>section').forEach(s=>s.classList.add('hidden'));$('p-'+panel).classList.remove('hidden');}
 function input(id){return ($(id)&&$(id).value||'').trim();}
@@ -929,8 +962,6 @@ async function saveConfig(){
   max_file_size:(parseInt($('cf-fmax').value)||100)*1048576,static_peers:peers,auto_open_web:$('cf-open').checked};
  try{const d=await j('/v1/config',{method:'PUT',body:JSON.stringify(body)});$('cf-res').textContent=JSON.stringify(d);refresh();}catch(e){}
 }
-(function(){ if(TOKEN){refresh();loadConfig();} })();
-$('auto-refresh').addEventListener('change',e=>{if(!e.target.checked)return;refresh();});
 setInterval(()=>{if($('auto-refresh').checked)refresh();},2000);
 </script></body></html>"#;
     HTML.replace("__LEN__", &history_len.to_string())
