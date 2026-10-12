@@ -52,7 +52,30 @@ enum Command {
         /// Display name for this node (defaults to `agent-<hostname>`).
         #[arg(long)]
         name: Option<String>,
+        /// Set the cluster token directly (instead of generating a random one).
+        #[arg(long)]
+        cluster_token: Option<String>,
+        /// Trust the LAN without a shared token (`security.mode = "open"`).
+        #[arg(long)]
+        open: bool,
     },
+    /// One-command pairing: create a config and adopt `TOKEN` from the
+    /// main machine (replaces manually editing agentlink.json).
+    Join {
+        /// The cluster token printed by `agentlink token` on the main machine.
+        token: String,
+        /// Display name for this node.
+        #[arg(long)]
+        name: Option<String>,
+        /// Trust the LAN without a shared token.
+        #[arg(long)]
+        open: bool,
+        /// Overwrite an existing configuration file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print this node's cluster token (for pairing other machines).
+    Token,
     /// Run the node (default command).
     Run {
         /// Create `agentlink.json` with defaults if it does not exist yet.
@@ -69,7 +92,7 @@ enum Command {
 fn load_config(path: &Path, create_if_missing: bool) -> Result<Config> {
     if !path.exists() {
         if create_if_missing {
-            let cfg = Config::generate(None);
+            let cfg = Config::generate(None, None, None);
             cfg.save(path)
                 .with_context(|| format!("failed to write config to {}", path.display()))?;
             println!("created new config: {}", path.display());
@@ -96,21 +119,62 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Init { force, name }) => {
+        Some(Command::Init {
+            force,
+            name,
+            cluster_token,
+            open,
+        }) => {
             if cli.config.exists() && !force {
                 bail!(
                     "config already exists: {} (use --force to overwrite)",
                     cli.config.display()
                 );
             }
-            let cfg = Config::generate(name);
+            let mode = open.then(|| "open".to_string());
+            let cfg = Config::generate(name, cluster_token, mode);
             cfg.save(&cli.config)?;
             println!("created config: {}", cli.config.display());
             println!("  node_id: {}", cfg.node_id);
             println!("  name:    {}", cfg.name);
             println!("  token:   {} (local API)", cfg.local_api.token);
-            println!("  cluster: {} (network)", cfg.security.cluster_token);
-            println!("\nedit the file to set a shared cluster_token across machines.");
+            println!(
+                "  cluster: {} ({})",
+                cfg.security.cluster_token, cfg.security.mode
+            );
+            if cfg.security.mode == "strict" {
+                println!(
+                    "\n其他机器上运行: agentlink join {}  (自动配对)",
+                    cfg.security.cluster_token
+                );
+            }
+            Ok(())
+        }
+
+        Some(Command::Join {
+            token,
+            name,
+            open,
+            force,
+        }) => {
+            if cli.config.exists() && !force {
+                bail!(
+                    "config already exists: {} (use --force to overwrite)",
+                    cli.config.display()
+                );
+            }
+            let mode = open.then(|| "open".to_string());
+            let cfg = Config::generate(name, Some(token), mode);
+            cfg.save(&cli.config)?;
+            println!("paired: {} ({})", cfg.name, cfg.node_id);
+            println!("  cluster_token set ({} mode)", cfg.security.mode);
+            println!("\nrun `agentlink run` to start");
+            Ok(())
+        }
+
+        Some(Command::Token) => {
+            let cfg = load_config(&cli.config, false)?;
+            println!("{}", cfg.security.cluster_token);
             Ok(())
         }
 
@@ -124,7 +188,7 @@ async fn main() -> Result<()> {
             for p in &cfg.discovery.static_peers {
                 println!("  {p}");
             }
-            println!("(live discovery lands in M1)");
+            println!("(nodes are discovered automatically over UDP broadcast)");
             Ok(())
         }
 

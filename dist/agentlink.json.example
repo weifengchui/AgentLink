@@ -1,0 +1,41 @@
+{
+  "v": 1,
+  "node_id": "请用手动 init 生成（见使用说明）",
+  "name": "agent-LAN-TEST",
+  "listen_port": 8765,
+  "data_dir": "./data",
+  "discovery": {
+    "enabled": true,
+    "methods": ["udp_broadcast"],
+    "broadcast_port": 8766,
+    "announce_interval_seconds": 5,
+    "heartbeat_interval_seconds": 10,
+    "offline_timeout_seconds": 30,
+    "static_peers": []
+  },
+  "security": {
+    "mode": "strict",
+    "cluster_token": "CHANGE-ME-改成与主机一致的token"
+  },
+  "local_api": {
+    "host": "0.0.0.0",
+    "token": "随机生成"
+  },
+  "files": {
+    "max_file_size": 104857600,
+    "chunk_size": 65536,
+    "recv_dir": "./data/files",
+    "max_concurrent": 1
+  },
+  "delivery": {
+    "ack_timeout_seconds": 5,
+    "max_retries": 5,
+    "offline_ttl_seconds": 300,
+    "dedup_cache_size": 2048
+  },
+  "log": {
+    "level": "info",
+    "format": "text",
+    "file": ""
+  }
+}

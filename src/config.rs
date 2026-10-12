@@ -251,7 +251,11 @@ impl Default for LogConfig {
 
 impl Config {
     /// Build a brand new configuration with a fresh identity and tokens.
-    pub fn generate(name: Option<String>) -> Self {
+    pub fn generate(
+        name: Option<String>,
+        cluster_token: Option<String>,
+        mode: Option<String>,
+    ) -> Self {
         Config {
             v: CURRENT_CONFIG_VERSION,
             node_id: new_short_id(),
@@ -268,8 +272,8 @@ impl Config {
                 static_peers: Vec::new(),
             },
             security: SecurityConfig {
-                mode: default_security_mode(),
-                cluster_token: new_secret(),
+                mode: mode.unwrap_or_else(default_security_mode),
+                cluster_token: cluster_token.unwrap_or_else(new_secret),
             },
             local_api: LocalApiConfig {
                 host: default_local_host(),
@@ -345,9 +349,19 @@ pub fn new_short_id() -> String {
     id[..12].to_string()
 }
 
-/// A 32 hex character random secret, used for tokens.
+/// A human-friendly secret for tokens: `xxxx-xxxx-xxxx-xxxx`, avoiding
+/// confusing characters, so it is easy to copy between machines.
 pub fn new_secret() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
+    const CHARS: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+    let bytes = uuid::Uuid::new_v4().as_bytes().to_vec();
+    let mut s = String::with_capacity(19);
+    for (i, b) in bytes.iter().take(16).enumerate() {
+        if i % 4 == 0 && i > 0 {
+            s.push('-');
+        }
+        s.push(CHARS[(b % (CHARS.len() as u8)) as usize] as char);
+    }
+    s
 }
 
 fn default_node_name() -> String {

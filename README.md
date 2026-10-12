@@ -39,10 +39,18 @@ cargo build --release --features mdns
 ## 使用
 
 ```bash
-# 1) 首次创建配置（生成随机 node_id 与 token）
+# 1) 主机：创建配置（自动生成随机 node_id 与 cluster_token）
 agentlink init --name agent-PC-A
+#    init 会直接提示：其他机器运行 agentlink join <token> 一键配对
 
-# 2) 把各机器的 security.cluster_token 改成同一个值（局域网共享密钥）
+# 2) 其他机器：自动配对（无需手改 agentlink.json）
+agentlink join <token> --name agent-PC-B
+
+# 免密快速测试（局域网互信，跳过 token 校验）
+agentlink init --open        # 或 agentlink join <token> --open
+
+# 查看本机 cluster_token
+agentlink token
 
 # 3) 运行
 agentlink run
