@@ -12,6 +12,7 @@
 | `agentlink-linux` | Linux x64 可执行文件 |
 | `启动.bat` | Windows 一键启动 / 自动配对脚本 |
 | `AGENTS-使用说明.md` | **给 AI Agent 的接口契约**（接入前必读） |
+| `SKILL.md` | Agent 注册与双向通信的 **Skill 定义**（`agentlink-agent-registration`，给 AI Agent 消费） |
 | `agentlink.json.example` | 配置示例（一般用 `init` / `join` 自动生成，无需手建） |
 
 ## 快速开始（Windows）
