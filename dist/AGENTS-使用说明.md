@@ -40,8 +40,6 @@
 | POST | `/v1/ack-inbox` | 确认本机已消费某条消息（可选） |
 | GET/POST/DELETE | `/v1/agents` | 注册 / 查看 / 注销**本机 Agent**（`agent_id`、名字、能力标签） |
 | GET | `/v1/fleet/agents` | 全网 Agent 目录（本机 + 各在线节点同步的） |
-| GET | `/v1/files/:name` | 下载本机收到的文件（须 token） |
-| POST | `/v1/open-folder` | 在系统文件管理器中打开文件所在目录（仅本机 loopback + token） |
 | GET | `/v1/history` | 最近对话记录（环形缓冲，供人工查看） |
 | GET/PUT | `/v1/config` | 查看 / 修改配置文件（敏感字段掩码；名称与标签即时生效，其余重启生效） |
 | GET | `/web` | **人工可看页面**：总览 / 节点 / Agent / 对话 / 发送 / 配置。打开后输入 `local_api.token`（存在浏览器会话里，**不进 URL**） |
