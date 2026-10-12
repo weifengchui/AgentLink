@@ -74,8 +74,9 @@ curl -H 'X-Auth-Token: <local token>' http://127.0.0.1:8765/v1/peers
 | POST | `/v1/ack-inbox` | `X-Auth-Token` | 确认已读的本机消息 |
 | GET/POST/DELETE | `/v1/agents` | `X-Auth-Token` | 注册/查看/注销本机 Agent（多 Agent，能力标签） |
 | GET | `/v1/fleet/agents` | `X-Auth-Token` | 全网 Agent 目录（节点间自动同步） |
+| GET/PUT | `/v1/config` | `X-Auth-Token` | 查看/修改配置（掩码显示；名称/标签即时生效） |
 | GET | `/v1/history` | `X-Auth-Token` | 最近对话记录（环形缓冲） |
-| GET | `/web?token=…` | query token | **人工可看页面**：节点 / Agent / 对话历史（含发送消息与文件） |
+| GET | `/web` | 无（token 页内输入） | **人工可看页面**（V1 风格）：总览/节点/Agent/对话/发送/配置；token 只存会话不进 URL |
 | WS | `/v1/ws?token=…&client=…` | query token | 订阅本机入站消息（`client` 即 agent_id，按 `to_agent` 定向投递）与 join/leave 事件 |
 | WS | `/peer/ws` | cluster token（握手） | 对等节点消息连接 |
 | WS | `/peer/file/ws` | cluster token（握手） | 对等节点文件传输连接 |

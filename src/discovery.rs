@@ -30,18 +30,18 @@ pub async fn run(cfg: Config, state: SharedState, mut shutdown: watch::Receiver<
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     let mut buf = vec![0u8; 4096];
 
-    send(&socket, &cfg, "announce").await;
+    send(&socket, &state, "announce").await;
     tracing::info!(port, "discovery: listening via UDP broadcast");
 
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
-                send(&socket, &cfg, "bye").await;
+                send(&socket, &state, "bye").await;
                 tracing::info!("discovery: announced bye");
                 break;
             }
             _ = ticker.tick() => {
-                send(&socket, &cfg, "announce").await;
+                send(&socket, &state, "announce").await;
             }
             res = socket.recv_from(&mut buf) => {
                 match res {
@@ -66,8 +66,15 @@ fn make_socket(port: u16) -> anyhow::Result<UdpSocket> {
     Ok(UdpSocket::from_std(std_socket)?)
 }
 
-async fn send(socket: &UdpSocket, cfg: &Config, action: &str) {
-    let msg = DiscoveryMessage::new(action, &cfg.node_id, &cfg.name, cfg.listen_port, &cfg.tags);
+async fn send(socket: &UdpSocket, state: &SharedState, action: &str) {
+    let cfg = &state.config;
+    let msg = DiscoveryMessage::new(
+        action,
+        &cfg.node_id,
+        &state.display_name(),
+        cfg.listen_port,
+        &state.tags(),
+    );
     let data = match serde_json::to_vec(&msg) {
         Ok(d) => d,
         Err(e) => {

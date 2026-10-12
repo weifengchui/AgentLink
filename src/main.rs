@@ -88,6 +88,18 @@ enum Command {
     Version,
 }
 
+/// Open a URL in the OS default browser (best effort).
+fn open_web_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+}
+
 /// Load configuration, optionally creating it on first run.
 fn load_config(path: &Path, create_if_missing: bool) -> Result<Config> {
     if !path.exists() {
@@ -201,19 +213,21 @@ async fn main() -> Result<()> {
             let cfg = load_config(&cli.config, create_if_missing)?;
             logging::init(&cfg.log);
             ensure_dirs(&cfg)?;
-            run(cfg).await
+            let cfg_path = cli.config.clone();
+            run(cfg, cfg_path).await
         }
 
         None => {
             let cfg = load_config(&cli.config, false)?;
             logging::init(&cfg.log);
             ensure_dirs(&cfg)?;
-            run(cfg).await
+            let cfg_path = cli.config.clone();
+            run(cfg, cfg_path).await
         }
     }
 }
 
-async fn run(cfg: Config) -> Result<()> {
+async fn run(cfg: Config, config_file: PathBuf) -> Result<()> {
     let bind = format!("{}:{}", cfg.local_api.host, cfg.listen_port);
 
     let (peer_tx, peer_rx) = tokio::sync::mpsc::channel(256);
@@ -222,6 +236,7 @@ async fn run(cfg: Config) -> Result<()> {
     let files = Arc::new(file::FileManager::new());
     let state = Arc::new(AppState::new(
         cfg.clone(),
+        config_file,
         peers,
         peer_tx,
         router.clone(),
@@ -292,6 +307,12 @@ async fn run(cfg: Config) -> Result<()> {
         "agentlink node started"
     );
     tracing::info!("local API: http://127.0.0.1:{}/v1/health", cfg.listen_port);
+
+    if cfg.web.auto_open {
+        let url = format!("http://127.0.0.1:{}/web", cfg.listen_port);
+        tracing::info!(url, "opening web page in default browser");
+        open_web_browser(&url);
+    }
 
     axum::serve(
         listener,

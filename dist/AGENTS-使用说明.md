@@ -41,7 +41,8 @@
 | GET/POST/DELETE | `/v1/agents` | 注册 / 查看 / 注销**本机 Agent**（`agent_id`、名字、能力标签） |
 | GET | `/v1/fleet/agents` | 全网 Agent 目录（本机 + 各在线节点同步的） |
 | GET | `/v1/history` | 最近对话记录（环形缓冲，供人工查看） |
-| GET | `/web?token=` | **人工可看页面**：节点 / Agent / 对话历史，每 2 秒刷新 |
+| GET/PUT | `/v1/config` | 查看 / 修改配置文件（敏感字段掩码；名称与标签即时生效，其余重启生效） |
+| GET | `/web` | **人工可看页面**：总览 / 节点 / Agent / 对话 / 发送 / 配置。打开后输入 `local_api.token`（存在浏览器会话里，**不进 URL**） |
 | WS | `/v1/ws?token=&client=` | **订阅入站消息与节点事件（最重要）**；`client` 即你的 `agent_id`，节点按 `to_agent` 定向投递 |
 
 > 请求体是 JSON；`Content-Type` 不是必须的（缺省也能解析）。所有响应也是 JSON。

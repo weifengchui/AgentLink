@@ -26,6 +26,8 @@ pub struct Config {
     pub tags: Vec<String>,
     #[serde(default)]
     pub history: HistoryConfig,
+    #[serde(default)]
+    pub web: WebConfig,
 
     #[serde(default)]
     pub discovery: DiscoveryConfig,
@@ -127,6 +129,14 @@ pub struct HistoryConfig {
     pub file: String,
 }
 
+/// Web UI / browser behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebConfig {
+    /// Open the human-facing page in the default browser on startup.
+    #[serde(default = "default_true")]
+    pub auto_open: bool,
+}
+
 // ---- defaults ---------------------------------------------------------------
 
 fn default_version() -> u32 {
@@ -209,6 +219,14 @@ impl Default for HistoryConfig {
             enabled: true,
             len: default_history_len(),
             file: String::new(),
+        }
+    }
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        WebConfig {
+            auto_open: default_true(),
         }
     }
 }
@@ -296,6 +314,7 @@ impl Config {
             data_dir: default_data_dir(),
             tags: Vec::new(),
             history: HistoryConfig::default(),
+            web: WebConfig::default(),
             discovery: DiscoveryConfig {
                 enabled: true,
                 methods: default_discovery_methods(),
@@ -399,6 +418,10 @@ pub fn new_secret() -> String {
 }
 
 fn default_node_name() -> String {
+    // 节点名默认用本机局域网 IPv4，直观可辨；也可手动改 name。
+    if let Ok(ip) = local_ip_address::local_ip() {
+        return ip.to_string();
+    }
     let host = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "host".to_string());

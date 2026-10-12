@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -31,9 +31,18 @@ use crate::router::Router;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Live-adjustable identity fields (name / tags), synced without restart.
+#[derive(Debug, Clone)]
+pub struct Runtime {
+    pub name: String,
+    pub tags: Vec<String>,
+}
+
 /// Shared state for the running node.
 pub struct AppState {
     pub config: Config,
+    /// Path of the on-disk config file (for `PUT /v1/config` persistence).
+    pub config_file: PathBuf,
     pub started_at: Instant,
     pub peers: PeerTable,
     /// Discovery -> connection manager channel.
@@ -42,28 +51,71 @@ pub struct AppState {
     pub router: Arc<Router>,
     /// File transfer counter.
     pub files: Arc<FileManager>,
+    /// Live identity (node name / tags), editable from the web UI.
+    pub runtime: std::sync::RwLock<Runtime>,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
+        config_file: PathBuf,
         peers: PeerTable,
         peer_tx: mpsc::Sender<DiscoveredPeer>,
         router: Arc<Router>,
         files: Arc<FileManager>,
     ) -> Self {
+        let runtime = Runtime {
+            name: config.name.clone(),
+            tags: config.tags.clone(),
+        };
         AppState {
             config,
+            config_file,
             started_at: Instant::now(),
             peers,
             peer_tx,
             router,
             files,
+            runtime: std::sync::RwLock::new(runtime),
         }
     }
 
     pub fn uptime_seconds(&self) -> u64 {
         self.started_at.elapsed().as_secs()
+    }
+
+    /// Current live node name.
+    pub fn display_name(&self) -> String {
+        self.runtime.read().unwrap().name.clone()
+    }
+
+    /// Current live tags (machine capability labels).
+    pub fn tags(&self) -> Vec<String> {
+        self.runtime.read().unwrap().tags.clone()
+    }
+
+    /// Update live identity and persist `name`/`tags` into the config file.
+    pub fn set_identity(
+        &self,
+        name: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut rt = self.runtime.write().unwrap();
+            if let Some(n) = name {
+                rt.name = n;
+            }
+            if let Some(t) = tags {
+                rt.tags = t;
+            }
+        }
+        // Persist into the on-disk config so it survives restarts.
+        let mut cfg = self.config.clone();
+        cfg.name = self.display_name();
+        cfg.tags = self.tags();
+        cfg.save(&self.config_file)?;
+        Ok(())
     }
 }
 
@@ -85,6 +137,7 @@ pub fn router(state: SharedState) -> AxRouter {
         )
         .route("/v1/fleet/agents", get(fleet_agents))
         .route("/v1/history", get(history_get))
+        .route("/v1/config", get(config_get).put(config_put))
         .route("/web", get(web_page))
         .route("/v1/web", get(web_page))
         .route("/v1/ws", get(subscribe_ws))
@@ -99,7 +152,8 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
         "ok": true,
         "version": VERSION,
         "node_id": state.config.node_id,
-        "name": state.config.name,
+        "name": state.display_name(),
+        "tags": state.tags(),
         "uptime_seconds": state.uptime_seconds(),
     }))
 }
@@ -120,7 +174,7 @@ async fn status(State(state): State<SharedState>, headers: HeaderMap) -> impl In
             "ok": true,
             "version": VERSION,
             "node_id": state.config.node_id,
-            "name": state.config.name,
+            "name": state.display_name(),
             "listen_port": state.config.listen_port,
             "uptime_seconds": state.uptime_seconds(),
             "peers_known": peers.len(),
@@ -500,115 +554,387 @@ async fn history_get(State(state): State<SharedState>, headers: HeaderMap) -> im
     )
 }
 
-/// Human-friendly dashboard page (no assets, reads /v1/* via JS).
-async fn web_page(Query(params): Query<SubParams>, State(state): State<SharedState>) -> Response {
-    let expected = state.config.local_api.token.as_bytes();
-    if !constant_time_eq(params.token.as_bytes(), expected) {
+// ---- config view / edit (web 配置页) ---------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ConfigUpdateRequest {
+    name: Option<String>,
+    tags: Option<Vec<String>>,
+    log_level: Option<String>,
+    history_len: Option<usize>,
+    max_file_size: Option<u64>,
+    static_peers: Option<Vec<String>>,
+    cluster_token: Option<String>,
+    auto_open_web: Option<bool>,
+}
+
+/// Mask secrets so the config view never leaks full tokens.
+fn mask_secret(s: &str) -> String {
+    if s.len() <= 8 {
+        "****".to_string()
+    } else {
+        format!("{}…{}", &s[..4], &s[s.len() - 2..])
+    }
+}
+
+/// Read the effective configuration (secrets masked).
+async fn config_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let c = &state.config;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "config": {
+                "name": state.display_name(),
+                "tags": state.tags(),
+                "node_id": c.node_id,
+                "listen_port": c.listen_port,
+                "data_dir": c.data_dir,
+                "discovery": {
+                    "enabled": c.discovery.enabled,
+                    "methods": c.discovery.methods,
+                    "broadcast_port": c.discovery.broadcast_port,
+                    "announce_interval_seconds": c.discovery.announce_interval_seconds,
+                    "heartbeat_interval_seconds": c.discovery.heartbeat_interval_seconds,
+                    "offline_timeout_seconds": c.discovery.offline_timeout_seconds,
+                    "static_peers": c.discovery.static_peers,
+                },
+                "security": {
+                    "mode": c.security.mode,
+                    "cluster_token": mask_secret(&c.security.cluster_token),
+                },
+                "local_api": {
+                    "host": c.local_api.host,
+                    "token": mask_secret(&c.local_api.token),
+                },
+                "files": {
+                    "max_file_size": c.files.max_file_size,
+                    "chunk_size": c.files.chunk_size,
+                    "recv_dir": c.files.recv_dir,
+                    "max_concurrent": c.files.max_concurrent,
+                },
+                "log": { "level": c.log.level, "format": c.log.format, "file": c.log.file },
+                "history": { "enabled": c.history.enabled, "len": c.history.len },
+                "web": { "auto_open": c.web.auto_open },
+            }
+        })),
+    )
+}
+
+/// Update configuration. `name`/`tags` apply live; most other fields persist to
+/// the config file and take effect after a node restart.
+async fn config_put(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    JsonAny(req): JsonAny<ConfigUpdateRequest>,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let name = req
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    if let Some(n) = &name {
+        if n.len() > 64 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "name too long (max 64)" })),
+            );
+        }
+    }
+    if let Err(e) = state.set_identity(name.clone(), req.tags.clone()) {
         return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "bad token" })),
-        )
-            .into_response();
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        );
+    }
+
+    // Reload the file (already contains updated name/tags) and merge the rest.
+    let mut cfg = match Config::load(&state.config_file) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": e.to_string() })),
+            );
+        }
+    };
+    if let Some(l) = &req.log_level {
+        if !matches!(l.as_str(), "debug" | "info" | "warn" | "error") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "log_level must be debug|info|warn|error" })),
+            );
+        }
+        cfg.log.level = l.clone();
+    }
+    if let Some(h) = req.history_len {
+        cfg.history.len = h.max(1);
+    }
+    if let Some(m) = req.max_file_size {
+        cfg.files.max_file_size = m.max(1);
+    }
+    if let Some(sp) = req.static_peers {
+        cfg.discovery.static_peers = sp;
+    }
+    if let Some(t) = req.cluster_token {
+        let t = t.trim().to_string();
+        if !t.is_empty() && t != cfg.security.cluster_token {
+            cfg.security.cluster_token = t;
+        }
+    }
+    if let Some(a) = req.auto_open_web {
+        cfg.web.auto_open = a;
+    }
+    if let Err(e) = cfg.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        );
+    }
+    if let Err(e) = cfg.save(&state.config_file) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        );
     }
     (
         StatusCode::OK,
-        Html(web_html(&params.token, state.config.history.len)),
+        Json(json!({
+            "ok": true,
+            "config": "saved",
+            "restart_hint": "端口/广播端口/安全模式/日志格式/历史条数/最大文件/static_peers 保存后重启生效；名称与标签已即时生效",
+        })),
     )
-        .into_response()
 }
 
-fn web_html(token: &str, history_len: usize) -> String {
+/// Human-friendly dashboard page (no assets; token is entered in-session and
+/// sent via `X-Auth-Token` header, never in the URL).
+async fn web_page(State(state): State<SharedState>) -> Response {
+    (StatusCode::OK, Html(web_html(state.config.history.len))).into_response()
+}
+
+fn web_html(history_len: usize) -> String {
     const HTML: &str = r#"<!doctype html>
-<html lang="zh"><head><meta charset="utf-8"><title>AgentLink · 对话总览</title>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentLink · Console</title>
 <style>
 :root{color-scheme:dark}
-body{font-family:system-ui,"Segoe UI","Microsoft YaHei";background:#0f1115;color:#d7dde6;margin:0;padding:16px}
-h1{font-size:18px;margin:0 0 4px}.sub{color:#8b949e;font-size:12px;margin-bottom:14px}
-.card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 14px;margin-bottom:14px}
-.card h2{font-size:13px;margin:0 0 8px;color:#7ee787}
-.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;margin-left:4px}
-.on{background:#1f6feb22;color:#58a6ff}.off{background:#f8514922;color:#f85149}
-table{border-collapse:collapse;width:100%;font-size:12px}
-td,th{text-align:left;padding:4px 8px;border-bottom:1px solid #21262d;white-space:nowrap}
-.msg{border-left:3px solid #30363d;padding:6px 10px;margin:6px 0;font-size:12px;background:#0d1117;border-radius:0 6px 6px 0}
-.msg .meta{color:#8b949e;font-size:11px}.msg .pay{color:#79c0ff;word-break:break-all;white-space:pre-wrap}
-.row{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap}
-.row input,.row textarea,.row button{box-sizing:border-box}
-input,textarea,button{background:#0d1117;color:#d7dde6;border:1px solid #30363d;border-radius:6px;padding:6px 8px;font-size:12px;font-family:inherit}
-button{cursor:pointer;background:#1f6feb;border-color:#1f6feb;color:#fff}
-button:active{opacity:.8}
-.full{width:100%}
-label{font-size:11px;color:#8b949e}
-</style></head><body>
-<h1>AgentLink</h1><div class="sub">局域网 Agent 通信总线 · 每 2 秒刷新</div>
-<div id="status" class="sub">加载中…</div>
-<div class="card"><h2>发送消息 / 文件</h2>
-<div class="row"><label>目标(to)</label><input id="to" list="peers-list" placeholder="node_id 或节点名；* = 广播">
-<datalist id="peers-list"></datalist>
-<label>Agent(to_agent)</label><input id="to_agent" placeholder="可选，如 reviewer"></div>
-<div class="row"><textarea id="payload" rows="2" class="full" placeholder='payload JSON，如 {"content":"你好"}'></textarea></div>
-<div class="row">
-<button onclick="doSend()">发送消息</button>
-<input type="file" id="file">
-<button onclick="doFile()">发送文件</button>
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;background:#0b0e14;color:#dbe2ea;font-size:13px}
+a{color:#4f8cff;text-decoration:none}
+.hidden{display:none!important}
+#app{display:grid;grid-template-columns:220px 1fr;min-height:100vh}
+#sidebar{background:#0e1219;border-right:1px solid #1c2330;padding:16px 12px;position:sticky;top:0;height:100vh;overflow:auto}
+#logo{display:flex;align-items:center;gap:8px;padding:4px 8px 14px;font-weight:700;font-size:15px;letter-spacing:.2px}
+#logo .dot{width:10px;height:10px;border-radius:50%;background:#4f8cff;box-shadow:0 0 10px #4f8cff}
+#sidebar .nav{margin:2px 0;padding:8px 10px;border-radius:8px;cursor:pointer;color:#9aa7b8;display:flex;align-items:center;gap:8px}
+#sidebar .nav:hover{background:#141b26;color:#e6edf5}
+#sidebar .nav.active{background:#16233b;color:#7fb0ff}
+#main{display:flex;flex-direction:column;min-width:0}
+#topbar{display:flex;align-items:center;gap:14px;padding:12px 20px;border-bottom:1px solid #1c2330;position:sticky;top:0;background:rgba(11,14,20,.92);backdrop-filter:blur(6px);z-index:5}
+#topbar .t{font-weight:600}
+#topbar .sub{color:#7d8aa0;font-size:12px}
+.spacer{flex:1}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:20px;font-size:11px;line-height:1.4}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.on{background:rgba(63,185,80,.12);color:#3fb950}.on .dot{background:#3fb950}
+.off{background:rgba(248,81,73,.12);color:#f85149}.off .dot{background:#f85149}
+.warn{background:rgba(210,153,34,.12);color:#d29922}
+.content{padding:20px;max-width:1200px;width:100%}
+.card{background:#10151d;border:1px solid #1c2330;border-radius:12px;padding:16px;margin-bottom:16px}
+.card h2{margin:0 0 12px;font-size:13px;color:#9aa7b8;font-weight:600;letter-spacing:.4px;text-transform:uppercase}
+table{width:100%;border-collapse:collapse}
+th{font-size:11px;color:#7d8aa0;text-align:left;padding:6px 8px;border-bottom:1px solid #1c2330;font-weight:500}
+td{padding:8px;border-bottom:1px solid #171e29;vertical-align:middle}
+tr:hover td{background:#131a24}
+.chip{display:inline-block;padding:1px 8px;border-radius:12px;font-size:11px;background:#182238;color:#9db4dd;margin:1px 2px}
+.metric{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.metric .m{background:#10151d;border:1px solid #1c2330;border-radius:12px;padding:14px}
+.metric .v{font-size:24px;font-weight:700;margin-top:4px}
+.metric .k{font-size:11px;color:#7d8aa0}
+.msg{border-left:3px solid #263041;padding:8px 12px;margin:8px 0;background:#0d1219;border-radius:0 8px 8px 0}
+.msg .meta{color:#7d8aa0;font-size:11px;margin-bottom:2px}
+.msg .pay{color:#9cc5ff;word-break:break-all;white-space:pre-wrap}
+.msg.out{border-left-color:#4f8cff}
+.msg.in{border-left-color:#3fb950}
+.row{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
+input,textarea,select{background:#0b1017;color:#dbe2ea;border:1px solid #263041;border-radius:8px;padding:8px 10px;font-size:13px;font-family:inherit;outline:none}
+input:focus,textarea:focus,select:focus{border-color:#4f8cff}
+button{background:#1a2a45;color:#e6edf5;border:1px solid #2b4a7c;border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer;font-family:inherit}
+button.primary{background:#2f6fe4;border-color:#2f6fe4}
+button:hover{filter:brightness(1.12)}
+button:active{filter:brightness(.95)}
+textarea{width:100%;resize:vertical}
+.hint{color:#5f6b7f;font-size:12px;margin:2px 0 6px}
+.cfg-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.cfg-grid label{display:block;font-size:12px;color:#9aa7b8;margin:6px 0 4px}
+input,textarea,select{width:100%}
+row input{width:auto}
+#modal{position:fixed;inset:0;background:rgba(4,6,10,.8);display:flex;align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(4px)}
+#modal .box{background:#121823;border:1px solid #263041;border-radius:14px;padding:24px;width:360px;box-shadow:0 20px 60px #0008}
+#modal h3{margin:0 0 6px}
+.switch{position:relative;display:inline-block;width:38px;height:20px;margin-left:8px;vertical-align:middle}
+.switch input{display:none}
+.slider{position:absolute;inset:0;background:#263041;border-radius:20px;transition:.2s}
+.slider:before{content:"";position:absolute;width:14px;height:14px;left:3px;top:3px;background:#dbe2ea;border-radius:50%;transition:.2s}
+.switch input:checked+.slider{background:#2f6fe4}
+.switch input:checked+.slider:before{transform:translateX(18px)}
+</style></head>
+<body>
+<div id="modal"><div class="box">
+<h3>AgentLink</h3>
+<p class="hint">输入本机 <code>agentlink.json</code> 里 <code>local_api.token</code> 的值。Token 只保存在当前浏览器会话，不放进地址栏。</p>
+<input id="token-input" style="width:100%" placeholder="local_api.token">
+<div class="row"><button class="primary" onclick="saveToken()">进入控制台</button></div>
+</div></div>
+
+<div id="app" class="hidden">
+<aside id="sidebar">
+  <div id="logo"><span class="dot"></span>AgentLink</div>
+  <div class="nav active" data-p="overview" onclick="show('overview')">总览</div>
+  <div class="nav" data-p="nodes" onclick="show('nodes')">节点</div>
+  <div class="nav" data-p="agents" onclick="show('agents')">Agent</div>
+  <div class="nav" data-p="chat" onclick="show('chat')">对话 / 发送</div>
+  <div class="nav" data-p="config" onclick="show('config')">配置</div>
+</aside>
+<div id="main">
+  <div id="topbar">
+    <div><div class="t" id="tb-self">—</div><div class="sub" id="tb-meta">—</div></div>
+    <div class="spacer"></div>
+    <span class="sub">自动刷新 <label class="switch"><input type="checkbox" id="auto-refresh" checked><span class="slider"></span></label></span>
+    <button onclick="refresh()">刷新</button>
+  </div>
+  <div class="content">
+    <section id="p-overview">
+      <div class="metric">
+        <div class="m"><div class="k">在线节点</div><div class="v" id="m-nodes">0</div></div>
+        <div class="m"><div class="k">历史消息</div><div class="v" id="m-history">0</div></div>
+        <div class="m"><div class="k">传输中</div><div class="v" id="m-transfer">0</div></div>
+        <div class="m"><div class="k">版本</div><div class="v" id="m-version">—</div></div>
+      </div>
+      <div class="card"><h2>快捷发送</h2>
+        <div class="row"><input id="to" list="peers-list" placeholder="目标 node_id / 节点名 / * (广播)" style="flex:2"><input id="to_agent" placeholder="Agent (可选)" style="flex:1"></div>
+        <div class="row"><textarea id="payload" rows="2" placeholder='{"content":"你好"}'></textarea></div>
+        <div class="row"><button class="primary" onclick="doSend()">发送消息</button><input type="file" id="file"><button onclick="doFile()">发送文件</button></div>
+        <div id="sendres" class="hint"></div>
+      </div>
+    </section>
+    <section id="p-nodes" class="hidden">
+      <div class="card"><h2>节点 Peers</h2><table><thead><tr><th>名称</th><th>node_id</th><th>地址</th><th>标签</th><th>状态</th></tr></thead><tbody id="peers-body"></tbody></table></div>
+    </section>
+    <section id="p-agents" class="hidden">
+      <div class="card"><h2>Agent（全网）</h2><table><thead><tr><th>节点</th><th>agent_id</th><th>名字</th><th>能力</th><th>状态</th></tr></thead><tbody id="agents-body"></tbody></table></div>
+    </section>
+    <section id="p-chat" class="hidden">
+      <div class="card"><h2>发送消息 / 文件</h2>
+        <datalist id="peers-list"></datalist>
+        <div class="row"><input id="to2" list="peers-list" placeholder="目标 node_id / 节点名 / * (广播)" style="flex:2"><input id="to_agent2" placeholder="Agent (可选)" style="flex:1"></div>
+        <div class="row"><textarea id="payload2" rows="2" placeholder='{"content":"你好"}'></textarea></div>
+        <div class="row"><button class="primary" onclick="doSend()">发送消息</button><input type="file" id="file2"><button onclick="doFile()">发送文件</button></div>
+        <div id="sendres2" class="hint"></div>
+      </div>
+      <div class="card"><h2>对话记录（最近 __LEN__ 条）</h2><div id="history"></div></div>
+    </section>
+    <section id="p-config" class="hidden">
+      <div class="card"><h2>节点配置</h2>
+        <div class="cfg-grid">
+          <div><label>节点名称（改后即时生效）</label><input id="cf-name"></div>
+          <div><label>标签 tags（逗号分隔）</label><input id="cf-tags"></div>
+          <div><label>日志级别</label><select id="cf-log"><option>debug</option><option>info</option><option>warn</option><option>error</option></select></div>
+          <div><label>历史条数（重启生效）</label><input id="cf-hist" type="number" min="10"></div>
+          <div><label>最大文件 MB（重启生效）</label><input id="cf-fmax" type="number" min="1"></div>
+        </div>
+        <p class="hint" style="margin-top:12px">静态节点 static_peers（每行一个 IP:端口，重启生效）：</p>
+        <textarea id="cf-peers" rows="3"></textarea>
+        <div class="row"><span class="hint">启动自动打开 Web</span><label class="switch"><input type="checkbox" id="cf-open"><span class="slider"></span></label></div>
+        <div class="row" style="margin-top:6px"><button class="primary" onclick="saveConfig()">保存配置</button><span id="cf-res" class="hint"></span></div>
+        <p class="hint" id="cf-restart"></p>
+      </div>
+      <div class="card"><h2>只读信息</h2><div id="cf-ro" class="hint"></div></div>
+    </section>
+  </div>
 </div>
-<div id="sendres" class="sub"></div>
 </div>
-<div class="card"><h2>节点 / Peers</h2><table id="peers"></table></div>
-<div class="card"><h2>Agent（全网）</h2><table id="agents"></table></div>
-<div class="card"><h2>对话记录（环形缓冲 __LEN__ 条）</h2><div id="history"></div></div>
+
 <script>
-const TOKEN="__TOKEN__";
-const HDR={"X-Auth-Token":TOKEN};
-async function j(p){const r=await fetch(p,{headers:HDR});return r.json();}
+const $=id=>document.getElementById(id);
+const LS_KEY='al_token';
+let TOKEN=sessionStorage.getItem(LS_KEY)||'';
+const HDR=()=>({'X-Auth-Token':TOKEN});
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(ts){try{return new Date(ts).toLocaleString();}catch{return ts;}}
-function input(id){return (document.getElementById(id).value||'').trim();}
+function saveToken(){TOKEN=$('token-input').value.trim();sessionStorage.setItem(LS_KEY,TOKEN);$('modal').classList.add('hidden');$('app').classList.remove('hidden');refresh();}
+(function(){ if(TOKEN){$('modal').classList.add('hidden');$('app').classList.remove('hidden');} })();
+async function j(p,opt){const o=opt||{};const r=await fetch(p,{...o,headers:{...HDR(),...(o.headers||{})}});const d=await r.json().catch(()=>({}));if(r.status===401){alert('token 无效，请重新输入');sessionStorage.removeItem(LS_KEY);location.reload();throw new Error('401');}return d;}
+function show(panel){document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.p===panel));document.querySelectorAll('.content>section').forEach(s=>s.classList.add('hidden'));$('p-'+panel).classList.remove('hidden');}
+function input(id){return ($(id)&&$(id).value||'').trim();}
 async function doSend(){
- const to=input('to'); if(!to){alert('请填目标 to');return;}
- const to_agent=input('to_agent')||undefined;
- let raw=input('payload'), payload;
- try{payload=raw?JSON.parse(raw):{};}catch{payload={content:raw};}
- try{
-  const r=await fetch('/v1/send',{method:'POST',headers:HDR,body:JSON.stringify({to,to_agent,type:'text',action:'send',payload})});
-  document.getElementById('sendres').textContent=JSON.stringify(await r.json());
- }catch(e){document.getElementById('sendres').textContent='发送失败: '+e;}
+  const to=input('to')||input('to2'); if(!to){alert('请填目标 to');return;}
+  const to_agent=input('to_agent')||input('to_agent2')||undefined;
+  let raw=input('payload')||input('payload2'),payload;
+  try{payload=raw?JSON.parse(raw):{};}catch{payload={content:raw};}
+  try{const d=await j('/v1/send',{method:'POST',body:JSON.stringify({to,to_agent,type:'text',action:'send',payload})});foo(d);}catch(e){}
 }
 async function doFile(){
- const f=document.getElementById('file').files[0]; if(!f){alert('请选择文件');return;}
- const to=input('to'); if(!to){alert('请填目标 to');return;}
- const q=new URLSearchParams({to});
- if(input('to_agent'))q.set('to_agent',input('to_agent'));
- try{
-  const r=await fetch('/v1/send-file-upload?'+q.toString(),{method:'POST',headers:{...HDR,'X-File-Name':f.name},body:f});
-  document.getElementById('sendres').textContent=JSON.stringify(await r.json());
- }catch(e){document.getElementById('sendres').textContent='发送失败: '+e;}
+  const f=($('file').files[0])||($('file2').files[0]); if(!f){alert('请选择文件');return;}
+  const to=input('to')||input('to2'); if(!to){alert('请填目标 to');return;}
+  const q=new URLSearchParams({to}); if(input('to_agent')||input('to_agent2'))q.set('to_agent',input('to_agent')||input('to_agent2'));
+  try{const d=await j('/v1/send-file-upload?'+q,{method:'POST',headers:{'X-File-Name':f.name},body:f});foo(d);}catch(e){}
 }
+function foo(d){$('sendres').textContent=JSON.stringify(d);$('sendres2').textContent=JSON.stringify(d);refresh();}
 async function refresh(){
  try{
   const [st,peers,agents,hist]=await Promise.all([j('/v1/status'),j('/v1/peers'),j('/v1/fleet/agents'),j('/v1/history')]);
-  let pe='<tr><th>名称</th><th>node_id</th><th>地址</th><th>标签tags</th><th>状态</th></tr>';
-  if(peers&&peers.ok)for(const p of peers.peers)pe+=`<tr><td>${esc(p.name)}</td><td>${esc(p.node_id)}</td><td>${esc(p.addr)}</td><td>${esc((p.tags||[]).join(', '))}</td><td><span class="badge ${p.online?'on':'off'}">${p.online?'在线':'离线'}</span></td></tr>`;
-  document.getElementById('peers').innerHTML=pe;
-  let dl='';
-  if(peers&&peers.ok)for(const p of peers.peers)dl+=`<option value="${esc(p.node_id)}">${esc(p.name)}</option>`;
-  if(agents&&agents.ok)for(const a of agents.agents)dl+=`<option value="${esc(a.node_id)}">${esc(a.node_name)} / agent ${esc(a.agent_id)}</option>`;
-  const dlEl=document.getElementById('peers-list'); if(dlEl)dlEl.innerHTML=dl;
-  let ag='<tr><th>node</th><th>agent_id</th><th>名字</th><th>能力</th><th>状态</th></tr>';
-  if(agents&&agents.ok)for(const a of agents.agents)ag+=`<tr><td>${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td>${esc(a.name)}</td><td>${esc((a.capabilities||[]).join(', '))}</td><td><span class="badge ${a.online?'on':'off'}">${a.online?'在线':'离线'}</span></td></tr>`;
-  document.getElementById('agents').innerHTML=ag;
+  $('tb-self').textContent=st.name;
+  $('tb-meta').textContent=`${st.node_id} · v${st.version} · 在线 ${st.peers_online}/${st.peers_known} · ${new Date().toLocaleTimeString()}`;
+  $('m-nodes').textContent=`${st.peers_online}/${st.peers_known}`;
+  $('m-history').textContent=hist.history.length;
+  $('m-transfer').textContent=st.active_transfers;
+  $('m-version').textContent=st.version;
+  let pe=''; if(peers&&peers.ok)for(const p of peers.peers)pe+=`<tr><td>${esc(p.name)}</td><td>${esc(p.node_id)}</td><td>${esc(p.addr)}</td><td>${(p.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</td><td><span class="badge ${p.online?'on':'off'}"><span class="dot"></span>${p.online?'在线':'离线'}</span></td></tr>`;
+  $('peers-body').innerHTML=pe;
+  let ag=''; if(agents&&agents.ok)for(const a of agents.agents)ag+=`<tr><td>${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td>${esc(a.name)}</td><td>${(a.capabilities||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join('')}</td><td><span class="badge ${a.online?'on':'off'}"><span class="dot"></span>${a.online?'在线':'离线'}</span></td></tr>`;
+  $('agents-body').innerHTML=ag;
+  let dl=''; if(peers&&peers.ok)for(const p of peers.peers)dl+=`<option value="${esc(p.node_id)}">${esc(p.name)}</option>`;
+  if(agents&&agents.ok)for(const a of agents.agents)dl+=`<option value="${esc(a.node_id)}">${esc(a.node_name||a.node_id)} / ${esc(a.agent_id)}</option>`;
+  $('peers-list').innerHTML=dl;
   let hh='';
-  if(hist&&hist.ok)for(const m of hist.history.slice().reverse())hh+=`<div class="msg"><div class="meta">${fmt(m.ts)} · ${esc(m.direction)} · ${esc(m.from_agent||'节点')}${esc(m.from)} → ${esc(m.to_agent||'')}${esc(m.to)} · ${esc(m.kind)}/${esc(m.action)}</div><div class="pay">${esc(JSON.stringify(m.payload))}</div></div>`;
-  document.getElementById('history').innerHTML=hh||'<div class="sub">（暂无业务消息，等 Agent 说话后这里会实时显示）</div>';
-  document.getElementById('status').textContent=`节点 ${st?st.name:'?'} · 在线 ${st?st.peers_online:0}/${st?st.peers_known:0} · 历史 ${hist&&hist.ok?hist.history.length:0} 条 · 最后刷新 ${new Date().toLocaleTimeString()}`;
- }catch(e){document.getElementById('status').textContent='刷新失败: '+e;}
+  if(hist&&hist.ok)for(const m of hist.history.slice().reverse())hh+=`<div class="msg ${m.direction==='out'?'out':m.direction==='in'?'in':''}"><div class="meta">${fmt(m.ts)} · ${esc(m.from_agent||'节点')} ${esc(m.from)} → ${esc(m.to_agent||'')} ${esc(m.to)} · ${esc(m.kind)}/${esc(m.action)}</div><div class="pay">${esc(JSON.stringify(m.payload))}</div></div>`;
+  $('history').innerHTML=hh||'<p class="hint">暂无业务消息</p>';
+ }catch(e){}
 }
-refresh();setInterval(refresh,2000);
+async function loadConfig(){
+ try{
+  const d=await j('/v1/config');
+  const c=d.config;
+  $('cf-name').value=c.name; $('cf-tags').value=(c.tags||[]).join(',');
+  $('cf-log').value=c.log.level; $('cf-hist').value=c.history.len; $('cf-fmax').value=Math.round(c.files.max_file_size/1048576);
+  $('cf-peers').value=(c.discovery.static_peers||[]).join('\n');
+  $('cf-open').checked=c.web.auto_open;
+  $('cf-ro').textContent=`node_id ${c.node_id} · 端口 ${c.listen_port} · 广播 ${c.discovery.broadcast_port} · 模式 ${c.security.mode} · data_dir ${c.data_dir}`;
+  $('cf-restart').textContent='名称与标签立即生效；端口 / 广播端口 / 日志格式 / 历史条数 / 最大文件 / static_peers 保存后重启生效。';
+ }catch(e){}
+}
+async function saveConfig(){
+ const peers=$('cf-peers').value.split(/[\n,]/).map(s=>s.trim()).filter(Boolean);
+ const body={name:$('cf-name').value.trim(),tags:$('cf-tags').value.split(/[,，]/).map(s=>s.trim()).filter(Boolean),
+  log_level:$('cf-log').value,history_len:parseInt($('cf-hist').value)||500,
+  max_file_size:(parseInt($('cf-fmax').value)||100)*1048576,static_peers:peers,auto_open_web:$('cf-open').checked};
+ try{const d=await j('/v1/config',{method:'PUT',body:JSON.stringify(body)});$('cf-res').textContent=JSON.stringify(d);refresh();}catch(e){}
+}
+(function(){ if(TOKEN){refresh();loadConfig();} })();
+$('auto-refresh').addEventListener('change',e=>{if(!e.target.checked)return;refresh();});
+setInterval(()=>{if($('auto-refresh').checked)refresh();},2000);
 </script></body></html>"#;
-    HTML.replace("__TOKEN__", token)
-        .replace("__LEN__", &history_len.to_string())
+    HTML.replace("__LEN__", &history_len.to_string())
 }
-
 // ---- local subscription -----------------------------------------------------
 
 #[derive(Debug, Deserialize)]

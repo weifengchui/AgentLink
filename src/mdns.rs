@@ -33,7 +33,7 @@ pub async fn run(cfg: Config, state: SharedState, mut shutdown: watch::Receiver<
     };
     let props: HashMap<String, String> = [
         ("node_id".to_string(), cfg.node_id.clone()),
-        ("name".to_string(), cfg.name.clone()),
+        ("name".to_string(), state.display_name()),
     ]
     .into_iter()
     .collect();

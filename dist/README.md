@@ -1,4 +1,4 @@
-# AgentLink v0.3.0
+# AgentLink v0.4.0
 
 局域网多台机器上 **AI Agent 之间**的通信总线。只为程序服务，不为人聊天。
 一台机器跑一个常驻小进程；Agent 通过 `127.0.0.1` 的 HTTP/WS 接口收发消息与文件，
@@ -33,7 +33,7 @@ curl.exe http://127.0.0.1:8765/v1/health
 curl.exe -H "X-Auth-Token: <token>" http://127.0.0.1:8765/v1/peers
 
 # 人工查看：节点 / Agent / 双方对话（浏览器打开）
-#   http://127.0.0.1:8765/web?token=<token>
+#   http://127.0.0.1:8765/web   (打开后输入 local_api.token，不进URL)
 #   http://127.0.0.1:8765/v1/web?token=<token>
 ```
 

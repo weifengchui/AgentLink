@@ -199,7 +199,11 @@ async fn session(
     let strict = cfg.security.mode == "strict";
 
     // Always speak first: send our hello.
-    let hello = Hello::new(&cfg.node_id, &cfg.name, &cfg.security.cluster_token);
+    let hello = Hello::new(
+        &cfg.node_id,
+        &state.display_name(),
+        &cfg.security.cluster_token,
+    );
     if send_text(&send, &hello).await.is_err() {
         return;
     }
