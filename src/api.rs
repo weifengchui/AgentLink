@@ -946,6 +946,11 @@ tr:hover td{background:#131a24}
 .msg .pay{color:#9cc5ff;word-break:break-all;white-space:pre-wrap}
 .msg.out{border-left-color:#4f8cff}
 .msg.in{border-left-color:#3fb950}
+select#to,select#to2{width:230px;max-width:230px}
+select#to_agent,select#to_agent2{width:170px;max-width:170px}
+.row select{width:auto}
+.msg .meta{font-size:12px}
+.lbl{color:#8b949e;font-size:11px;margin-right:2px}
 .fl{position:relative;color:#7d8aa0;font-size:11px}
 .tool{display:none;gap:4px;margin-left:6px}
 .fl:hover .tool{display:inline-flex}
@@ -1009,7 +1014,7 @@ row input{width:auto}
         <div class="m"><div class="k">版本</div><div class="v" id="m-version">—</div></div>
       </div>
       <div class="card"><h2>快捷发送</h2>
-        <div class="row"><input id="to" list="peers-list" placeholder="目标 node_id / 节点名 / * (广播)" style="flex:2"><input id="to_agent" placeholder="Agent (可选)" style="flex:1"></div>
+        <div class="row"><span class="lbl">目标</span><select id="to"></select><span class="lbl">Agent</span><select id="to_agent"></select></div>
         <div class="row"><textarea id="payload" rows="2" placeholder='{"content":"你好"}'></textarea></div>
         <div class="row"><button class="primary" onclick="doSend()">发送消息</button><input type="file" id="file"><button onclick="doFile()">发送文件</button></div>
         <div class="row" id="quick-targets"></div>
@@ -1030,8 +1035,7 @@ row input{width:auto}
     </section>
     <section id="p-chat" class="hidden">
       <div class="card"><h2>发送消息 / 文件</h2>
-        <datalist id="peers-list"></datalist>
-        <div class="row"><input id="to2" list="peers-list" placeholder="目标 node_id / 节点名 / * (广播)" style="flex:2"><input id="to_agent2" placeholder="Agent (可选)" style="flex:1"></div>
+                <div class="row"><span class="lbl">目标</span><select id="to2"></select><span class="lbl">Agent</span><select id="to_agent2"></select></div>
         <div class="row"><textarea id="payload2" rows="2" placeholder='{"content":"你好"}'></textarea></div>
         <div class="row"><button class="primary" onclick="doSend('2')">发送消息</button><input type="file" id="file2"><button onclick="doFile('2')">发送文件</button></div>
         <div id="sendres2" class="hint"></div>
@@ -1071,23 +1075,34 @@ let TOKEN=sessionStorage.getItem(LS_KEY)||'';
 const HDR=()=>({'X-Auth-Token':TOKEN});
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(ts){try{return new Date(ts).toLocaleString();}catch{return ts;}}
-let HIST=[],OV={page:1},CH={page:1};
+let HIST=[],OV={page:1},CH={page:1},NAMES={},AN={};
+function who(n){return NAMES[n]||n;}
+function whoa(n,a){return a?AN[n+'|'+a]||a:''}
+function dirLab(m){if(m.kind==='file')return '📄 文件';if(m.direction==='out')return '⬆ 发出';if(m.direction==='in')return '⬇ 收到';return '• 本机';}
+function prettyPay(m){
+  const p=m.payload||{};
+  if(p&&typeof p==='object'&&typeof p.content==='string'){const t=p.content;return t.length>260?t.slice(0,260)+'…':t;}
+  return JSON.stringify(p);
+}
 function histRow(m){
-  const dir=m.direction==='out'?'out':m.direction==='in'?'in':'';
+  const dir=(m.direction==='out'?'out':m.direction==='in'?'in':'');
+  const fromW=who(m.from)+(m.from_agent?` [${whoa(m.from,m.from_agent)}]`:'');
+  const toW=who(m.to)+(m.to_agent?` [${whoa(m.to,m.to_agent)}]`:'');
   if(m.kind==='file'){
     const nm=esc((m.payload&&m.payload.file_name)||'file');
-    const sp=m.payload&&m.payload.saved_path||'';
-    const sz=(m.payload&&m.payload.size)||'?';
+    const sp=(m.payload&&m.payload.saved_path)||'';
+    const sz=humanSize(m.payload&&m.payload.size||0);
     const local=(m.direction==='in'||m.direction==='local')&&sp;
     let head;
     if(local){
       const dl=encodeURIComponent(nm);
       head=`<span class="fl">📄 <a href="/v1/files/${dl}" target="_blank" rel="noopener">${nm}</a> <span class="tool"><a class="tbtn" href="/v1/files/${dl}" target="_blank" rel="noopener">打开文件</a><button class="tbtn" onclick="openFl('${dl}')">打开文件夹</button></span></span>`;
     }else{head=`📤 ${nm}`;}
-    return `<div class="msg file"><div class="meta">${fmt(m.ts)} · 文件 · ${esc(m.direction)} · ${esc(m.from)} → ${esc(m.to)}</div><div class="pay">${head} · ${sz} B · ${sp?esc(sp):''}</div></div>`;
+    return `<div class="msg file"><div class="meta">${fmt(m.ts)} · ${dirLab(m)} · ${esc(fromW)} → ${esc(toW)}</div><div class="pay">${head} · ${sz}</div></div>`;
   }
-  return `<div class="msg ${dir}"><div class="meta">${fmt(m.ts)} · ${esc(m.from_agent||'节点')} ${esc(m.from)} → ${esc(m.to_agent||'')} ${esc(m.to)} · ${esc(m.kind)}/${esc(m.action)}</div><div class="pay">${esc(JSON.stringify(m.payload))}</div></div>`;
+  return `<div class="msg ${dir}"><div class="meta">${fmt(m.ts)} · ${dirLab(m)} · ${esc(fromW)} → ${esc(toW)} · <span class="k">${esc(m.kind)}/${esc(m.action)}</span></div><div class="pay">${esc(prettyPay(m))}</div></div>`;
 }
+function humanSize(n){if(!n)return '';if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(1)+' MB';}
 function filterHist(kw,arr){if(!kw)return arr.slice();return arr.filter(m=>JSON.stringify({f:m.from,a:m.from_agent,t:m.to,ta:m.to_agent,k:m.kind,p:m.payload}).toLowerCase().includes(kw.toLowerCase()));}
 function renderList(elx,info,arr,page,size){
   const total=arr.length,pages=Math.max(1,Math.ceil(total/size));
@@ -1100,7 +1115,17 @@ function renderList(elx,info,arr,page,size){
 function ovGo(p){OV.page=renderList(el('ov-hist'),el('ov-info'),filterHist(el('ov-kw').value,HIST),p,parseInt(el('ov-size').value)||20);}
 function chGo(p){CH.page=renderList(el('history'),el('ch-info'),filterHist(el('ch-kw').value,HIST),p,parseInt(el('ch-size').value)||50);}
 async function openFl(nm){try{await j('/v1/open-folder',{method:'POST',body:JSON.stringify({file:decodeURIComponent(nm)})});}catch(e){}}
-function pick(id,ag){const t=el('to'),t2=el('to2'),a=el('to_agent'),a2=el('to_agent2');if(t)t.value=id;if(t2)t2.value=id;if(a)a.value=ag;if(a2)a2.value=ag;}
+function pick(id,ag){
+  const t=el('to'),t2=el('to2'),a=el('to_agent'),a2=el('to_agent2');
+  if(t){t.value=id;} if(t2){t2.value=id;}
+  if(a){a.value=ag||'';} if(a2){a2.value=ag||'';}
+}
+[['to_agent','to'],['to_agent2','to2']].forEach(([s,t])=>{
+  const se=el(s),te=el(t);
+  if(se&&te)se.addEventListener('change',()=>{
+    const o=se.options[se.selectedIndex]; if(o&&o.dataset.node)te.value=o.dataset.node;
+  });
+});
 function saveToken(){TOKEN=$('token-input').value.trim();sessionStorage.setItem(LS_KEY,TOKEN);enter();}
 function enter(){$('modal').classList.add('hidden');$('app').classList.remove('hidden');refresh();loadConfig();}
 async function boot(){
@@ -1160,9 +1185,19 @@ async function refresh(){
   $('peers-body').innerHTML=pe;
   let ag=''; if(agents&&agents.ok)for(const a of agents.agents)ag+=`<tr><td>${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td>${esc(a.name)}</td><td>${(a.capabilities||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join('')}</td><td><span class="badge ${a.online?'on':'off'}"><span class="dot"></span>${a.online?'在线':'离线'}</span></td></tr>`;
   $('agents-body').innerHTML=ag;
-  let dl=''; if(peers&&peers.ok)for(const p of peers.peers)dl+=`<option value="${esc(p.node_id)}">${esc(p.name)}</option>`;
-  if(agents&&agents.ok)for(const a of agents.agents)dl+=`<option value="${esc(a.node_id)}">${esc(a.node_name||a.node_id)} / ${esc(a.agent_id)}</option>`;
-  $('peers-list').innerHTML=dl;
+  // 节点名 / agent 名映射（给人看）
+  NAMES={}; AN={};
+  if(st&&st.node_id){NAMES[st.node_id]=st.name||st.node_id;}
+  if(peers&&peers.ok)for(const p of peers.peers)NAMES[p.node_id]=p.name;
+  if(agents&&agents.ok)for(const a of agents.agents){AN[a.node_id+'|'+a.agent_id]=(a.name||a.agent_id); NAMES[a.node_id]=a.node_name||NAMES[a.node_id]||a.node_id;}
+  // 目标下拉（纯选择）
+  const curTo=el('to').value, curTo2=el('to2').value, curAg=el('to_agent').value, curAg2=el('to_agent2').value;
+  let opn='<option value="*">* 广播（全部节点）</option>';
+  if(peers&&peers.ok)for(const p of peers.peers)opn+=`<option value="${esc(p.node_id)}">${esc(p.name)}${p.online?'':'（离线）'}</option>`;
+  [el('to'),el('to2')].forEach(x=>{const c=x===el('to')?curTo:curTo2;x.innerHTML=opn;if(c&&[...x.options].some(o=>o.value===c))x.value=c;});
+  let opa='<option value="">（无 · 发给整机）</option>';
+  if(agents&&agents.ok)for(const a of agents.agents)opa+=`<option value="${esc(a.agent_id)}" data-node="${esc(a.node_id)}">${esc(a.node_name||a.node_id)} · ${esc(a.agent_id)}</option>`;
+  [el('to_agent'),el('to_agent2')].forEach(x=>{const c=x===el('to_agent')?curAg:curAg2;x.innerHTML=opa;if(c&&[...x.options].some(o=>o.value===c))x.value=c;});
   HIST=hist&&hist.ok?hist.history.slice():[];
   ovGo(OV.page); chGo(CH.page);
   let qt='';
