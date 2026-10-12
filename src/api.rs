@@ -991,6 +991,7 @@ row input{width:auto}
 <div id="agent-modal" hidden style="position:fixed;inset:0;background:rgba(4,6,10,.8);align-items:center;justify-content:center;z-index:60;backdrop-filter:blur(4px)">
   <div class="box">
     <h3>编辑 Agent</h3>
+    <p class="hint">提示：也可在列表中「双击名称」就地改名（回车保存）。</p>
     <label>agent_id（身份，不可改）</label><input id="ag-id" readonly>
     <label>名称 name（改后全网同步）</label><input id="ag-name">
     <label>能力 capabilities（逗号分隔）</label><input id="ag-caps">
@@ -998,7 +999,6 @@ row input{width:auto}
     <div id="ag-res" class="hint"></div>
   </div>
 </div>
-
 <div id="app" class="hidden">
 <aside id="sidebar">
   <div id="logo"><span class="dot"></span>AgentLink</div>
@@ -1131,6 +1131,30 @@ async function saveAgentEdit(){
   const body={agent_id:el('ag-id').value.trim(),name:el('ag-name').value.trim(),capabilities:el('ag-caps').value.split(/[,，]/).map(x=>x.trim()).filter(Boolean)};
   try{const d=await j('/v1/agents',{method:'POST',body:JSON.stringify(body)});el('ag-res').textContent=JSON.stringify(d);hideAgentEdit();refresh();}catch(e){el('ag-res').textContent='保存失败: '+(e.message||e);}
 }
+function inlineName(td,i){
+  const a=AGENTS[i]||{}; if(!a) return;
+  const old=el('ed-input');
+  if(old) return; // 已有输入框在编辑中
+  const inp=document.createElement('input');
+  inp.id='ed-input'; inp.value=a.name||''; td.innerHTML=''; td.appendChild(inp);
+  inp.focus(); inp.select();
+  let done=false;
+  function close(){
+    if(done) return; done=true; el('ed-input')&&el('ed-input').parentNode&&(el('ed-input').remove());
+  }
+  inp.addEventListener('keydown',ev=>{
+    if(ev.key==='Enter'){ ev.preventDefault(); const v=inp.value.trim(); close(); if(v&&v!==(a.name||'')){ saveName(i,v); } else { refresh(); } }
+    else if(ev.key==='Escape'){ close(); refresh(); }
+  });
+  inp.addEventListener('blur',()=>{ const v=inp.value.trim(); close(); if(v&&v!==(a.name||'')){ saveName(i,v); } else { refresh(); } });
+}
+async function saveName(i,newName){
+  const a=AGENTS[i]||{};
+  try{
+    const d=await j('/v1/agents',{method:'POST',body:JSON.stringify({agent_id:a.agent_id,name:newName,capabilities:a.capabilities||[]})});
+    refresh();
+  }catch(e){ alert('改名失败: '+(e.message||e)); refresh(); }
+}
 async function delAgent(i){const a=AGENTS[i]||{};if(!confirm('删除 Agent '+a.agent_id+'？'))return;try{const d=await j('/v1/agents',{method:'DELETE',body:JSON.stringify({agent_id:a.agent_id})});alert(JSON.stringify(d));refresh();}catch(e){alert('删除失败: '+(e.message||e));}}
 function pick(id,ag){
   const t=el('to'),t2=el('to2'),a=el('to_agent'),a2=el('to_agent2');
@@ -1201,7 +1225,7 @@ async function refresh(){
   let pe=''; if(peers&&peers.ok)for(const p of peers.peers)pe+=`<tr><td>${esc(p.name)}</td><td>${esc(p.node_id)}</td><td>${esc(p.addr)}</td><td>${(p.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</td><td><span class="badge ${p.online?'on':'off'}"><span class="dot"></span>${p.online?'在线':'离线'}</span></td></tr>`;
   $('peers-body').innerHTML=pe;
   AGENTS=agents&&agents.ok?agents.agents:[];
-  let ag=''; AGENTS.forEach((a,i)=>ag+=`<tr><td>${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td>${esc(a.name)}</td><td>${(a.capabilities||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join('')}</td><td><span class="badge ${a.online?'on':'off'}"><span class="dot"></span>${a.online?'在线':'离线'}</span></td><td><button class="tbtn" onclick="editAgent(${i})">改名</button> <button class="tbtn" onclick="delAgent(${i})">删除</button></td></tr>`);
+  let ag=''; AGENTS.forEach((a,i)=>ag+=`<tr><td>${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td class="ed-name" title="双击改名，回车保存" ondblclick="inlineName(this,${i})">${esc(a.name)}</td><td>${(a.capabilities||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join('')}</td><td><span class="badge ${a.online?'on':'off'}"><span class="dot"></span>${a.online?'在线':'离线'}</span></td><td><button class="tbtn" onclick="editAgent(${i})">改名</button> <button class="tbtn" onclick="delAgent(${i})">删除</button></td></tr>`);
   $('agents-body').innerHTML=ag;
   // 节点名 / agent 名映射（给人看）
   NAMES={}; AN={};
