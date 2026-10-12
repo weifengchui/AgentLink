@@ -739,7 +739,15 @@ async fn web_setup(
 /// Human-friendly dashboard page (no assets; token is entered in-session and
 /// sent via `X-Auth-Token` header, never in the URL).
 async fn web_page(State(state): State<SharedState>) -> Response {
-    (StatusCode::OK, Html(web_html(state.config.history.len))).into_response()
+    let mut headers = HeaderMap::new();
+    headers.insert("Cache-Control", "no-store".parse().unwrap());
+    headers.insert("Pragma", "no-cache".parse().unwrap());
+    (
+        StatusCode::OK,
+        headers,
+        Html(web_html(state.config.history.len)),
+    )
+        .into_response()
 }
 
 fn web_html(history_len: usize) -> String {
@@ -859,7 +867,7 @@ row input{width:auto}
         <datalist id="peers-list"></datalist>
         <div class="row"><input id="to2" list="peers-list" placeholder="目标 node_id / 节点名 / * (广播)" style="flex:2"><input id="to_agent2" placeholder="Agent (可选)" style="flex:1"></div>
         <div class="row"><textarea id="payload2" rows="2" placeholder='{"content":"你好"}'></textarea></div>
-        <div class="row"><button class="primary" onclick="doSend()">发送消息</button><input type="file" id="file2"><button onclick="doFile()">发送文件</button></div>
+        <div class="row"><button class="primary" onclick="doSend('2')">发送消息</button><input type="file" id="file2"><button onclick="doFile('2')">发送文件</button></div>
         <div id="sendres2" class="hint"></div>
       </div>
       <div class="card"><h2>对话记录（最近 __LEN__ 条）</h2><div id="history"></div></div>
@@ -908,20 +916,36 @@ boot();
 async function j(p,opt){const o=opt||{};const r=await fetch(p,{...o,headers:{...HDR(),...(o.headers||{})}});const d=await r.json().catch(()=>({}));if(r.status===401){alert('token 无效，请重新输入');sessionStorage.removeItem(LS_KEY);location.reload();throw new Error('401');}return d;}
 function show(panel){document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.p===panel));document.querySelectorAll('.content>section').forEach(s=>s.classList.add('hidden'));$('p-'+panel).classList.remove('hidden');}
 function input(id){return ($(id)&&$(id).value||'').trim();}
-async function doSend(){
-  const to=input('to')||input('to2'); if(!to){alert('请填目标 to');return;}
-  const to_agent=input('to_agent')||input('to_agent2')||undefined;
-  let raw=input('payload')||input('payload2'),payload;
+function el(id){return document.getElementById(id);}
+function val(id){const e=el(id);return e?(e.value||'').trim():'';}
+async function doSend(sfx){
+  sfx=sfx||'';
+  const res=el('sendres'+sfx);
+  const to=val('to'+sfx); if(!to){res.textContent='请填目标 to';return;}
+  const to_agent=val('to_agent'+sfx)||undefined;
+  let raw=val('payload'+sfx),payload;
   try{payload=raw?JSON.parse(raw):{};}catch{payload={content:raw};}
-  try{const d=await j('/v1/send',{method:'POST',body:JSON.stringify({to,to_agent,type:'text',action:'send',payload})});foo(d);}catch(e){}
+  try{
+    const d=await j('/v1/send',{method:'POST',body:JSON.stringify({to,to_agent,type:'text',action:'send',payload})});
+    res.textContent=JSON.stringify(d);refresh();
+  }catch(e){res.textContent='发送失败: '+(e.message||e);}
 }
-async function doFile(){
-  const f=($('file').files[0])||($('file2').files[0]); if(!f){alert('请选择文件');return;}
-  const to=input('to')||input('to2'); if(!to){alert('请填目标 to');return;}
-  const q=new URLSearchParams({to}); if(input('to_agent')||input('to_agent2'))q.set('to_agent',input('to_agent')||input('to_agent2'));
-  try{const d=await j('/v1/send-file-upload?'+q,{method:'POST',headers:{'X-File-Name':f.name},body:f});foo(d);}catch(e){}
+async function doFile(sfx){
+  sfx=sfx||'';
+  const res=el('sendres'+sfx);
+  const fe=el('file'+sfx);
+  const f=fe&&fe.files&&fe.files[0];
+  if(!f){res.textContent='请先选择文件';return;}
+  const to=val('to'+sfx); if(!to){res.textContent='请填目标 to';return;}
+  const q=new URLSearchParams({to});
+  if(val('to_agent'+sfx))q.set('to_agent',val('to_agent'+sfx));
+  try{
+    res.textContent='上传发送中…';
+    const d=await j('/v1/send-file-upload?'+q,{method:'POST',headers:{'X-File-Name':f.name},body:f});
+    res.textContent=JSON.stringify(d);refresh();
+    fe.value='';
+  }catch(e){res.textContent='发送失败: '+(e.message||e);}
 }
-function foo(d){$('sendres').textContent=JSON.stringify(d);$('sendres2').textContent=JSON.stringify(d);refresh();}
 async function refresh(){
  try{
   const [st,peers,agents,hist]=await Promise.all([j('/v1/status'),j('/v1/peers'),j('/v1/fleet/agents'),j('/v1/history')]);
