@@ -988,6 +988,16 @@ row input{width:auto}
 <input id="token-input" style="width:100%" placeholder="local_api.token">
 <div class="row"><button class="primary" onclick="saveToken()">进入控制台</button></div>
 </div></div>
+<div id="agent-modal" hidden style="position:fixed;inset:0;background:rgba(4,6,10,.8);align-items:center;justify-content:center;z-index:60;backdrop-filter:blur(4px)">
+  <div class="box">
+    <h3>编辑 Agent</h3>
+    <label>agent_id（身份，不可改）</label><input id="ag-id" readonly>
+    <label>名称 name（改后全网同步）</label><input id="ag-name">
+    <label>能力 capabilities（逗号分隔）</label><input id="ag-caps">
+    <div class="row"><button class="primary" onclick="saveAgentEdit()">保存</button><button onclick="hideAgentEdit()">取消</button></div>
+    <div id="ag-res" class="hint"></div>
+  </div>
+</div>
 
 <div id="app" class="hidden">
 <aside id="sidebar">
@@ -1031,7 +1041,7 @@ row input{width:auto}
       <div class="card"><h2>节点 Peers</h2><table><thead><tr><th>名称</th><th>node_id</th><th>地址</th><th>标签</th><th>状态</th></tr></thead><tbody id="peers-body"></tbody></table></div>
     </section>
     <section id="p-agents" class="hidden">
-      <div class="card"><h2>Agent（全网）</h2><table><thead><tr><th>节点</th><th>agent_id</th><th>名字</th><th>能力</th><th>状态</th></tr></thead><tbody id="agents-body"></tbody></table></div>
+      <div class="card"><h2>Agent（全网）</h2><table><thead><tr><th>节点</th><th>agent_id</th><th>名字</th><th>能力</th><th>状态</th><th>操作</th></tr></thead><tbody id="agents-body"></tbody></table></div>
     </section>
     <section id="p-chat" class="hidden">
       <div class="card"><h2>发送消息 / 文件</h2>
@@ -1075,7 +1085,7 @@ let TOKEN=sessionStorage.getItem(LS_KEY)||'';
 const HDR=()=>({'X-Auth-Token':TOKEN});
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(ts){try{return new Date(ts).toLocaleString();}catch{return ts;}}
-let HIST=[],OV={page:1},CH={page:1},NAMES={},AN={};
+let HIST=[],OV={page:1},CH={page:1},NAMES={},AN={},AGENTS=[];
 function who(n){return NAMES[n]||n;}
 function whoa(n,a){return a?AN[n+'|'+a]||a:''}
 function dirLab(m){if(m.kind==='file')return '📄 文件';if(m.direction==='out')return '⬆ 发出';if(m.direction==='in')return '⬇ 收到';return '• 本机';}
@@ -1115,6 +1125,13 @@ function renderList(elx,info,arr,page,size){
 function ovGo(p){OV.page=renderList(el('ov-hist'),el('ov-info'),filterHist(el('ov-kw').value,HIST),p,parseInt(el('ov-size').value)||20);}
 function chGo(p){CH.page=renderList(el('history'),el('ch-info'),filterHist(el('ch-kw').value,HIST),p,parseInt(el('ch-size').value)||50);}
 async function openFl(nm){try{await j('/v1/open-folder',{method:'POST',body:JSON.stringify({file:decodeURIComponent(nm)})});}catch(e){}}
+function editAgent(i){const a=AGENTS[i]||{};el('ag-id').value=a.agent_id||'';el('ag-name').value=a.name||'';el('ag-caps').value=(a.capabilities||[]).join(', ');el('ag-res').textContent='';const m=el('agent-modal');m.hidden=false;m.style.display='flex';}
+function hideAgentEdit(){const m=el('agent-modal');m.hidden=true;m.style.display='none';}
+async function saveAgentEdit(){
+  const body={agent_id:el('ag-id').value.trim(),name:el('ag-name').value.trim(),capabilities:el('ag-caps').value.split(/[,，]/).map(x=>x.trim()).filter(Boolean)};
+  try{const d=await j('/v1/agents',{method:'POST',body:JSON.stringify(body)});el('ag-res').textContent=JSON.stringify(d);hideAgentEdit();refresh();}catch(e){el('ag-res').textContent='保存失败: '+(e.message||e);}
+}
+async function delAgent(i){const a=AGENTS[i]||{};if(!confirm('删除 Agent '+a.agent_id+'？'))return;try{const d=await j('/v1/agents',{method:'DELETE',body:JSON.stringify({agent_id:a.agent_id})});alert(JSON.stringify(d));refresh();}catch(e){alert('删除失败: '+(e.message||e));}}
 function pick(id,ag){
   const t=el('to'),t2=el('to2'),a=el('to_agent'),a2=el('to_agent2');
   if(t){t.value=id;} if(t2){t2.value=id;}
@@ -1183,7 +1200,8 @@ async function refresh(){
   $('m-version').textContent=st.version;
   let pe=''; if(peers&&peers.ok)for(const p of peers.peers)pe+=`<tr><td>${esc(p.name)}</td><td>${esc(p.node_id)}</td><td>${esc(p.addr)}</td><td>${(p.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</td><td><span class="badge ${p.online?'on':'off'}"><span class="dot"></span>${p.online?'在线':'离线'}</span></td></tr>`;
   $('peers-body').innerHTML=pe;
-  let ag=''; if(agents&&agents.ok)for(const a of agents.agents)ag+=`<tr><td>${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td>${esc(a.name)}</td><td>${(a.capabilities||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join('')}</td><td><span class="badge ${a.online?'on':'off'}"><span class="dot"></span>${a.online?'在线':'离线'}</span></td></tr>`;
+  AGENTS=agents&&agents.ok?agents.agents:[];
+  let ag=''; AGENTS.forEach((a,i)=>ag+=`<tr><td>${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td>${esc(a.name)}</td><td>${(a.capabilities||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join('')}</td><td><span class="badge ${a.online?'on':'off'}"><span class="dot"></span>${a.online?'在线':'离线'}</span></td><td><button class="tbtn" onclick="editAgent(${i})">改名</button> <button class="tbtn" onclick="delAgent(${i})">删除</button></td></tr>`);
   $('agents-body').innerHTML=ag;
   // 节点名 / agent 名映射（给人看）
   NAMES={}; AN={};
