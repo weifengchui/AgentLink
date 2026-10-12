@@ -57,17 +57,21 @@ pub struct DiscoveryMessage {
     pub name: String,
     /// Peer WebSocket port.
     pub port: u16,
+    /// Machine-level capability labels.
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub ts: String,
 }
 
 impl DiscoveryMessage {
-    pub fn new(action: &str, node_id: &str, name: &str, port: u16) -> Self {
+    pub fn new(action: &str, node_id: &str, name: &str, port: u16, tags: &[String]) -> Self {
         DiscoveryMessage {
             discovery: DISCOVERY_VERSION,
             action: action.to_string(),
             node_id: node_id.to_string(),
             name: name.to_string(),
             port,
+            tags: tags.to_vec(),
             ts: now_rfc3339(),
         }
     }
@@ -118,6 +122,12 @@ pub struct Envelope {
     pub msg_id: String,
     pub from: String,
     pub to: String,
+    /// Source agent id (optional; multiple agents may share one node).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_agent: Option<String>,
+    /// Target agent id on the destination node (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_agent: Option<String>,
     #[serde(rename = "type")]
     pub kind: String,
     pub action: String,
@@ -140,6 +150,8 @@ impl Envelope {
             msg_id: new_id(),
             from: node_id.to_string(),
             to: "*".to_string(),
+            from_agent: None,
+            to_agent: None,
             kind: "ctrl".to_string(),
             action: "heartbeat".to_string(),
             payload: serde_json::Value::Null,
@@ -151,6 +163,7 @@ impl Envelope {
     }
 
     /// Build a business envelope with a fresh `msg_id` and timestamp.
+    #[allow(clippy::too_many_arguments)]
     pub fn business(
         node_id: &str,
         to: &str,
@@ -159,12 +172,16 @@ impl Envelope {
         payload: Value,
         ttl_seconds: Option<u64>,
         reply_to: Option<String>,
+        from_agent: Option<String>,
+        to_agent: Option<String>,
     ) -> Self {
         Envelope {
             v: PROTOCOL_VERSION,
             msg_id: new_id(),
             from: node_id.to_string(),
             to: to.to_string(),
+            from_agent,
+            to_agent,
             kind: kind.to_string(),
             action: action.to_string(),
             payload,
@@ -185,6 +202,8 @@ impl Envelope {
             json!({ "ref": ref_id }),
             None,
             None,
+            None,
+            None,
         )
     }
 
@@ -198,6 +217,30 @@ impl Envelope {
             json!({ "node_id": peer_id, "name": peer_name }),
             None,
             None,
+            None,
+            None,
+        )
+    }
+
+    /// Agent directory push frame between nodes (`ctrl/agents_update`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn agents_update(
+        node_id: &str,
+        to: &str,
+        payload: Value,
+        from_agent: Option<String>,
+        to_agent: Option<String>,
+    ) -> Self {
+        Envelope::business(
+            node_id,
+            to,
+            "ctrl",
+            "agents_update",
+            payload,
+            None,
+            None,
+            from_agent,
+            to_agent,
         )
     }
 }

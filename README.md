@@ -71,7 +71,13 @@ curl -H 'X-Auth-Token: <local token>' http://127.0.0.1:8765/v1/peers
 | POST | `/v1/send` | `X-Auth-Token` | 发消息（点对点 / `"*"` 广播）；body 无需 Content-Type |
 | POST | `/v1/send-file` | `X-Auth-Token` | 传本地文件（`to` + `file_path`） |
 | POST | `/v1/ack-inbox` | `X-Auth-Token` | 确认已读的本机消息 |
-| WS | `/v1/ws?token=…&client=…` | query token | 订阅本机入站消息与 join/leave 事件 |
+| POST | `/v1/send-file` | `X-Auth-Token` | 传本地文件（`to` + `file_path`） |
+| POST | `/v1/ack-inbox` | `X-Auth-Token` | 确认已读的本机消息 |
+| GET/POST/DELETE | `/v1/agents` | `X-Auth-Token` | 注册/查看/注销本机 Agent（多 Agent，能力标签） |
+| GET | `/v1/fleet/agents` | `X-Auth-Token` | 全网 Agent 目录（节点间自动同步） |
+| GET | `/v1/history` | `X-Auth-Token` | 最近对话记录（环形缓冲） |
+| GET | `/web?token=…` | query token | **人工可看页面**：节点 / Agent / 对话历史 |
+| WS | `/v1/ws?token=…&client=…` | query token | 订阅本机入站消息（`client` 即 agent_id，按 `to_agent` 定向投递）与 join/leave 事件 |
 | WS | `/peer/ws` | cluster token（握手） | 对等节点消息连接 |
 | WS | `/peer/file/ws` | cluster token（握手） | 对等节点文件传输连接 |
 
@@ -92,7 +98,10 @@ curl -X POST http://127.0.0.1:8765/v1/send-file -H "X-Auth-Token: $TOKEN" -d \
 - **发现**：UDP 广播（默认）→ mDNS（`--features mdns`）→ 静态 peers（兜底）
 - **拓扑**：Mesh 全互联 WebSocket，`node_id` 字典序小的主动拨号，每对一条连接
 - **可靠性**：点对点 at-least-once（ACK + 有界重试 + 离线暂存 TTL），广播 at-most-once
-- **消息**：统一 JSON 信封，`payload` 完全透传，不做任何业务解析
+- **消息**：统一 JSON 信封（含 `from_agent`/`to_agent`），多 Agent 一机并存、Agent 间对话，`payload` 完全透传
+- **Agent 目录**：注册能力标签，节点间 `ctrl/agents_update` 同步，`/v1/fleet/agents` 看全网
+- **人工视图**：`/web` 页面 + `/v1/history` 看节点 / Agent / 双方聊了啥
+- **机器标签**：`tags` 进 `/v1/peers`（A：能力标签）
 - **文件**：独立 `/peer/file/ws` 连接，分块 + SHA-256 校验 + `recv_dir` 沙箱
 - **安全**：`strict`（共享 `cluster_token` + HMAC 握手/帧签名 + 时间窗防重放）/ `open`
 

@@ -4,6 +4,7 @@
 //! A single listener serves both; `/v1/*` requires the local API token while
 //! `/peer/ws` authenticates via the cluster token during the handshake.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use axum::body::Bytes;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequest, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{async_trait, Json, Router as AxRouter};
 use futures_util::{SinkExt, StreamExt};
@@ -77,6 +78,13 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/send", post(send))
         .route("/v1/send-file", post(send_file))
         .route("/v1/ack-inbox", post(ack_inbox))
+        .route(
+            "/v1/agents",
+            get(agents_get).post(agents_post).delete(agents_delete),
+        )
+        .route("/v1/fleet/agents", get(fleet_agents))
+        .route("/v1/history", get(history_get))
+        .route("/web", get(web_page))
         .route("/v1/ws", get(subscribe_ws))
         .route("/peer/ws", get(peer_ws))
         .route("/peer/file/ws", get(file_ws))
@@ -148,6 +156,12 @@ struct SendRequest {
     ttl_seconds: Option<u64>,
     #[serde(default)]
     reply_to: Option<String>,
+    /// Sender agent id (multiple agents may share this node).
+    #[serde(default)]
+    from_agent: Option<String>,
+    /// Target agent id on the destination node.
+    #[serde(default)]
+    to_agent: Option<String>,
 }
 
 /// Send a message to a peer (`node_id` or name) or broadcast to `"*"`.
@@ -181,6 +195,8 @@ async fn send(
         payload,
         req.ttl_seconds,
         req.reply_to,
+        req.from_agent,
+        req.to_agent,
     );
     match state.router.send(env).await {
         Ok(msg_id) => (
@@ -276,6 +292,186 @@ async fn ack_inbox(
     (StatusCode::OK, Json(json!({ "ok": true, "acked": acked })))
 }
 
+// ---- agents & conversation history (M7) -------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct RegisterAgentRequest {
+    agent_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+/// Register (or refresh) a local AI agent. Capabilities are broadcast to peers.
+async fn agents_post(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    JsonAny(req): JsonAny<RegisterAgentRequest>,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let id = req.agent_id.trim();
+    let valid = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if !valid {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "agent_id must be 1-64 chars of [A-Za-z0-9_.-]" })),
+        );
+    }
+    let rec =
+        state
+            .router
+            .register_agent(id, req.name.map(|s| s.trim().to_string()), req.capabilities);
+    (StatusCode::OK, Json(json!({ "ok": true, "agent": rec })))
+}
+
+/// Remove a local agent (its registration vanishes from the fleet view too).
+async fn agents_delete(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    JsonAny(req): JsonAny<RegisterAgentRequest>,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let removed = state.router.unregister_agent(req.agent_id.trim());
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "removed": removed })),
+    )
+}
+
+/// List agents registered on this node.
+async fn agents_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "node": { "node_id": state.config.node_id, "name": state.config.name },
+            "agents": state.router.local_agents(),
+        })),
+    )
+}
+
+/// List agents across the whole LAN fleet (local + synced from peers).
+async fn fleet_agents(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let mut names: HashMap<String, String> = HashMap::new();
+    for p in state.peers.snapshot() {
+        names.insert(p.node_id.clone(), p.name.clone());
+    }
+    names.insert(state.config.node_id.clone(), state.config.name.clone());
+    let agents: Vec<serde_json::Value> = state
+        .router
+        .fleet_agents()
+        .iter()
+        .map(|a| {
+            let mut v = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
+            if let serde_json::Value::Object(m) = &mut v {
+                m.insert(
+                    "node_name".to_string(),
+                    serde_json::json!(names
+                        .get(&a.node_id)
+                        .cloned()
+                        .unwrap_or_else(|| a.node_id.clone())),
+                );
+            }
+            v
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "agents": agents })),
+    )
+}
+
+/// Recent bus traffic (ring buffer) for the human view.
+async fn history_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "history": state.router.history() })),
+    )
+}
+
+/// Human-friendly dashboard page (no assets, reads /v1/* via JS).
+async fn web_page(Query(params): Query<SubParams>, State(state): State<SharedState>) -> Response {
+    let expected = state.config.local_api.token.as_bytes();
+    if !constant_time_eq(params.token.as_bytes(), expected) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "bad token" })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Html(web_html(&params.token, state.config.history.len)),
+    )
+        .into_response()
+}
+
+fn web_html(token: &str, history_len: usize) -> String {
+    const HTML: &str = r#"<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>AgentLink · 对话总览</title>
+<style>
+:root{color-scheme:dark}
+body{font-family:system-ui,"Segoe UI","Microsoft YaHei";background:#0f1115;color:#d7dde6;margin:0;padding:16px}
+h1{font-size:18px;margin:0 0 4px}.sub{color:#8b949e;font-size:12px;margin-bottom:14px}
+.card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 14px;margin-bottom:14px}
+.card h2{font-size:13px;margin:0 0 8px;color:#7ee787}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;margin-left:4px}
+.on{background:#1f6feb22;color:#58a6ff}.off{background:#f8514922;color:#f85149}
+table{border-collapse:collapse;width:100%;font-size:12px}
+td,th{text-align:left;padding:4px 8px;border-bottom:1px solid #21262d;white-space:nowrap}
+.msg{border-left:3px solid #30363d;padding:6px 10px;margin:6px 0;font-size:12px;background:#0d1117;border-radius:0 6px 6px 0}
+.msg .meta{color:#8b949e;font-size:11px}.msg .pay{color:#79c0ff;word-break:break-all;white-space:pre-wrap}
+</style></head><body>
+<h1>AgentLink</h1><div class="sub">局域网 Agent 通信总线 · 人类可看视图 · 每 2 秒刷新</div>
+<div id="status" class="sub">加载中…</div>
+<div class="card"><h2>节点 / Peers</h2><table id="peers"></table></div>
+<div class="card"><h2>Agent（全网）</h2><table id="agents"></table></div>
+<div class="card"><h2>对话记录（环形缓冲 __LEN__ 条）</h2><div id="history"></div></div>
+<script>
+const TOKEN="__TOKEN__";
+const HDR={"X-Auth-Token":TOKEN};
+async function j(p){const r=await fetch(p,{headers:HDR});return r.json();}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function fmt(ts){try{return new Date(ts).toLocaleString();}catch{return ts;}}
+async function refresh(){
+ try{
+  const [st,peers,agents,hist]=await Promise.all([j('/v1/status'),j('/v1/peers'),j('/v1/fleet/agents'),j('/v1/history')]);
+  let pe='<tr><th>名称</th><th>node_id</th><th>地址</th><th>标签tags</th><th>状态</th></tr>';
+  if(peers&&peers.ok)for(const p of peers.peers)pe+=`<tr><td>${esc(p.name)}</td><td>${esc(p.node_id)}</td><td>${esc(p.addr)}</td><td>${esc((p.tags||[]).join(', '))}</td><td><span class="badge ${p.online?'on':'off'}">${p.online?'在线':'离线'}</span></td></tr>`;
+  document.getElementById('peers').innerHTML=pe;
+  let ag='<tr><th>node</th><th>agent_id</th><th>名字</th><th>能力</th><th>状态</th></tr>';
+  if(agents&&agents.ok)for(const a of agents.agents)ag+=`<tr><td>${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td>${esc(a.name)}</td><td>${esc((a.capabilities||[]).join(', '))}</td><td><span class="badge ${a.online?'on':'off'}">${a.online?'在线':'离线'}</span></td></tr>`;
+  document.getElementById('agents').innerHTML=ag;
+  let hh='';
+  if(hist&&hist.ok)for(const m of hist.history.slice().reverse())hh+=`<div class="msg"><div class="meta">${fmt(m.ts)} · ${esc(m.direction)} · ${esc(m.from_agent||'节点')}${esc(m.from)} → ${esc(m.to_agent||'')}${esc(m.to)} · ${esc(m.kind)}/${esc(m.action)}</div><div class="pay">${esc(JSON.stringify(m.payload))}</div></div>`;
+  document.getElementById('history').innerHTML=hh||'<div class="sub">（暂无业务消息，等 Agent 说话后这里会实时显示）</div>';
+  document.getElementById('status').textContent=`节点 ${st?st.name:'?'} · 在线 ${st?st.peers_online:0}/${st?st.peers_known:0} · 历史 ${hist&&hist.ok?hist.history.length:0} 条 · 最后刷新 ${new Date().toLocaleTimeString()}`;
+ }catch(e){document.getElementById('status').textContent='刷新失败: '+e;}
+}
+refresh();setInterval(refresh,2000);
+</script></body></html>"#;
+    HTML.replace("__TOKEN__", token)
+        .replace("__LEN__", &history_len.to_string())
+}
+
 // ---- local subscription -----------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -299,12 +495,17 @@ async fn subscribe_ws(
         )
             .into_response();
     }
-    let _ = params.client;
-    ws.on_upgrade(move |socket| handle_subscriber(socket, state))
+    let client = params.client.unwrap_or_default();
+    ws.on_upgrade(move |socket| handle_subscriber(socket, state, client))
 }
 
-/// Forward router events (messages + join/leave) to a local WS client.
-async fn handle_subscriber(socket: WebSocket, state: SharedState) {
+/// Forward events/messages to a local WS client (an agent).
+/// The `client` id is the agent id: messages carrying `to_agent` only reach the
+/// matching client.
+async fn handle_subscriber(socket: WebSocket, state: SharedState, client_id: String) {
+    if !client_id.is_empty() {
+        state.router.client_online(&client_id);
+    }
     let mut rx: broadcast::Receiver<Envelope> = state.router.subscribe();
     let (mut sender, mut receiver) = socket.split();
     loop {
@@ -312,6 +513,15 @@ async fn handle_subscriber(socket: WebSocket, state: SharedState) {
             ev = rx.recv() => {
                 match ev {
                     Ok(env) => {
+                        // Agent-level routing: only deliver when addressed to
+                        // this client, or to the node in general.
+                        let pass = env
+                        .to_agent
+                        .as_deref()
+                        .is_none_or(|a| a == client_id.as_str());
+                        if !pass {
+                            continue;
+                        }
                         let text = serde_json::to_string(&env).unwrap_or_default();
                         if sender.send(WsMessage::Text(text)).await.is_err() {
                             break;
@@ -331,6 +541,9 @@ async fn handle_subscriber(socket: WebSocket, state: SharedState) {
                 }
             }
         }
+    }
+    if !client_id.is_empty() {
+        state.router.client_offline(&client_id);
     }
 }
 

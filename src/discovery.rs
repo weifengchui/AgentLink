@@ -67,7 +67,7 @@ fn make_socket(port: u16) -> anyhow::Result<UdpSocket> {
 }
 
 async fn send(socket: &UdpSocket, cfg: &Config, action: &str) {
-    let msg = DiscoveryMessage::new(action, &cfg.node_id, &cfg.name, cfg.listen_port);
+    let msg = DiscoveryMessage::new(action, &cfg.node_id, &cfg.name, cfg.listen_port, &cfg.tags);
     let data = match serde_json::to_vec(&msg) {
         Ok(d) => d,
         Err(e) => {
@@ -102,7 +102,7 @@ fn handle_datagram(data: &[u8], src: SocketAddr, cfg: &Config, state: &SharedSta
 
     let is_new = state
         .peers
-        .upsert_discovered(&msg.node_id, &msg.name, &addr);
+        .upsert_discovered(&msg.node_id, &msg.name, &addr, msg.tags);
     if is_new {
         tracing::info!(peer = %msg.name, node_id = %msg.node_id, addr, "discovery: new peer");
     }

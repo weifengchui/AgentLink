@@ -581,6 +581,8 @@ async fn send_file_frame(
         payload,
         ttl,
         None,
+        None,
+        None,
     );
     send_value(sink, &env).await
 }

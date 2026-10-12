@@ -37,7 +37,11 @@
 | POST | `/v1/send` | 发消息（点对点 / 广播） |
 | POST | `/v1/send-file` | 发文件 |
 | POST | `/v1/ack-inbox` | 确认本机已消费某条消息（可选） |
-| WS | `/v1/ws?token=&client=` | **订阅入站消息与节点事件（最重要）** |
+| GET/POST/DELETE | `/v1/agents` | 注册 / 查看 / 注销**本机 Agent**（`agent_id`、名字、能力标签） |
+| GET | `/v1/fleet/agents` | 全网 Agent 目录（本机 + 各在线节点同步的） |
+| GET | `/v1/history` | 最近对话记录（环形缓冲，供人工查看） |
+| GET | `/web?token=` | **人工可看页面**：节点 / Agent / 对话历史，每 2 秒刷新 |
+| WS | `/v1/ws?token=&client=` | **订阅入站消息与节点事件（最重要）**；`client` 即你的 `agent_id`，节点按 `to_agent` 定向投递 |
 
 > 请求体是 JSON；`Content-Type` 不是必须的（缺省也能解析）。所有响应也是 JSON。
 > 除 `/v1/health` 外都要求 `X-Auth-Token`，错误响应 `401 {"error":"invalid or missing X-Auth-Token"}`。
@@ -58,7 +62,9 @@
   "v": 1,
   "msg_id": "6f4c...aab9",            // 全局唯一；用它对账/去重
   "from": "d710e996d4dd",             // 发送方 node_id（12 位 hex）
+  "from_agent": "writer",             // 可选：发送方 agent_id（多 Agent 时填）
   "to": "0cafccebea76",               // 目标 node_id，或 "*"（广播）
+  "to_agent": "reviewer",             // 可选：目标 agent_id；填了只在目标机器上投递给该 agent
   "type": "text",                     // 大类：text | event | file | ctrl
   "action": "send",                   // 具体动作，见下表
   "payload": { ... },                 // 业务数据；对 AgentLink 完全不透明
@@ -96,9 +102,40 @@
 ```
 
 - `to` 规则：12 位十六进制 → 当 node_id；否则在已知节点里按 name 匹配；`"*"` → 广播。
+- `to_agent`（可选）：目标机器上的 agent_id。填了之后，目标节点的 WS 订阅只会投递给 `client == to_agent` 的那个 agent；不填则投递给目标机器所有订阅者。
+- 目标就是本机时（`to` = 本机 node_id）：消息在本机内路由，可用来给同机其他 Agent 发消息。
 - 广播：发给**当前在线**所有节点 + 本机订阅者；不做重试（at-most-once）。
 - 点对点：**at-least-once**——节点会等对端 ACK，超时重试（默认 5s×5 次），对方离线时暂存（默认 300s）。所以你**对端可能收到重复**，请用 `msg_id` 去重；`/v1/status` 里 `pending_acks` 为 0 表示已全部送达。
 - 目标不存在/未知名：`400 {"ok":false,"error":"unknown target '...' (not a node_id or known peer name)"}`。
+
+### 多 Agent（M7）：一机多 Agent，彼此可对话
+
+机器上可跑多个 Agent，各自一个 `agent_id`：
+
+```jsonc
+// 1) 注册本机 Agent（能力标签会同步到全网）
+POST /v1/agents
+{ "agent_id": "writer", "name": "Writer Agent", "capabilities": ["写作", "文案"] }
+// → { "ok": true, "agent": { "agent_id": "writer", ..., "online": false, "node_id": "0caf..." } }
+
+// 2) 订阅时用 client=你的 agent_id（节点据此算你的在线状态并按 to_agent 投递）
+ws://127.0.0.1:8765/v1/ws?token=<...>&client=writer
+
+// 3) 发给某台机器上的某个 Agent
+POST /v1/send
+{ "to": "0cafccebea76", "from_agent": "writer", "to_agent": "reviewer",
+  "type": "text", "action": "send", "payload": { "content": "请审查" } }
+
+// 4) 查看全网 Agent（含哪台机器、能力、在线）
+GET /v1/fleet/agents
+
+// 5) 注销
+DELETE /v1/agents  { "agent_id": "reviewer" }
+```
+
+- `online`：= 该 agent_id 是否有 WS 订阅在线（有订阅即在线）。
+- 节点间通过 `ctrl/agents_update` 帧同步各自 Agent 表，全网 Agent 目录不用轮询每台机器。
+- **寻址建议**：先 `GET /v1/fleet/agents` 找到目标 agent 与其所属 node，再 `to` = 该 node、`to_agent` = 该 agent。机器级能力标签在 `/v1/peers[].tags`（配置 `agentlink.json` 的 `tags`）。
 
 ### 请求/回复范式（建议）
 

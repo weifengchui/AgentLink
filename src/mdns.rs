@@ -97,7 +97,9 @@ fn handle_resolved(cfg: &Config, state: &SharedState, info: &ServiceInfo) {
     };
 
     let addr = format!("{ip}:{port}");
-    let is_new = state.peers.upsert_discovered(&node_id, &name, &addr);
+    let is_new = state
+        .peers
+        .upsert_discovered(&node_id, &name, &addr, Vec::new());
     if is_new {
         tracing::info!(peer = %name, node_id = %node_id, addr, "mdns: peer discovered");
     }

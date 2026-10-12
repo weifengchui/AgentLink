@@ -313,6 +313,10 @@ async fn handle_text(
                 addr: advertised,
                 tx: send.clone(),
             });
+            // Tell the peer which agents live on this node.
+            if let Some(env) = state.router.agents_update_envelope(&hello.node_id) {
+                let _ = send_text(send, &env).await;
+            }
             true
         }
 
@@ -331,6 +335,18 @@ async fn handle_text(
                 .unwrap_or("");
             if !ref_id.is_empty() {
                 state.router.on_ack(ref_id);
+            }
+            true
+        }
+
+        "agents_update" => {
+            let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("");
+            let agents: Option<Vec<crate::router::AgentRecord>> = value
+                .get("payload")
+                .and_then(|p| p.get("agents"))
+                .and_then(|a| serde_json::from_value(a.clone()).ok());
+            if let (Some(agents), false) = (agents, from.is_empty()) {
+                state.router.on_agents_update(from, agents);
             }
             true
         }

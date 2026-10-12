@@ -21,6 +21,11 @@ pub struct Config {
     pub listen_port: u16,
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// Machine-level capability labels (shown in /v1/peers).
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub history: HistoryConfig,
 
     #[serde(default)]
     pub discovery: DiscoveryConfig,
@@ -109,6 +114,19 @@ pub struct LogConfig {
     pub file: String,
 }
 
+/// Human-visible conversation history (in-memory ring + optional JSONL file).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Ring-buffer capacity (most recent N messages kept in memory).
+    #[serde(default = "default_history_len")]
+    pub len: usize,
+    /// Optional append log under `data_dir` (e.g. "history.jsonl").
+    #[serde(default)]
+    pub file: String,
+}
+
 // ---- defaults ---------------------------------------------------------------
 
 fn default_version() -> u32 {
@@ -179,6 +197,20 @@ fn default_log_level() -> String {
 }
 fn default_log_format() -> String {
     "text".to_string()
+}
+
+fn default_history_len() -> usize {
+    500
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        HistoryConfig {
+            enabled: true,
+            len: default_history_len(),
+            file: String::new(),
+        }
+    }
 }
 
 // ---- sub-config defaults ----------------------------------------------------
@@ -262,6 +294,8 @@ impl Config {
             name: name.unwrap_or_else(default_node_name),
             listen_port: DEFAULT_LISTEN_PORT,
             data_dir: default_data_dir(),
+            tags: Vec::new(),
+            history: HistoryConfig::default(),
             discovery: DiscoveryConfig {
                 enabled: true,
                 methods: default_discovery_methods(),

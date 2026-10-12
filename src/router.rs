@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::config::Config;
@@ -92,6 +93,39 @@ struct OfflineEntry {
     expires_at: Instant,
 }
 
+/// An AI agent registered on some node (M7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRecord {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// True when at least one WS subscriber with `client == agent_id` is connected.
+    pub online: bool,
+    /// Owning node_id (filled in the fleet view).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node_id: String,
+}
+
+/// One history entry for the human view (`/web`, `/v1/history`).
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryEntry {
+    pub ts: String,
+    pub msg_id: String,
+    /// Address string of the sending/receiving node.
+    pub node: String,
+    /// `in` | `out` | `local`.
+    pub direction: String,
+    pub from: String,
+    pub from_agent: Option<String>,
+    pub to: String,
+    pub to_agent: Option<String>,
+    pub kind: String,
+    pub action: String,
+    pub payload: serde_json::Value,
+}
+
 pub struct Router {
     cfg: Config,
     registry: PeerRegistry,
@@ -103,6 +137,14 @@ pub struct Router {
     offline: tokio::sync::Mutex<HashMap<String, VecDeque<OfflineEntry>>>,
     /// Messages delivered locally but not yet acked by the local agent.
     local_pending: Mutex<HashMap<String, Instant>>,
+    /// Local AI agents registered on this node (agent_id -> record).
+    agents: Mutex<HashMap<String, AgentRecord>>,
+    /// Remote agents, keyed by their owning node_id (synced via ctrl frames).
+    fleet_agents: Mutex<HashMap<String, Vec<AgentRecord>>>,
+    /// Active local WS subscribers count per client id.
+    clients: Mutex<HashMap<String, usize>>,
+    /// Ring buffer of recent traffic for the human view.
+    history: Mutex<VecDeque<HistoryEntry>>,
 }
 
 impl Router {
@@ -121,6 +163,10 @@ impl Router {
             pending: Mutex::new(HashMap::new()),
             offline: tokio::sync::Mutex::new(HashMap::new()),
             local_pending: Mutex::new(HashMap::new()),
+            agents: Mutex::new(HashMap::new()),
+            fleet_agents: Mutex::new(HashMap::new()),
+            clients: Mutex::new(HashMap::new()),
+            history: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -164,9 +210,16 @@ impl Router {
             env.sig = Some(sig);
         }
 
+        // Local delivery: addressed to this very node (agents on this machine).
+        if env.to == self.cfg.node_id {
+            let _ = self.handle_incoming(&env).await;
+            return Ok(env.msg_id);
+        }
+
         let is_broadcast = env.to == "*" || env.to.is_empty();
 
         if is_broadcast {
+            self.record_history(&env, "out", "*");
             let sinks: Vec<PeerSink> = self.registry.all();
             for sink in sinks {
                 self.send_raw(&sink, &env).await;
@@ -176,6 +229,7 @@ impl Router {
             return Ok(env.msg_id);
         }
 
+        self.record_history(&env, "out", &env.to);
         match self.registry.get(&env.to) {
             Some(sink) => {
                 if self.send_raw(&sink, &env).await {
@@ -233,6 +287,7 @@ impl Router {
             dedup.record(&env.msg_id)
         };
         if is_new {
+            self.record_history(env, "in", &env.from);
             self.deliver_local(env.clone()).await;
             if env.to != "*" {
                 self.local_pending
@@ -441,5 +496,188 @@ impl Router {
 
     pub fn local_pending_count(&self) -> usize {
         self.local_pending.lock().unwrap().len()
+    }
+
+    // ---- agent registry (M7) ------------------------------------------------
+
+    pub fn register_agent(
+        &self,
+        agent_id: &str,
+        name: Option<String>,
+        capabilities: Vec<String>,
+    ) -> AgentRecord {
+        let online = self.clients.lock().unwrap().contains_key(agent_id);
+        let rec = AgentRecord {
+            agent_id: agent_id.to_string(),
+            name,
+            capabilities,
+            online,
+            node_id: self.cfg.node_id.clone(),
+        };
+        self.agents
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), rec.clone());
+        self.sync_push_agents();
+        rec
+    }
+
+    pub fn unregister_agent(&self, agent_id: &str) -> bool {
+        let removed = self.agents.lock().unwrap().remove(agent_id).is_some();
+        if removed {
+            self.sync_push_agents();
+        }
+        removed
+    }
+
+    pub fn local_agents(&self) -> Vec<AgentRecord> {
+        let agents = self.agents.lock().unwrap();
+        let mut v: Vec<AgentRecord> = agents.values().cloned().collect();
+        v.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        v
+    }
+
+    /// Agents across the whole fleet (local + cached from peers).
+    pub fn fleet_agents(&self) -> Vec<AgentRecord> {
+        let mut out = self.local_agents();
+        let remote = self.fleet_agents.lock().unwrap();
+        for list in remote.values() {
+            out.extend(list.iter().cloned());
+        }
+        out.sort_by(|a, b| {
+            (a.node_id.as_str(), a.agent_id.as_str())
+                .cmp(&(b.node_id.as_str(), b.agent_id.as_str()))
+        });
+        out
+    }
+
+    /// A local WS subscriber connected (its `client` = agent id).
+    pub fn client_online(&self, client_id: &str) {
+        {
+            let mut c = self.clients.lock().unwrap();
+            *c.entry(client_id.to_string()).or_insert(0) += 1;
+        }
+        self.refresh_agent_status();
+    }
+
+    pub fn client_offline(&self, client_id: &str) {
+        {
+            let mut c = self.clients.lock().unwrap();
+            if let Some(n) = c.get_mut(client_id) {
+                *n -= 1;
+                if *n == 0 {
+                    c.remove(client_id);
+                }
+            }
+        }
+        self.refresh_agent_status();
+    }
+
+    fn refresh_agent_status(&self) {
+        let clients = self.clients.lock().unwrap();
+        let mut changed = false;
+        {
+            let mut agents = self.agents.lock().unwrap();
+            for rec in agents.values_mut() {
+                let on = clients.contains_key(&rec.agent_id);
+                if rec.online != on {
+                    rec.online = on;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.sync_push_agents();
+        }
+    }
+
+    /// Cache the agent list reported by a peer node.
+    pub fn on_agents_update(&self, from_node: &str, agents: Vec<AgentRecord>) {
+        self.fleet_agents
+            .lock()
+            .unwrap()
+            .insert(from_node.to_string(), agents);
+    }
+
+    /// An `agents_update` envelope addressed to `to` (None if no agents here).
+    pub fn agents_update_envelope(&self, to: &str) -> Option<Envelope> {
+        let agents = self.local_agents();
+        if agents.is_empty() {
+            return None;
+        }
+        let payload = serde_json::json!({ "agents": agents });
+        Some(Envelope::agents_update(
+            &self.cfg.node_id,
+            to,
+            payload,
+            None,
+            None,
+        ))
+    }
+
+    /// Push our latest agent table to every connected peer.
+    pub fn sync_push_agents(&self) {
+        let Some(env) = self.agents_update_envelope("*") else {
+            return;
+        };
+        let Ok(text) = serde_json::to_string(&env) else {
+            return;
+        };
+        for sink in self.registry.all() {
+            let text = text.clone();
+            tokio::spawn(async move {
+                let _ = sink.tx.send(Frame::Text(text)).await;
+            });
+        }
+    }
+
+    // ---- conversation history (M7) -------------------------------------------
+
+    pub fn record_history(&self, env: &Envelope, direction: &str, node: &str) {
+        if !self.cfg.history.enabled {
+            return;
+        }
+        if env.kind == "ctrl" || env.kind == "event" {
+            return;
+        }
+        let entry = HistoryEntry {
+            ts: env.ts.clone(),
+            msg_id: env.msg_id.clone(),
+            node: node.to_string(),
+            direction: direction.to_string(),
+            from: env.from.clone(),
+            from_agent: env.from_agent.clone(),
+            to: env.to.clone(),
+            to_agent: env.to_agent.clone(),
+            kind: env.kind.clone(),
+            action: env.action.clone(),
+            payload: env.payload.clone(),
+        };
+        let mut h = self.history.lock().unwrap();
+        if h.len() >= self.cfg.history.len.max(1) {
+            h.pop_front();
+        }
+        h.push_back(entry);
+
+        let file = &self.cfg.history.file;
+        if !file.is_empty() {
+            let path = self.cfg.data_dir.join(file);
+            if let Ok(line) = serde_json::to_string(env) {
+                use std::io::Write;
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .and_then(|mut f| {
+                        f.write_all(line.as_bytes())?;
+                        f.write_all(b"\n")
+                    });
+            }
+        }
+    }
+
+    pub fn history(&self) -> Vec<HistoryEntry> {
+        let h = self.history.lock().unwrap();
+        h.iter().cloned().collect()
     }
 }

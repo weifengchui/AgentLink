@@ -75,7 +75,9 @@
   "v": 1,                          // 协议版本
   "msg_id": "uuid-v4",             // 全局唯一
   "from": "a1b2c3d4e5f6",          // 发送方 node_id
+  "from_agent": "writer",          // 可选：发送方 agent_id（多 Agent）
   "to":   "f6e5d4c3b2a1",          // 目标 node_id，或 "*" 表示广播
+  "to_agent": "reviewer",          // 可选：目标 agent_id（目标机器按此投递）
   "type": "text",                  // 大类
   "action": "send",                // 具体动作
   "payload": {},                   // 业务数据，中间层不解析
@@ -94,10 +96,14 @@
 | `text` | `broadcast` | 广播 | `to` 必须为 `"*"` |
 | `ctrl` | `hello` / `heartbeat` / `bye` | 双向 | 连接管理 |
 | `ctrl` | `ack` / `nack` | 双向 | 送达确认 |
+| `ctrl` | `agents_update` | 节点→节点 | Agent 目录同步（payload：`{agents:[{agent_id,name,capabilities,online,node_id}]}`） |
 | `event` | `join` / `leave` / `peer_update` | 节点→本地订阅者 | 上下线通知 |
 | `file` | `file_meta` / `file_accept` / `file_chunk` / `file_complete` / `file_done` / `file_error` | 双向 | 文件传输（§5） |
 
 `payload` 的语义由上层 Agent 定义，AgentLink 只做透传。
+
+投递规则：`to_agent` 非空时，目标节点只投递给 `client == to_agent` 的订阅者；
+否则投递给目标节点所有订阅者。若 `to` 为本机 `node_id`，消息在本机内路由（同机 Agent 互发）。
 
 ---
 

@@ -13,6 +13,8 @@ pub struct PeerInfo {
     pub name: String,
     /// `host:port` of the peer's WebSocket endpoint.
     pub addr: String,
+    /// Machine-level capability labels advertised by the peer.
+    pub tags: Vec<String>,
     pub online: bool,
     pub last_seen: Instant,
     /// `in` or `out`: who dialled.
@@ -25,6 +27,7 @@ pub struct PeerView {
     pub node_id: String,
     pub name: String,
     pub addr: String,
+    pub tags: Vec<String>,
     pub online: bool,
     pub last_seen_seconds_ago: u64,
     pub direction: String,
@@ -51,12 +54,21 @@ impl PeerTable {
     }
 
     /// Record a peer learned from discovery. Returns `true` if it is new.
-    pub fn upsert_discovered(&self, node_id: &str, name: &str, addr: &str) -> bool {
+    pub fn upsert_discovered(
+        &self,
+        node_id: &str,
+        name: &str,
+        addr: &str,
+        tags: Vec<String>,
+    ) -> bool {
         let mut map = self.inner.write().unwrap();
         match map.get_mut(node_id) {
             Some(p) => {
                 p.name = name.to_string();
                 p.addr = addr.to_string();
+                if !tags.is_empty() {
+                    p.tags = tags;
+                }
                 false
             }
             None => {
@@ -66,6 +78,7 @@ impl PeerTable {
                         node_id: node_id.to_string(),
                         name: name.to_string(),
                         addr: addr.to_string(),
+                        tags,
                         online: false,
                         last_seen: Instant::now(),
                         direction: String::new(),
@@ -83,6 +96,7 @@ impl PeerTable {
             node_id: node_id.to_string(),
             name: name.to_string(),
             addr: addr.to_string(),
+            tags: Vec::new(),
             online: false,
             last_seen: Instant::now(),
             direction: direction.to_string(),
@@ -131,6 +145,7 @@ impl PeerTable {
                 node_id: p.node_id.clone(),
                 name: p.name.clone(),
                 addr: p.addr.clone(),
+                tags: p.tags.clone(),
                 online: p.online,
                 last_seen_seconds_ago: p.last_seen.elapsed().as_secs(),
                 direction: p.direction.clone(),
