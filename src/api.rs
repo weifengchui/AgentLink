@@ -7,13 +7,15 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::Path as UrlPath;
 use axum::extract::{ConnectInfo, FromRequest, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{async_trait, Json, Router as AxRouter};
@@ -137,6 +139,8 @@ pub fn router(state: SharedState) -> AxRouter {
         )
         .route("/v1/fleet/agents", get(fleet_agents))
         .route("/v1/history", get(history_get))
+        .route("/v1/files/:file_name", get(file_download))
+        .route("/v1/open-folder", post(open_folder))
         .route("/v1/config", get(config_get).put(config_put))
         .route("/web", get(web_page))
         .route("/v1/web", get(web_page))
@@ -555,6 +559,154 @@ async fn history_get(State(state): State<SharedState>, headers: HeaderMap) -> im
     )
 }
 
+/// Download a file that this node received (served from `files.recv_dir`).
+async fn file_download(
+    UrlPath(file_name): UrlPath<String>,
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return unauthorized().into_response();
+    }
+    let Some(name) = crate::file::sanitize_name(&file_name) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid file name" })),
+        )
+            .into_response();
+    };
+    let path = state.config.files.recv_dir.join(&name);
+    if !path.is_file() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "file not found" })),
+        )
+            .into_response();
+    }
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let mut resp = Response::new(Body::from(bytes));
+            resp.headers_mut().insert(
+                "Content-Type",
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            resp.headers_mut().insert(
+                "Content-Disposition",
+                HeaderValue::from_static("attachment"),
+            );
+            resp.headers_mut().insert(
+                "X-Content-Type-Options",
+                HeaderValue::from_static("nosniff"),
+            );
+            resp
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": "read failed" })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenFolderRequest {
+    file: String,
+}
+
+/// Open the folder (highlighting the file) in the OS file manager.
+/// Local-only (loopback) + token required, since it triggers an OS action.
+async fn open_folder(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    JsonAny(req): JsonAny<OpenFolderRequest>,
+) -> Response {
+    if !addr.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "remote address; not allowed" })),
+        )
+            .into_response();
+    }
+    if !authorized(&state, &headers) {
+        return unauthorized().into_response();
+    }
+    let Some(name) = crate::file::sanitize_name(&req.file) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid file name" })),
+        )
+            .into_response();
+    };
+    let path = state.config.files.recv_dir.join(&name);
+    let dir = path.parent().map(|p| p.to_path_buf());
+    let Some(dir) = dir else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "no folder" })),
+        )
+            .into_response();
+    };
+    if !dir.is_dir() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "folder not found" })),
+        )
+            .into_response();
+    }
+    let opened = if path.is_file() {
+        open_in_folder(&path)
+    } else {
+        open_dir(&dir)
+    };
+    (StatusCode::OK, Json(json!({ "ok": opened }))).into_response()
+}
+
+/// Windows: `explorer /select,<file>`; Linux: open parent dir; macOS: `open -R`.
+fn open_in_folder(path: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg("/select,")
+            .arg(path)
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        path.parent()
+            .and_then(|d| Command::new("xdg-open").arg(d).spawn().ok())
+            .is_some()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg("-R").arg(path).spawn().is_ok()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+fn open_dir(dir: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer").arg(dir).spawn().is_ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open").arg(dir).spawn().is_ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(dir).spawn().is_ok()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
 // ---- config view / edit (web 配置页) ---------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -794,6 +946,13 @@ tr:hover td{background:#131a24}
 .msg .pay{color:#9cc5ff;word-break:break-all;white-space:pre-wrap}
 .msg.out{border-left-color:#4f8cff}
 .msg.in{border-left-color:#3fb950}
+.fl{position:relative;color:#7d8aa0;font-size:11px}
+.tool{display:none;gap:4px;margin-left:6px}
+.fl:hover .tool{display:inline-flex}
+.tbtn{display:inline-block;padding:1px 8px;border-radius:8px;font-size:11px;text-decoration:none;color:#9cc5ff;background:#182238;border:1px solid #263041;cursor:pointer;font-family:inherit;margin-left:2px}
+.chip-btn{display:inline-block;padding:2px 10px;border-radius:14px;font-size:11px;background:#16233b;color:#9db4dd;border:1px solid #263041;cursor:pointer;margin:2px}
+.chip-btn:hover{border-color:#4f8cff;color:#e6edf5}
+.msg.file .pay{color:#7ee787}
 .row{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
 input,textarea,select{background:#0b1017;color:#dbe2ea;border:1px solid #263041;border-radius:8px;padding:8px 10px;font-size:13px;font-family:inherit;outline:none}
 input:focus,textarea:focus,select:focus{border-color:#4f8cff}
@@ -853,7 +1012,14 @@ row input{width:auto}
         <div class="row"><input id="to" list="peers-list" placeholder="目标 node_id / 节点名 / * (广播)" style="flex:2"><input id="to_agent" placeholder="Agent (可选)" style="flex:1"></div>
         <div class="row"><textarea id="payload" rows="2" placeholder='{"content":"你好"}'></textarea></div>
         <div class="row"><button class="primary" onclick="doSend()">发送消息</button><input type="file" id="file"><button onclick="doFile()">发送文件</button></div>
+        <div class="row" id="quick-targets"></div>
         <div id="sendres" class="hint"></div>
+      </div>
+      <div class="card"><h2>最近对话（总览 · 分页与查询）</h2>
+        <div class="row"><input id="ov-kw" placeholder="搜索：内容 / 节点 / agent…" style="flex:2" oninput="ovGo(1)">
+        <select id="ov-size" onchange="ovGo(1)"><option value="10">10</option><option value="20">20</option><option value="30" selected>30</option><option value="50">50</option></select></div>
+        <div id="ov-hist"></div>
+        <div class="row"><button onclick="ovGo(OV.page-1)">上一页</button><span class="hint" id="ov-info"></span><button onclick="ovGo(OV.page+1)">下一页</button></div>
       </div>
     </section>
     <section id="p-nodes" class="hidden">
@@ -870,7 +1036,12 @@ row input{width:auto}
         <div class="row"><button class="primary" onclick="doSend('2')">发送消息</button><input type="file" id="file2"><button onclick="doFile('2')">发送文件</button></div>
         <div id="sendres2" class="hint"></div>
       </div>
-      <div class="card"><h2>对话记录（最近 __LEN__ 条）</h2><div id="history"></div></div>
+      <div class="card"><h2>对话记录（最近 __LEN__ 条）</h2>
+        <div class="row"><input id="ch-kw" placeholder="搜索：内容 / 节点 / agent…" style="flex:2" oninput="chGo(1)">
+        <select id="ch-size" onchange="chGo(1)"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option></select></div>
+        <div id="history"></div>
+        <div class="row"><button onclick="chGo(CH.page-1)">上一页</button><span class="hint" id="ch-info"></span><button onclick="chGo(CH.page+1)">下一页</button></div>
+      </div>
     </section>
     <section id="p-config" class="hidden">
       <div class="card"><h2>节点配置</h2>
@@ -900,6 +1071,36 @@ let TOKEN=sessionStorage.getItem(LS_KEY)||'';
 const HDR=()=>({'X-Auth-Token':TOKEN});
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(ts){try{return new Date(ts).toLocaleString();}catch{return ts;}}
+let HIST=[],OV={page:1},CH={page:1};
+function histRow(m){
+  const dir=m.direction==='out'?'out':m.direction==='in'?'in':'';
+  if(m.kind==='file'){
+    const nm=esc((m.payload&&m.payload.file_name)||'file');
+    const sp=m.payload&&m.payload.saved_path||'';
+    const sz=(m.payload&&m.payload.size)||'?';
+    const local=(m.direction==='in'||m.direction==='local')&&sp;
+    let head;
+    if(local){
+      const dl=encodeURIComponent(nm);
+      head=`<span class="fl">📄 <a href="/v1/files/${dl}" target="_blank" rel="noopener">${nm}</a> <span class="tool"><a class="tbtn" href="/v1/files/${dl}" target="_blank" rel="noopener">打开文件</a><button class="tbtn" onclick="openFl('${dl}')">打开文件夹</button></span></span>`;
+    }else{head=`📤 ${nm}`;}
+    return `<div class="msg file"><div class="meta">${fmt(m.ts)} · 文件 · ${esc(m.direction)} · ${esc(m.from)} → ${esc(m.to)}</div><div class="pay">${head} · ${sz} B · ${sp?esc(sp):''}</div></div>`;
+  }
+  return `<div class="msg ${dir}"><div class="meta">${fmt(m.ts)} · ${esc(m.from_agent||'节点')} ${esc(m.from)} → ${esc(m.to_agent||'')} ${esc(m.to)} · ${esc(m.kind)}/${esc(m.action)}</div><div class="pay">${esc(JSON.stringify(m.payload))}</div></div>`;
+}
+function filterHist(kw,arr){if(!kw)return arr.slice();return arr.filter(m=>JSON.stringify({f:m.from,a:m.from_agent,t:m.to,ta:m.to_agent,k:m.kind,p:m.payload}).toLowerCase().includes(kw.toLowerCase()));}
+function renderList(elx,info,arr,page,size){
+  const total=arr.length,pages=Math.max(1,Math.ceil(total/size));
+  if(page<1)page=1; if(page>pages)page=pages;
+  const part=arr.slice().reverse().slice((page-1)*size,page*size);
+  elx.innerHTML=part.map(histRow).join('')||'<p class="hint">无记录</p>';
+  info.textContent=`第 ${page}/${pages} 页 · 共 ${total} 条`;
+  return page;
+}
+function ovGo(p){OV.page=renderList(el('ov-hist'),el('ov-info'),filterHist(el('ov-kw').value,HIST),p,parseInt(el('ov-size').value)||20);}
+function chGo(p){CH.page=renderList(el('history'),el('ch-info'),filterHist(el('ch-kw').value,HIST),p,parseInt(el('ch-size').value)||50);}
+async function openFl(nm){try{await j('/v1/open-folder',{method:'POST',body:JSON.stringify({file:decodeURIComponent(nm)})});}catch(e){}}
+function pick(id,ag){const t=el('to'),t2=el('to2'),a=el('to_agent'),a2=el('to_agent2');if(t)t.value=id;if(t2)t2.value=id;if(a)a.value=ag;if(a2)a2.value=ag;}
 function saveToken(){TOKEN=$('token-input').value.trim();sessionStorage.setItem(LS_KEY,TOKEN);enter();}
 function enter(){$('modal').classList.add('hidden');$('app').classList.remove('hidden');refresh();loadConfig();}
 async function boot(){
@@ -962,9 +1163,12 @@ async function refresh(){
   let dl=''; if(peers&&peers.ok)for(const p of peers.peers)dl+=`<option value="${esc(p.node_id)}">${esc(p.name)}</option>`;
   if(agents&&agents.ok)for(const a of agents.agents)dl+=`<option value="${esc(a.node_id)}">${esc(a.node_name||a.node_id)} / ${esc(a.agent_id)}</option>`;
   $('peers-list').innerHTML=dl;
-  let hh='';
-  if(hist&&hist.ok)for(const m of hist.history.slice().reverse())hh+=`<div class="msg ${m.direction==='out'?'out':m.direction==='in'?'in':''}"><div class="meta">${fmt(m.ts)} · ${esc(m.from_agent||'节点')} ${esc(m.from)} → ${esc(m.to_agent||'')} ${esc(m.to)} · ${esc(m.kind)}/${esc(m.action)}</div><div class="pay">${esc(JSON.stringify(m.payload))}</div></div>`;
-  $('history').innerHTML=hh||'<p class="hint">暂无业务消息</p>';
+  HIST=hist&&hist.ok?hist.history.slice():[];
+  ovGo(OV.page); chGo(CH.page);
+  let qt='';
+  if(peers&&peers.ok)for(const p of peers.peers){if(p.online)qt+=`<button class="chip-btn" onclick="pick('${esc(p.node_id)}','')" title="${esc(p.name)}">${esc(p.name)}</button>`;}
+  if(agents&&agents.ok)for(const a of agents.agents){if(a.online)qt+=`<button class="chip-btn" onclick="pick('${esc(a.node_id)}','${esc(a.agent_id)}')" title="${esc(a.node_name||a.node_id)} / ${esc(a.agent_id)}">${esc(a.node_name||a.node_id)} · ${esc(a.agent_id)}</button>`;}
+  const qtEl=el('quick-targets'); if(qtEl)qtEl.innerHTML=qt?('快捷选择：'+qt):'';
  }catch(e){}
 }
 async function loadConfig(){

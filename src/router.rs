@@ -680,4 +680,42 @@ impl Router {
         let h = self.history.lock().unwrap();
         h.iter().cloned().collect()
     }
+
+    /// Record a file transfer event into the human-visible history.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_file_event(
+        &self,
+        direction: &str,
+        from: &str,
+        to: &str,
+        file_name: &str,
+        size: u64,
+        saved_path: &str,
+    ) {
+        if !self.cfg.history.enabled {
+            return;
+        }
+        let entry = HistoryEntry {
+            ts: crate::proto::now_rfc3339(),
+            msg_id: crate::proto::new_id(),
+            node: from.to_string(),
+            direction: direction.to_string(),
+            from: from.to_string(),
+            from_agent: None,
+            to: to.to_string(),
+            to_agent: None,
+            kind: "file".to_string(),
+            action: "file".to_string(),
+            payload: serde_json::json!({
+                "file_name": file_name,
+                "size": size,
+                "saved_path": saved_path,
+            }),
+        };
+        let mut h = self.history.lock().unwrap();
+        if h.len() >= self.cfg.history.len.max(1) {
+            h.pop_front();
+        }
+        h.push_back(entry);
+    }
 }

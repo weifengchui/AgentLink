@@ -143,6 +143,20 @@ pub async fn send_transfer(
     state.files.end();
     result.map(|saved| {
         tracing::info!(file_id = %file_id, peer = %to, saved = %saved, "file: transfer complete");
+        if let Ok(md) = std::fs::metadata(path) {
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+            state.router.record_file_event(
+                "out",
+                &state.config.node_id,
+                to,
+                &name,
+                md.len(),
+                &saved,
+            );
+        }
         file_id
     })
 }
@@ -510,9 +524,23 @@ async fn run_receiver(
             "file_complete" => {
                 let Some(r) = recv_state.take() else { continue };
                 let file_id = r.file_id.clone();
+                let fname = r
+                    .final_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let fsize = r.size;
                 let result = finish_receive(r).await;
                 match result {
                     Ok(final_path) => {
+                        state.router.record_file_event(
+                            "in",
+                            &peer_id,
+                            &state.config.node_id,
+                            &fname,
+                            fsize,
+                            &final_path.to_string_lossy(),
+                        );
                         let saved = final_path.to_string_lossy().to_string();
                         send_file_frame(
                             state,
