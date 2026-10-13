@@ -129,6 +129,14 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/peers", get(peers))
+        .route(
+            "/v1/peers/:node_id/forget",
+            axum::routing::delete(peers_forget),
+        )
+        .route(
+            "/v1/peers/:node_id/unforget",
+            axum::routing::post(peers_unforget),
+        )
         .route("/v1/send", post(send))
         .route("/v1/send-file", post(send_file))
         .route("/v1/send-file-upload", post(send_file_upload))
@@ -200,6 +208,52 @@ async fn peers(State(state): State<SharedState>, headers: HeaderMap) -> impl Int
     (
         StatusCode::OK,
         Json(json!({ "ok": true, "peers": state.peers.snapshot() })),
+    )
+}
+
+/// Persist the current suppress list under the node's data dir.
+fn persist_forgotten(state: &AppState) -> Vec<String> {
+    let ids = state.peers.suppressed();
+    let path = state.config.data_dir.join("forgotten_peers.json");
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&ids).unwrap_or_default(),
+    );
+    ids
+}
+
+/// Forget a (ghost) peer: removes it from the table and suppresses
+/// re-discovery until that node handshakes live again.
+async fn peers_forget(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    UrlPath(node_id): UrlPath<String>,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let removed = state.peers.forget(&node_id);
+    let ids = persist_forgotten(&state);
+    state.router.close_peer(&node_id);
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "removed": removed, "suppressed": ids })),
+    )
+}
+
+async fn peers_unforget(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    UrlPath(node_id): UrlPath<String>,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    state.peers.unforget(&node_id);
+    let ids = persist_forgotten(&state);
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "suppressed": ids })),
     )
 }
 
@@ -524,6 +578,10 @@ async fn fleet_agents(State(state): State<SharedState>, headers: HeaderMap) -> i
         names.insert(p.node_id.clone(), p.name.clone());
     }
     names.insert(state.config.node_id.clone(), state.config.name.clone());
+    // Ghost guard: an agent can only be online if its NODE is online. Remote
+    // agent caches used to keep `online:true` forever after the owner node
+    // went away (new identity/reboot), confusing the fleet view.
+    let node_online = |nid: &str| nid == state.config.node_id || state.peers.is_online(nid);
     let agents: Vec<serde_json::Value> = state
         .router
         .fleet_agents()
@@ -531,6 +589,10 @@ async fn fleet_agents(State(state): State<SharedState>, headers: HeaderMap) -> i
         .map(|a| {
             let mut v = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
             if let serde_json::Value::Object(m) = &mut v {
+                m.insert(
+                    "online".to_string(),
+                    serde_json::json!(a.online && node_online(&a.node_id)),
+                );
                 m.insert(
                     "node_name".to_string(),
                     serde_json::json!(names
@@ -1162,6 +1224,7 @@ async function saveName(nodeId,agentId,newName){
   }catch(e){ alert('改名失败: '+(e.message||e)); refresh(); }
 }
 async function delAgent(nodeId,agentId){if(nodeId!==SELF){alert('远端 Agent 只能在其所属节点删除');return;}if(!confirm('删除 Agent '+agentId+'？'))return;try{const d=await j('/v1/agents',{method:'DELETE',body:JSON.stringify({agent_id:agentId})});alert(JSON.stringify(d));refresh();}catch(e){alert('删除失败: '+(e.message||e));}}
+async function forgetPeer(id){if(!confirm('遗忘节点 '+id+' ？\n将从列表移除并忽略自动发现；它下次主动握手连上时会自动回来。'))return;try{await j('/v1/peers/'+id+'/forget',{method:'DELETE'});refresh();}catch(e){alert('失败: '+(e.message||e));}}
 function pick(id,ag){
   const v=ag?('agent:'+id+':'+ag):id;
   const t=el('to'),t2=el('to2');
@@ -1229,7 +1292,7 @@ async function refresh(){
   $('m-history').textContent=hist.history.length;
   $('m-transfer').textContent=st.active_transfers;
   $('m-version').textContent=st.version;
-  let pe=''; if(peers&&peers.ok)for(const p of peers.peers)pe+=`<tr><td>${esc(p.name)}</td><td>${esc(p.node_id)}</td><td>${esc(p.addr)}</td><td>${(p.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</td><td><span class="badge ${p.online?'on':'off'}"><span class="dot"></span>${p.online?'在线':'离线'}</span></td></tr>`;
+  let pe=''; if(peers&&peers.ok)for(const p of peers.peers){const loc=st&&p.node_id===st.node_id;pe+=`<tr${loc?' class="local"':''}><td>${loc?'<span class="self-chip">本机</span>':''}${esc(p.name)}</td><td>${esc(p.node_id)}</td><td>${esc(p.addr)}</td><td>${(p.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</td><td><span class="badge ${p.online?'on':'off'}"><span class="dot"></span>${p.online?'在线':'离线'}</span></td><td>${(!p.online&&!loc)?`<button class="tbtn" title="从列表移除且忽略自动发现，直到该节点重新握手连上" onclick="forgetPeer('${esc(p.node_id)}')">遗忘</button>`:''}</td></tr>`;}
   $('peers-body').innerHTML=pe;
   AGENTS=agents&&agents.ok?agents.agents:[];
   SELF=(st&&st.node_id)||'';

@@ -145,6 +145,33 @@ fn ensure_dirs(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Generate a fresh config, but when an old config exists PRESERVE the
+/// machine identity (node_id/name/tokens/data_dir). Rationale: `init/join
+/// --force` was wiping node_id silently — after a reboot with autostart
+/// pointing at a different folder, whole nodes "became different machines"
+/// (incident 2026-10-13, node .7). Identity is what the mesh addresses by;
+/// regenerating it is almost never what the user means by re-init.
+fn generate_preserving_identity(
+    path: &std::path::Path,
+    name: Option<String>,
+    cluster_token: Option<String>,
+    mode: Option<String>,
+) -> Config {
+    let mut cfg = Config::generate(name.clone(), cluster_token, mode);
+    if let Ok(old) = Config::load(path) {
+        cfg.node_id = old.node_id;
+        if name.is_none() {
+            cfg.name = old.name;
+        }
+        cfg.local_api.token = old.local_api.token;
+        cfg.data_dir = old.data_dir; // never orphan the inbox/agents/files
+        if cfg.security.cluster_token.is_empty() {
+            cfg.security.cluster_token = old.security.cluster_token;
+        }
+    }
+    cfg
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -163,7 +190,7 @@ async fn main() -> Result<()> {
                 );
             }
             let mode = open.then(|| "open".to_string());
-            let cfg = Config::generate(name, cluster_token, mode);
+            let cfg = generate_preserving_identity(&cli.config, name, cluster_token, mode);
             cfg.save(&cli.config)?;
             println!("created config: {}", cli.config.display());
             println!("  node_id: {}", cfg.node_id);
@@ -195,7 +222,7 @@ async fn main() -> Result<()> {
                 );
             }
             let mode = open.then(|| "open".to_string());
-            let cfg = Config::generate(name, Some(token), mode);
+            let cfg = generate_preserving_identity(&cli.config, name, Some(token), mode);
             cfg.save(&cli.config)?;
             println!("paired: {} ({})", cfg.name, cfg.node_id);
             println!("  cluster_token set ({} mode)", cfg.security.mode);
@@ -264,6 +291,14 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
         router.clone(),
         files,
     ));
+    // Restore the user's "forget this node" list (ghost-peer cleanup,
+    // paired with DELETE /v1/peers/{node_id}).
+    let forgotten_path = cfg.data_dir.join("forgotten_peers.json");
+    if let Ok(raw) = std::fs::read_to_string(&forgotten_path) {
+        if let Ok(ids) = serde_json::from_str::<Vec<String>>(&raw) {
+            state.peers.set_suppressed(ids);
+        }
+    }
     let app = api::router(state.clone());
     let maintenance = router::Router::spawn_maintenance(&router);
 

@@ -191,6 +191,12 @@ impl Router {
         }
     }
 
+    /// Force-close a live peer link (user "forgot" an online node).
+    /// Dropping the sink closes its send channel, which ends the peer task.
+    pub fn close_peer(&self, node_id: &str) {
+        self.registry.remove(node_id);
+    }
+
     // ---- outbound (local agent -> network) ---------------------------------
 
     /// Send an envelope addressed to a specific peer or `"*"`.

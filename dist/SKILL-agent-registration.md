@@ -7,17 +7,17 @@ platforms: [windows, linux]
 ## ★ 上线必做自检（主动注册，不等消息）
 **任何 Agent 每次上线（开机、会话启动、重启、节点重启后）都必须主动执行以下序列，完成注册后再处理其他事务：**
 1. `GET /v1/health` 确认本机节点存活（拿 node_id）
-2. 有桥守护实现的（如 liteguard 侧）：幂等拉起 `bridge.sh start` —— 它在跑就跳过；
-   桥启动/重连时会自动完成注册（daemon 内置 register_all）
-   ※ liteguard 本机实现：bridge.sh start 已内置 ensure_node，会先自动拉起 WSL 侧节点
-     （agentlink-linux run，自动挑选 E:\Tools\AgentLink-v* 最新版），一条命令 = 节点+桥+注册全齐
-3. 无桥实现的 Agent：立即 `POST /v1/agents` 注册自己（agent_id=name=profile 名，全小写）
+2. 接唤醒线（新机器标准做法）：解包发布 bundle 后在其 `wake-kit/` 目录跑
+   `bash install-all.sh <你的profile名>` —— 一条命令装好桥+webhook+钩子+自检，幂等可重跑。
+   ※ 50 号机 liteguard 侧另有 `bridge.sh`/`daemon.py` 参考实现，其中的 `E:\Tools\AgentLink-v*`
+     目录、`HOME=/home/yxf` 等都是**该机专属路径，其他机器不要照抄**（照跑必挂）。
+3. 无桥实现的 Agent：立即 `POST /v1/agents` 注册自己（agent_id=name=profile 名原文）
    并建立 WS 订阅（client 必须等于 agent_id）
 4. 验证：`GET /v1/fleet/agents` 中自己的 agent_id 应 online=true；不是则排查 client/注册，不要继续干活
 5. （可选礼貌项）向全网或已知对端广播一条上线通告
 6. **消息驱动（v0.4.10+ 推荐）**：桥目录应已配 `wake_hook.py + wake.json`（发布包
-   `wake-kit.tar.gz` / 本技能目录 `wake_install.sh` 有安装法）——配好后总线消息会
-   自动唤醒你的会话，无需轮询；未配置时必须定期主动拉桥的 `/inbox`（8766/8767 管理口），
+   `wake-kit/` 的 `install-all.sh` 一键装好）——配好后总线消息会自动唤醒你的会话，
+   无需轮询；未配置时必须定期主动拉桥的 `/inbox`（8766/8767 管理口），
    否则升级协调/指令类消息会被无声积压。
 
 # AgentLink：Agent 注册与双向通信（全流程）
@@ -108,9 +108,9 @@ ws://127.0.0.1:8765/v1/ws?token=<local_api.token>&client=<你的agent_id>
 - Agent 会话侧只轮询这个管理 API 即可收发消息，不直接碰 WS 与 token
 - 用定时任务（本项目：每 5 分钟）做「看门狗保活 + 消费收件箱 + 按 reply_to 回复」
 - 多 Agent 注册表持久化（registry.json），重连时全部自动重注册——**新建任何 Agent 都必须同步注册到总线**（本团队规范）
-- 节点目录版本化时，配置自动发现最新版：对 `Tools/AgentLink-v*/agentlink.json` 按版本号取最高，别写死具体版本目录（实测：节点从 v0.2.0 升到 v0.4.4 后写死路径会 FileNotFoundError）。
-
-参考实现：main-PC 侧 daemon 在 `D:\HermesSpace\LiteGuard\agentlink\daemon.py`，控制脚本 `bridge.sh`。
+- ※ 以下为 50 号机专属参考，别处没有这些路径：节点目录在 `E:\Tools\AgentLink-v*` 按版本号取最高；
+  daemon 在 `D:\HermesSpace\LiteGuard\agentlink\daemon.py`，控制脚本 `bridge.sh`。
+  新机器请直接用 bundle `wake-kit/install-all.sh`，无需复刻这套布局。
 
 ## 7. 排障速查
 | 现象 | 原因 | 处理 |
@@ -145,3 +145,12 @@ ws://127.0.0.1:8765/v1/ws?token=<local_api.token>&client=<你的agent_id>
 - **传文件的完整闭环**：`send-file`（目标须在线；Windows 节点读 Windows 形态路径；落对端 `data/files`，完成不推 WS，轮询 `/v1/status` 的 `active_transfers=0`）→ 再发一条 text 指令对方把文件挪到规范位置 → 消息里写**精确字节数/SHA**（写"约17KB"这种估算会被对端当真并报分歧，实测 9691B vs "17KB" 乌龙）。
 - 回执礼仪：收到确认请求就回一条 `reply_to=<原 msg_id>`；派活/澄清也带上 reply_to 串线程。
 - `daemon.out`/日志尾部可能挂着**历史**失败 traceback（append 模式），先看时间戳再下结论；`bridge.sh` 的 resolve 会自动 glob 最新版本目录，老 traceback 不代表现在挂。
+
+## 10. v0.4.11 变更（2026-10-13，身份安全与幽灵治理）
+- **`init/join --force` 不再抹身份**：覆盖配置时自动保留旧 `node_id`/`local_api.token`/`data_dir`，
+  彻底堵住「重启后节点变成陌生机器」事故（.7 号机 node_id 漂移根因）。身份是网格的寻址锚点，
+  重新配对（join 新 cluster_token）照旧生效，唯独身份不动。
+- **fleet agents 在线判定联动节点**：节点掉线后其 agent 不再显示 online=true（幽灵在线）。
+- **web 节点列表**：本机行有「本机」标记；离线节点有「遗忘」按钮——移除并忽略自动发现，
+  持久化在 `data_dir/forgotten_peers.json`，该节点下次真实握手会自动回来。
+  API：`DELETE /v1/peers/<node_id>/forget`、`POST /v1/peers/<node_id>/unforget`。

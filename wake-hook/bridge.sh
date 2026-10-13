@@ -1,4 +1,7 @@
 #!/bin/bash
+# ⚠ 本脚本是 50 号机(liteguard)专属实现：路径 E:\Tools\AgentLink-v*、HOME=/home/yxf、
+#   daemon.py 布局都只在该机成立。**其他机器请直接用同目录 install-all.sh 一键安装，
+#   不要跑这个脚本。** 保留仅作架构参考。
 # Start / check AgentLink bridge daemon (detached, survives session)
 D=/mnt/d/HermesSpace/LiteGuard/agentlink
 PIDF="$D/daemon.pid"

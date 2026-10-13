@@ -46,11 +46,41 @@ pub struct DiscoveredPeer {
 #[derive(Default)]
 pub struct PeerTable {
     inner: RwLock<HashMap<String, PeerInfo>>,
+    /// Node ids the user explicitly "forgot". Re-discovery/re-dial of these
+    /// is suppressed until the node contacts us with a successful handshake
+    /// (a live handshake means it really is back) or the user un-forgets.
+    forgotten: RwLock<std::collections::HashSet<String>>,
 }
 
 impl PeerTable {
     pub fn new() -> Self {
         PeerTable::default()
+    }
+
+    /// Load the persisted suppress list (called once at startup).
+    pub fn set_suppressed(&self, ids: impl IntoIterator<Item = String>) {
+        let mut s = self.forgotten.write().unwrap();
+        s.extend(ids);
+    }
+
+    pub fn suppressed(&self) -> Vec<String> {
+        self.forgotten.read().unwrap().iter().cloned().collect()
+    }
+
+    /// Remove a peer from the table and remember to ignore future
+    /// discoveries of it (user pressed "forget" in the console).
+    pub fn forget(&self, node_id: &str) -> bool {
+        let existed = self.inner.write().unwrap().remove(node_id).is_some();
+        self.forgotten.write().unwrap().insert(node_id.to_string());
+        existed
+    }
+
+    pub fn unforget(&self, node_id: &str) {
+        self.forgotten.write().unwrap().remove(node_id);
+    }
+
+    fn is_forgotten(&self, node_id: &str) -> bool {
+        self.forgotten.read().unwrap().contains(node_id)
     }
 
     /// Record a peer learned from discovery. Returns `true` if it is new.
@@ -61,6 +91,9 @@ impl PeerTable {
         addr: &str,
         tags: Vec<String>,
     ) -> bool {
+        if self.is_forgotten(node_id) {
+            return false;
+        }
         let mut map = self.inner.write().unwrap();
         match map.get_mut(node_id) {
             Some(p) => {
@@ -91,6 +124,9 @@ impl PeerTable {
 
     /// Mark a peer online / refresh identity after a successful handshake.
     pub fn mark_online(&self, node_id: &str, name: &str, addr: &str, direction: &str) {
+        // A live handshake overrides any earlier user "forget": the node
+        // demonstrably exists again (e.g. config restored after re-init).
+        self.forgotten.write().unwrap().remove(node_id);
         let mut map = self.inner.write().unwrap();
         let entry = map.entry(node_id.to_string()).or_insert_with(|| PeerInfo {
             node_id: node_id.to_string(),

@@ -120,3 +120,7 @@ curl -X POST http://127.0.0.1:8765/v1/send-file -H "X-Auth-Token: $TOKEN" -d \
 - `8766`（`broadcast_port`）：UDP 发现广播
 
 首次运行请在防火墙放行这两个端口（见 [`docs/部署.md`](docs/部署.md)）。
+## 版本提要
+- **v0.4.11**：`init/join --force` 保留 node_id/token/data_dir（堵死身份漂移事故）；
+  fleet agents 在线状态联动节点（幽灵在线消除）；web 节点列表加「本机」标记与离线节点「遗忘」
+  按钮（`DELETE /v1/peers/<id>/forget`，持久化 data_dir/forgotten_peers.json，真实握手自动解禁）。

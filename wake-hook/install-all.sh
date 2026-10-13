@@ -13,6 +13,8 @@ P="${1:-study}"
 AGENT="${2:-$P}"
 PORT="${PORT:-8644}"
 BRIDGE_DIR="${BRIDGE_DIR:-/mnt/d/HermesSpace/.fleet-B1/agentlink}"
+BRIDGE_PORT="${BRIDGE_PORT:-8643}"
+REAL_HOME=$(eval echo "~$(id -un)")   # hermes profile 环境会改写 HOME，取真实家目录
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
 say(){ printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -61,7 +63,7 @@ say "2/6 webhook 平台 (profile=$P port=$PORT)"
 hermes -p "$P" config set platforms.webhook.enabled true           >/dev/null
 hermes -p "$P" config set platforms.webhook.extra.host "127.0.0.1" >/dev/null
 hermes -p "$P" config set platforms.webhook.extra.port "$PORT"     >/dev/null
-CFGYAML="$HOME/.hermes/profiles/$P/config.yaml"
+CFGYAML="$REAL_HOME/.hermes/profiles/$P/config.yaml"
 CUR_SECRET=$(sed -n '/^platforms:/,/^[a-z_]*:/p' "$CFGYAML" 2>/dev/null | grep -m1 'secret:' | awk '{print $2}')
 [ -n "$CUR_SECRET" ] || hermes -p "$P" config set platforms.webhook.extra.secret "$(openssl rand -hex 24)" >/dev/null
 hermes -p "$P" gateway restart >/dev/null 2>&1 || true
@@ -74,7 +76,7 @@ curl -s -m2 --noproxy '*' "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q 
 echo "   ok: :$PORT 监听中"
 
 say "3/6 路由 agentlink-msg"
-SUBS="$HOME/.hermes/profiles/$P/webhook_subscriptions.json"
+SUBS="$REAL_HOME/.hermes/profiles/$P/webhook_subscriptions.json"
 if [ ! -f "$SUBS" ] || ! grep -q agentlink-msg "$SUBS"; then
   hermes -p "$P" webhook subscribe agentlink-msg \
     --prompt "【AgentLink 总线新消息】来自 {from}（agent {from_agent}）：主题={topic}
@@ -102,10 +104,10 @@ say "5/6 启动桥 (client=$AGENT)"
 PIDF="$BRIDGE_DIR/bridge.pid"
 [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null && { kill "$(cat "$PIDF")" 2>/dev/null || true; sleep 1; }
 cd "$BRIDGE_DIR"
-BRIDGE_AGENT="$AGENT" BRIDGE_PORT=8767 setsid nohup "$PYEXE" hermes_bridge.py >> logs/bridge.out 2>&1 &
+BRIDGE_AGENT="$AGENT" BRIDGE_PORT="$BRIDGE_PORT" setsid nohup "$PYEXE" hermes_bridge.py >> logs/bridge.out 2>&1 &
 echo $! > "$PIDF"
 sleep 3
-curl -s -m3 --noproxy '*' "http://127.0.0.1:8767/status" 2>/dev/null | grep -q '"ws_connected": *true' \
+curl -s -m3 --noproxy '*' "http://127.0.0.1:$BRIDGE_PORT/status" 2>/dev/null | grep -q '"ws_connected": *true' \
   && echo "   ok: 桥已连上节点" \
   || echo "   警告：桥 ws 未确认，看 $BRIDGE_DIR/logs/bridge.out"
 
