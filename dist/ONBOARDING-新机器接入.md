@@ -37,31 +37,13 @@ agentlink.exe token          # 或读 agentlink.json → security.cluster_token
 
 ```bash
 cd <解压目录>/wake-kit
-# ① 开 webhook 并订阅（P=要唤醒的 hermes profile 名）
-P=study
-hermes -p $P config set platforms.webhook.enabled true
-hermes -p $P config set platforms.webhook.extra.host "127.0.0.1"
-hermes -p $P config set platforms.webhook.extra.port "8644"
-hermes -p $P config set platforms.webhook.extra.secret "$(openssl rand -hex 24)"
-hermes -p $P gateway restart
-curl -s http://127.0.0.1:8644/health     # 期望 status ok
-hermes -p $P webhook subscribe agentlink-msg \
-  --prompt "【AgentLink 总线新消息】来自 {from}（agent {from_agent}）：主题={topic}
-内容：{content}
-msg_id={msg_id}
-如果这条消息需要你行动（指令/升级协调/问询），现在处理并按需回复；纯通告类记录即可。"
-SECRET=*** -p $P webhook list 输出取>"
-
-# ② 桥文件就位（目录不存在就先按 SKILL-agent-registration.md 的§6 建桥）
-mkdir -p /mnt/d/HermesSpace/.fleet-B1/agentlink
-cp hermes_bridge.py wake_hook.py /mnt/d/HermesSpace/.fleet-B1/agentlink/
-# （liteguard 目录同理：cp daemon.py bridge.sh wake_hook.py → LiteGuard/agentlink/）
-
-# ③ 一键安装+重启桥
-AGENTLINK_BRIDGE_DIR=/mnt/d/HermesSpace/.fleet-B1/agentlink \
-  AGENT_PROFILE=$P BRIDGE_AGENT_ID=study WEBHOOK_SECRET=*** \
-  bash wake_install.sh
+# 一键安装唤醒线（P=要唤醒的 hermes profile 名；幂等，失败可重跑）
+bash install-all.sh study        # 例：profile 叫 study；10 号如为 luna 则 bash install-all.sh luna
 ```
+脚本自动完成：解释器探测 → webhook 平台与路由（secret 自动读写）→ wake.json →
+起桥 → HMAC 自检。看到"完成 ✅"即成功。同机第二条 agent 链路用隔离参数，例如：
+`BRIDGE_DIR=/mnt/d/HermesSpace/.fleet-<id>/agentlink BRIDGE_PORT=8647 PORT=8646 bash install-all.sh <profile>`
+（旧脚本 wake_install.sh 已废弃删除——它带一个损坏的 SECRET 行，勿使用。）
 
 ## 3. Agent 上线注册（每个 hermes profile 会话）
 

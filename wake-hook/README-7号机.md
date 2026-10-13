@@ -1,5 +1,7 @@
 # 7 号机唤醒钩子安装包（wake-kit）
 
+
+> ⚠ 已过时提醒：本文的 wake_install.sh 已废弃（第 8 行 SECRET 变量名被脱敏腰斩，必炸）。现在一律 `bash install-all.sh <profile>` 一键安装。
 **目的**：桥收到 AgentLink 总线消息后自动唤醒本机 agent 会话（hermes webhook），
 不再依赖 agent 主动拉收件箱。附带修复：liteguard bridge.sh 的 ensure_node 改为
 Windows exe 形态拉起（WSL 内跑 linux 节点会被防火墙挡，导致节点互不可见——50 已实证）。
