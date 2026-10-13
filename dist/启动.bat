@@ -43,6 +43,9 @@ if errorlevel 1 (
 )
 echo 配对成功（strict 模式）.
 
+rem -- ensure per-user at-logon autostart task (silent, best effort) --
+"%~dp0agentlink.exe" autostart >nul 2>&1
+
 :run
 echo 启动 AgentLink... （关闭本窗口即停止）
 "%~dp0agentlink.exe" run

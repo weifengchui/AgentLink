@@ -81,6 +81,21 @@ enum Command {
         /// Create `agentlink.json` with defaults if it does not exist yet.
         #[arg(long)]
         create_if_missing: bool,
+        /// Do not open the /web page in the browser even if web.auto_open is true
+        /// (use this for autostart / headless sessions).
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// Windows: register (or remove) a per-user "at logon" scheduled task that
+    /// starts this node automatically with `run --no-open`. No admin needed.
+    /// Other OSes: prints guidance (see deploy/install-systemd.sh).
+    Autostart {
+        /// Remove the scheduled task instead of creating it.
+        #[arg(long)]
+        remove: bool,
+        /// Re-register (overwrite) an existing task with current paths.
+        #[arg(long)]
+        force: bool,
     },
     /// List known peers.
     Peers,
@@ -209,25 +224,28 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Some(Command::Run { create_if_missing }) => {
+        Some(Command::Run {
+            create_if_missing,
+            no_open,
+        }) => {
             let cfg = load_config(&cli.config, create_if_missing)?;
             logging::init(&cfg.log);
             ensure_dirs(&cfg)?;
             let cfg_path = cli.config.clone();
-            run(cfg, cfg_path).await
+            run(cfg, cfg_path, no_open).await
         }
-
+        Some(Command::Autostart { remove, force }) => autostart(&cli.config, remove, force),
         None => {
             let cfg = load_config(&cli.config, false)?;
             logging::init(&cfg.log);
             ensure_dirs(&cfg)?;
             let cfg_path = cli.config.clone();
-            run(cfg, cfg_path).await
+            run(cfg, cfg_path, false).await
         }
     }
 }
 
-async fn run(cfg: Config, config_file: PathBuf) -> Result<()> {
+async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
     let bind = format!("{}:{}", cfg.local_api.host, cfg.listen_port);
 
     let (peer_tx, peer_rx) = tokio::sync::mpsc::channel(256);
@@ -308,7 +326,7 @@ async fn run(cfg: Config, config_file: PathBuf) -> Result<()> {
     );
     tracing::info!("local API: http://127.0.0.1:{}/v1/health", cfg.listen_port);
 
-    if cfg.web.auto_open {
+    if cfg.web.auto_open && !no_open {
         let url = format!("http://127.0.0.1:{}/web", cfg.listen_port);
         tracing::info!(url, "opening web page in default browser");
         open_web_browser(&url);
@@ -366,4 +384,91 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutdown signal received");
+}
+
+/// Windows: manage a per-user "at logon" scheduled task that starts the node
+/// headless (`run --no-open`), so a machine reboot brings the mesh back by
+/// itself — no browser page, no manual click. On other platforms this prints
+/// systemd guidance instead.
+fn autostart(config_path: &std::path::Path, remove: bool, force: bool) -> Result<()> {
+    const TASK_NAME: &str = "AgentLink";
+
+    if !cfg!(windows) {
+        println!("autostart is implemented via Windows Task Scheduler (schtasks /SC ONLOGON).");
+        println!("On Linux, install the systemd unit instead:");
+        println!("  ./deploy/install-systemd.sh   # run from the node directory");
+        println!("  systemctl --user enable --now agentlink   # if the script sets a user unit");
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().context("cannot resolve current exe path")?;
+    let cfg_abs = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        std::path::absolute(config_path).unwrap_or_else(|_| config_path.to_path_buf())
+    };
+
+    let exists = std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", TASK_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if remove {
+        if !exists {
+            println!("no '{TASK_NAME}' scheduled task; nothing to remove");
+            return Ok(());
+        }
+        let out = std::process::Command::new("schtasks")
+            .args(["/Delete", "/TN", TASK_NAME, "/F"])
+            .output()?;
+        if out.status.success() {
+            println!("removed scheduled task '{TASK_NAME}'");
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "schtasks /Delete failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    } else {
+        if exists && !force {
+            println!("scheduled task '{TASK_NAME}' already exists. Details:");
+            let _ = std::process::Command::new("schtasks")
+                .args(["/Query", "/TN", TASK_NAME])
+                .stdout(std::process::Stdio::inherit())
+                .status();
+            println!("(use --force to re-register with current paths, --remove to delete)");
+            return Ok(());
+        }
+        if !cfg_abs.exists() {
+            anyhow::bail!(
+                "config '{}' does not exist; run this from the node directory or pass --config",
+                cfg_abs.display()
+            );
+        }
+        let action = format!(
+            "\"{}\" --config \"{}\" run --no-open",
+            exe.display(),
+            cfg_abs.display()
+        );
+        let out = std::process::Command::new("schtasks")
+            .args([
+                "/Create", "/TN", TASK_NAME, "/SC", "ONLOGON", "/TR", &action, "/F",
+            ])
+            .output()?;
+        if out.status.success() {
+            println!("registered scheduled task '{TASK_NAME}' (starts at logon, headless):");
+            println!("  {action}");
+            println!("start it now without waiting for next logon:  schtasks /Run /TN {TASK_NAME}");
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "schtasks /Create failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
 }
