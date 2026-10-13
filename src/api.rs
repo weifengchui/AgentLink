@@ -937,6 +937,10 @@ th{font-size:11px;color:#7d8aa0;text-align:left;padding:6px 8px;border-bottom:1p
 td{padding:8px;border-bottom:1px solid #171e29;vertical-align:middle}
 tr:hover td{background:#131a24}
 .chip{display:inline-block;padding:1px 8px;border-radius:12px;font-size:11px;background:#182238;color:#9db4dd;margin:1px 2px}
+#agents-body tr.local td{background:#12203a;box-shadow:inset 0 0 0 0 transparent}
+#agents-body tr.local td:first-child{box-shadow:inset 3px 0 0 #4f8cff}
+#agents-body tr.local:hover td{background:#182a4c}
+.self-chip{display:inline-block;padding:1px 7px;border-radius:10px;font-size:10px;background:#234a86;color:#a8cbff;margin-right:6px}
 .metric{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
 .metric .m{background:#10151d;border:1px solid #1c2330;border-radius:12px;padding:14px}
 .metric .v{font-size:24px;font-weight:700;margin-top:4px}
@@ -1230,7 +1234,7 @@ async function refresh(){
   AGENTS=agents&&agents.ok?agents.agents:[];
   SELF=(st&&st.node_id)||'';
   let ag=''; AGENTS.forEach(a=>{const k=`'${esc(a.node_id)}','${esc(a.agent_id)}'`;const loc=a.node_id===SELF;
-  ag+=`<tr><td>${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td${loc?` class="ed-name" title="双击改名，回车保存" ondblclick="inlineName(this,${k})"`:''}>${esc(a.name)}</td><td>${(a.capabilities||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join('')}</td><td><span class="badge ${a.online?'on':'off'}"><span class="dot"></span>${a.online?'在线':'离线'}</span></td><td>${loc?`<button class="tbtn" onclick="editAgent(${k})">改名</button> <button class="tbtn" onclick="delAgent(${k})">删除</button>`:`<span class="hint" title="远端 Agent：请在其所属节点上改名/删除（本机 API 只管本机注册）">远端</span>`}</td></tr>`;});
+  ag+=`<tr${loc?' class="local"':''}><td>${loc?'<span class="self-chip">本机</span>':''}${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td${loc?` class="ed-name" title="双击改名，回车保存" ondblclick="inlineName(this,${k})"`:''}>${esc(a.name)}</td><td>${(a.capabilities||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join('')}</td><td><span class="badge ${a.online?'on':'off'}"><span class="dot"></span>${a.online?'在线':'离线'}</span></td><td>${loc?`<button class="tbtn" onclick="editAgent(${k})">改名</button> <button class="tbtn" onclick="delAgent(${k})">删除</button>`:`<span class="hint" title="远端 Agent：请在其所属节点上改名/删除（本机 API 只管本机注册）">远端</span>`}</td></tr>`;});
   if(!el('ed-input'))$('agents-body').innerHTML=ag;
   // 节点名 / agent 名映射（给人看）
   NAMES={}; AN={};
