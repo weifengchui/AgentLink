@@ -575,7 +575,7 @@ async fn file_download(
         )
             .into_response();
     };
-    let path = state.config.files.recv_dir.join(&name);
+    let path = state.config.files.recv_dir_resolved().join(&name);
     if !path.is_file() {
         return (
             StatusCode::NOT_FOUND,
@@ -638,7 +638,7 @@ async fn open_folder(
         )
             .into_response();
     };
-    let path = state.config.files.recv_dir.join(&name);
+    let path = state.config.files.recv_dir_resolved().join(&name);
     let dir = path.parent().map(|p| p.to_path_buf());
     let Some(dir) = dir else {
         return (

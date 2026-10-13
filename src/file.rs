@@ -423,7 +423,7 @@ async fn run_receiver(
                     .await;
                     continue;
                 }
-                let base = state.config.files.recv_dir.clone();
+                let base = state.config.files.recv_dir_resolved().to_path_buf();
                 if let Err(e) = tokio::fs::create_dir_all(&base).await {
                     send_file_error(state, sink, &peer_id, &meta.file_id, "io", &e.to_string())
                         .await;

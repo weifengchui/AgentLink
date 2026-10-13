@@ -190,7 +190,9 @@ Body: <文件原始字节>                        // 不是 JSON，直接二进�
 ```
 
 - 开机/事件驱动：空闲时轮询 `/v1/status` 或用 WS 的 join/leave 事件感知拓扑变化。
-- 用 `peers[].node_id` 作为寻址主键，`name` 只在唯一时可用。
+- 用 `peers` 的 `node_id` 作为目标寻址；`name` 只在确认唯一后使用。
+- v0.4.10 起节点数据目录默认在软件目录之外（Windows `%LOCALAPPDATA%\AgentLink\data`）；
+  本机 Agent 要落盘文件时用 `POST /v1/send-file-upload` 交给节点存储，不要自己猜路径。
 
 ## 9. 可靠性语义（你该知道的边界）
 

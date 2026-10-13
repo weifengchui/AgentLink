@@ -136,8 +136,12 @@ fn load_config(path: &Path, create_if_missing: bool) -> Result<Config> {
 fn ensure_dirs(cfg: &Config) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)
         .with_context(|| format!("failed to create data dir {}", cfg.data_dir.display()))?;
-    std::fs::create_dir_all(&cfg.files.recv_dir)
-        .with_context(|| format!("failed to create recv dir {}", cfg.files.recv_dir.display()))?;
+    std::fs::create_dir_all(cfg.files.recv_dir_resolved()).with_context(|| {
+        format!(
+            "failed to create recv dir {}",
+            cfg.files.recv_dir_resolved().display()
+        )
+    })?;
     Ok(())
 }
 

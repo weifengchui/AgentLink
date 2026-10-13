@@ -86,8 +86,10 @@ pub struct FilesConfig {
     pub max_file_size: u64,
     #[serde(default = "default_chunk_size")]
     pub chunk_size: u32,
-    #[serde(default = "default_recv_dir")]
-    pub recv_dir: PathBuf,
+    /// Not set in JSON -> `data_dir/files`. Explicit relative paths stay
+    /// anchored to the config file's folder (pre-0.4.10 compatibility).
+    #[serde(default)]
+    pub recv_dir: Option<std::path::PathBuf>,
     #[serde(default = "default_one")]
     pub max_concurrent: u32,
 }
@@ -146,7 +148,25 @@ fn default_listen_port() -> u16 {
     DEFAULT_LISTEN_PORT
 }
 fn default_data_dir() -> PathBuf {
-    PathBuf::from("./data")
+    // IMPORTANT: never default inside the node's own directory — releases
+    // swap whole folders (AgentLink-vX.Y.Z) and would orphan/overwrite data.
+    #[cfg(windows)]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        return PathBuf::from(local).join("AgentLink").join("data");
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            return PathBuf::from(xdg).join("agentlink");
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("agentlink");
+        }
+    }
+    PathBuf::from("./data") // last-resort fallback
 }
 fn default_true() -> bool {
     true
@@ -184,9 +204,15 @@ fn default_max_file_size() -> u64 {
 fn default_chunk_size() -> u32 {
     64 * 1024
 }
-fn default_recv_dir() -> PathBuf {
-    PathBuf::from("./data/files")
+impl FilesConfig {
+    /// Effective received-file directory (after `Config::normalize`).
+    pub fn recv_dir_resolved(&self) -> &std::path::Path {
+        self.recv_dir
+            .as_deref()
+            .unwrap_or(std::path::Path::new("files"))
+    }
 }
+
 fn default_one() -> u32 {
     1
 }
@@ -270,7 +296,7 @@ impl Default for FilesConfig {
         FilesConfig {
             max_file_size: default_max_file_size(),
             chunk_size: default_chunk_size(),
-            recv_dir: default_recv_dir(),
+            recv_dir: None, // -> <data_dir>/files after normalize
             max_concurrent: default_one(),
         }
     }
@@ -335,7 +361,7 @@ impl Config {
             files: FilesConfig {
                 max_file_size: default_max_file_size(),
                 chunk_size: default_chunk_size(),
-                recv_dir: default_recv_dir(),
+                recv_dir: None,
                 max_concurrent: 1,
             },
             delivery: DeliveryConfig {
@@ -355,9 +381,31 @@ impl Config {
     /// Load configuration from a JSON file.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
-        let cfg: Config = serde_json::from_str(&raw)?;
+        let mut cfg: Config = serde_json::from_str(&raw)?;
+        cfg.normalize(path);
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Resolve data paths so they never depend on the current working
+    /// directory (a logon-startup script may launch us from system32):
+    /// - relative `data_dir`        -> anchored to the config file's folder
+    /// - relative explicit `recv_dir` -> anchored to the config file's folder
+    /// - `recv_dir` not set          -> `<data_dir>/files`
+    pub fn normalize(&mut self, config_file: &Path) {
+        let base = config_file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        if self.data_dir.is_relative() {
+            self.data_dir = base.join(&self.data_dir);
+        }
+        self.files.recv_dir = Some(match &self.files.recv_dir {
+            Some(rel) if rel.is_relative() => base.join(rel),
+            Some(abs) => abs.clone(),
+            None => self.data_dir.join("files"),
+        });
     }
 
     /// Persist configuration as pretty JSON.

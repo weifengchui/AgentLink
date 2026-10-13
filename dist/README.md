@@ -18,6 +18,11 @@
 > v0.4.9：Windows 开机自启内置——`agentlink autostart` 在当前用户"启动"文件夹写入
 > `AgentLink.vbs` 隐藏窗口启动脚本（无需管理员），`启动.bat` 双击时自动静默注册；
 > `run --no-open` 后台拉起不弹浏览器。Linux 侧仍用 `deploy/install-systemd.sh`。
+>
+> v0.4.10：数据目录默认外置（Windows `%LOCALAPPDATA%\AgentLink\data`、Linux `~/.local/share/agentlink`），
+> 不再放软件目录里以免升级覆盖；`agentlink.json` 的 `data_dir` 可按机器各自改为绝对路径，
+> 相对路径以配置文件目录为基准。发布包新增 `SKILL-agent-registration.md`（Agent 上线注册技能，
+> 每台机器的 Agent 都应先学习并执行它）。
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
