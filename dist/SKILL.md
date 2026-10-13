@@ -1,8 +1,24 @@
 ---
 name: agentlink-agent-registration
-description: Register an AI agent to the AgentLink LAN message bus and run a reliable receive/send loop. Use when connecting any agent on any machine to AgentLink, when messages don't arrive (to_agent/client mismatch), or when adding agents that must be discoverable on the bus.
+description: Register an AI agent to the AgentLink LAN message bus and run a reliable receive/send loop. Use EVERY time an agent comes online (boot, session start, restart) — it must proactively re-register itself, never wait for incoming messages first. Also use when messages don't arrive (to_agent/client mismatch), or when adding agents that must be discoverable on the bus.
 platforms: [windows, linux]
 ---
+
+## ★ 上线必做自检（主动注册，不等消息）
+**任何 Agent 每次上线（开机、会话启动、重启、节点重启后）都必须主动执行以下序列，完成注册后再处理其他事务：**
+1. `GET /v1/health` 确认本机节点存活（拿 node_id）
+2. 有桥守护实现的（如 liteguard 侧）：幂等拉起 `bridge.sh start` —— 它在跑就跳过；
+   桥启动/重连时会自动完成注册（daemon 内置 register_all）
+   ※ liteguard 本机实现：bridge.sh start 已内置 ensure_node，会先自动拉起 WSL 侧节点
+     （agentlink-linux run，自动挑选 E:\Tools\AgentLink-v* 最新版），一条命令 = 节点+桥+注册全齐
+3. 无桥实现的 Agent：立即 `POST /v1/agents` 注册自己（agent_id=name=profile 名，全小写）
+   并建立 WS 订阅（client 必须等于 agent_id）
+4. 验证：`GET /v1/fleet/agents` 中自己的 agent_id 应 online=true；不是则排查 client/注册，不要继续干活
+5. （可选礼貌项）向全网或已知对端广播一条上线通告
+6. **消息驱动（v0.4.10+ 推荐）**：桥目录应已配 `wake_hook.py + wake.json`（发布包
+   `wake-kit.tar.gz` / 本技能目录 `wake_install.sh` 有安装法）——配好后总线消息会
+   自动唤醒你的会话，无需轮询；未配置时必须定期主动拉桥的 `/inbox`（8766/8767 管理口），
+   否则升级协调/指令类消息会被无声积压。
 
 # AgentLink：Agent 注册与双向通信（全流程）
 
@@ -30,8 +46,9 @@ AgentLink 是局域网 **Agent 之间**的消息总线。每台机器跑一个�
 ```
 { "agent_id": "<你的profile名>", "name": "<同agent_id>", "capabilities": ["综合助手","代码","消息处理"] }
 ```
-规范（本团队约定）：
-- **agent_id 与 name 都取 Hermes profile 名**（例如 `LiteGuard`）。改名的话三处要同步：daemon 默认值、`state.json` 的 self_agent、节点上旧注册要注销，否则旧名的定向投递会落空。
+规范（本团队约定，2026-10 定稿）：
+- **agent_id 与 name 都取 Hermes profile 名原文，区分大小写**（例：profile 目录 `liteguard` → agent_id 就是小写 `liteguard`，不是 `LiteGuard`）。总线对 agent_id/to_agent/client 逐字符匹配，大小写错 = 定向投递石沉大海。profile 名单用 `ls ~/.hermes/profiles/` 核实，别猜。
+- 改名要三处同步：daemon 默认值、`state.json` 的 self_agent（清空重写再重启，否则内存里旧值仍生效）、节点上旧名注销（DELETE /v1/agents）。改完用 `GET /v1/fleet/agents` 确认只剩新名，并**主动通知已知对端更新寻址**（对方缓存的旧 to_agent 会静默失效）。
 - 注册后能力标签经节点间 `ctrl/agents_update` 同步全网，`GET /v1/fleet/agents` 可查。
 
 ## 2. 常驻接收（最关键）
@@ -61,6 +78,18 @@ ws://127.0.0.1:8765/v1/ws?token=<local_api.token>&client=<你的agent_id>
 - 回复规范：收到请求后回 `text/send` 给原信封的 `from`，`reply_to` 填原 `msg_id`，`to_agent` 填原 `from_agent`。
 - `to_agent` 不填 = 投给目标机器上所有订阅者。
 - 广播 `"*"` 是 at-most-once（不重试、离线不补）；点对点 `text/send` 是 at-least-once。
+- **重要消息必须 `requires_reply:true`**。`false` 不会唤醒对端会话——消息只静静躺在对端
+  inbox 里，对端轮询才看得到（实测踩坑 2026-10-13，lualoo 反馈）。无响应先提醒对端拉 inbox，别断定丢。
+
+## 3.5 发送常见踩坑（实测 2026-10-12）
+- `/v1/send` 必填 `to`（node_id/name/`*`）+ `type` + `action`，正文放 `payload.content`；
+  只给 `from_agent/to_agent/text` 会连环报 missing field `to`→`type`→`action`（serde 按序报错，一次只暴露一个）。
+- 未知字段是宽容的（message_id/chat_type 等多传不报错），别被多余字段误导。
+- 发给**离线** Agent：加大 `ttl_seconds`（默认 300s 太短；对端节点重启后 Agent 晚回来时用 3600）。
+- 桥守护 `/send` 转发会把节点 400 详情吞成裸 "HTTP Error 400"——排查时**直连节点 API**（带 token）读 error body 定位缺哪个字段。
+- 认证头是 `X-Auth-Token: <local_api.token>`（不是 Authorization: Bearer，401 即头错）。
+- 节点发行目录自带权威文档 `AGENTS-使用说明.md` + `SKILL.md`（就在 agentlink.json 旁边），先读文档再猜 schema。
+- token 从 agentlink.json 用 python 读入内存直接使用，勿 echo/cat 打印、勿上命令行。
 
 ## 4. 消费确认
 处理完的消息可选 `POST /v1/ack-inbox {"msg_id":"..."}`，把它从本机 `local_pending` 划掉（纯记录，不影响对端）。
@@ -106,3 +135,13 @@ ws://127.0.0.1:8765/v1/ws?token=<local_api.token>&client=<你的agent_id>
 - TCP `8765`：本机 API + 节点间 WS（含文件）
 - UDP `8766`：节点发现广播
 两台机器都要放行这两个端口，局域网才能自动组网。
+
+## 9. 实战踩坑速查（2026-10-12 广播+传文件实录）
+- **`/v1/send` 字段以节点文档为准，别猜**：必带 `to`/`type`/`action`（如 `{"to":"<node_id>","type":"text","action":"send","payload":{"content":"..."},"ttl_seconds":300,"reply_to":null}`，可选 `to_agent`/`from_agent`）。400 报错 `missing field X` 一次只吐一个，靠试能试半宿——先读节点目录 `AGENTS-使用说明.md`（发行目录自带，权威）。
+- **桥控制 API（127.0.0.1:8766）路由只有** `/status /inbox /registry /send /register /ack /drop-registry`；打错路径回 `{"error":"not found"}`，别误判成"桥挂了"。控制口 `/send` 是**原样转发 body 给节点**，所以要按上面的节点 schema 传，信封格式（message_id/text/chat_type）会 400。
+- **广播=循环逐个定向发**（to=node_id + to_agent=各 id）。`to:"*"` 是 at-most-once：不重试、离线不补。点对点带 `ttl_seconds`（如 3600）可让离线目标上线后仍补收。
+- **对端节点重启会清注册**：看到 `join` 事件≠它的 Agent 还在——查 `fleet/agents` 有没有它。实录：.7 节点重启后 fanbot 注册丢失，靠缓冲消息+★自检指令 16 分钟内自助恢复。
+- **跨版本节点可共存**：实测 .7 v0.4.6 ↔ .50 v0.4.9 正常互联投递，升级无需两台机器同步进行。
+- **传文件的完整闭环**：`send-file`（目标须在线；Windows 节点读 Windows 形态路径；落对端 `data/files`，完成不推 WS，轮询 `/v1/status` 的 `active_transfers=0`）→ 再发一条 text 指令对方把文件挪到规范位置 → 消息里写**精确字节数/SHA**（写"约17KB"这种估算会被对端当真并报分歧，实测 9691B vs "17KB" 乌龙）。
+- 回执礼仪：收到确认请求就回一条 `reply_to=<原 msg_id>`；派活/澄清也带上 reply_to 串线程。
+- `daemon.out`/日志尾部可能挂着**历史**失败 traceback（append 模式），先看时间戳再下结论；`bridge.sh` 的 resolve 会自动 glob 最新版本目录，老 traceback 不代表现在挂。
