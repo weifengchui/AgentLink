@@ -15,6 +15,10 @@ platforms: [windows, linux]
    并建立 WS 订阅（client 必须等于 agent_id）
 4. 验证：`GET /v1/fleet/agents` 中自己的 agent_id 应 online=true；不是则排查 client/注册，不要继续干活
 5. （可选礼貌项）向全网或已知对端广播一条上线通告
+6. **消息驱动（v0.4.10+ 推荐）**：桥目录应已配 `wake_hook.py + wake.json`（发布包
+   `wake-kit.tar.gz` / 本技能目录 `wake_install.sh` 有安装法）——配好后总线消息会
+   自动唤醒你的会话，无需轮询；未配置时必须定期主动拉桥的 `/inbox`（8766/8767 管理口），
+   否则升级协调/指令类消息会被无声积压。
 
 # AgentLink：Agent 注册与双向通信（全流程）
 
@@ -137,6 +141,7 @@ ws://127.0.0.1:8765/v1/ws?token=<local_api.token>&client=<你的agent_id>
 - **桥控制 API（127.0.0.1:8766）路由只有** `/status /inbox /registry /send /register /ack /drop-registry`；打错路径回 `{"error":"not found"}`，别误判成"桥挂了"。控制口 `/send` 是**原样转发 body 给节点**，所以要按上面的节点 schema 传，信封格式（message_id/text/chat_type）会 400。
 - **广播=循环逐个定向发**（to=node_id + to_agent=各 id）。`to:"*"` 是 at-most-once：不重试、离线不补。点对点带 `ttl_seconds`（如 3600）可让离线目标上线后仍补收。
 - **对端节点重启会清注册**：看到 `join` 事件≠它的 Agent 还在——查 `fleet/agents` 有没有它。实录：.7 节点重启后 fanbot 注册丢失，靠缓冲消息+★自检指令 16 分钟内自助恢复。
+- **跨版本节点可共存**：实测 .7 v0.4.6 ↔ .50 v0.4.9 正常互联投递，升级无需两台机器同步进行。
 - **传文件的完整闭环**：`send-file`（目标须在线；Windows 节点读 Windows 形态路径；落对端 `data/files`，完成不推 WS，轮询 `/v1/status` 的 `active_transfers=0`）→ 再发一条 text 指令对方把文件挪到规范位置 → 消息里写**精确字节数/SHA**（写"约17KB"这种估算会被对端当真并报分歧，实测 9691B vs "17KB" 乌龙）。
 - 回执礼仪：收到确认请求就回一条 `reply_to=<原 msg_id>`；派活/澄清也带上 reply_to 串线程。
 - `daemon.out`/日志尾部可能挂着**历史**失败 traceback（append 模式），先看时间戳再下结论；`bridge.sh` 的 resolve 会自动 glob 最新版本目录，老 traceback 不代表现在挂。
