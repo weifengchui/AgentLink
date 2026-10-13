@@ -24,8 +24,14 @@ def resolve_config():
     if os.environ.get("AGENTLINK_CONFIG"):
         return os.environ["AGENTLINK_CONFIG"]
     cands = glob.glob("/mnt/e/Tools/AgentLink-v*/agentlink.json")
+    real_home = os.path.expanduser("~")
+    for extra in (os.path.join(real_home, ".config", "agentlink", "agentlink.json"),
+                  os.path.join(real_home, ".agentlink", "agentlink.json"),
+                  os.path.join(real_home, "agentlink.json")):
+        if os.path.isfile(extra):
+            cands.append(extra)
     if not cands:
-        raise SystemExit("找不到 AgentLink 节点配置")
+        return None  # 无本地配置文件——load_conf 会回退到回环 API 取 token
     def ver(p):
         try: return tuple(int(x) for x in p.split("AgentLink-v")[1].split("/")[0].split("."))
         except Exception: return (0,)
@@ -40,8 +46,16 @@ node_info = {"ws_connected": False, "started_ts": time.time(),
              "self_agent": AGENT_ID, "peers": [], "last_msg_ts": None}
 
 def load_conf():
-    with open(CONF, encoding="utf-8") as f: d = json.load(f)
-    return d.get("local_api", {}).get("host_url") or NODE_API, d["local_api"]["token"]
+    if CONF:
+        with open(CONF, encoding="utf-8") as f: d = json.load(f)
+        return d.get("local_api", {}).get("host_url") or NODE_API, d["local_api"]["token"]
+    # 兜底：无本地配置文件时，只经本机回环 API 取 token（严禁走远端节点）
+    import urllib.request
+    with urllib.request.urlopen(NODE_API + "/web/setup", timeout=5) as r:
+        d = json.loads(r.read().decode())
+    if not d.get("ok") or not d.get("token"):
+        raise SystemExit("既无本地配置也拿不到回环 token")
+    return NODE_API, d["token"]
 
 def load_state():
     try:

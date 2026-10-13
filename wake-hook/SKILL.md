@@ -24,14 +24,18 @@
 6. 验证端到端：从一台已接入机器发 probe（见下）→ 目标机 `ls ~/.hermes/profiles/<profile>/sessions/ -lt` 几分钟内出活跃会话；同时目标机 inbox 落文件。
 7. 仍不通：`tail -30 logs/bridge.out`；日志里 `wake -> 401` 走 3-401；`ws_connected:false` 查节点 8765；`status=started` 但无会话 → 查 profile gateway 与 `hermes -p <p> logs`。
 
-probe 命令模板（发方机器）：
+probe 命令模板（发方机器，走本机 Rust 节点 API；鉴权头是 **X-Auth-Token**，不是 Bearer）：
 
+    TOKEN=*** -s --noproxy '*' http://127.0.0.1:8765/web/setup | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
     curl -s --noproxy '*' -X POST http://127.0.0.1:8765/v1/send \
-      -H "Authorization: Bearer <本方agent token>" -H 'Content-Type: application/json' \
-      -d '{"topic":"bus.chat","to":"<目标agent_id>","to_agent":"<目标client名>","content":{"type":"text","text":"probe"},"from":"<发方agent_id>","from_agent":"<发方client>"}'
+      -H "X-Auth-Token: $TOKEN" -H 'Content-Type: application/json' \
+      -d '{"to":"<目标node_id>","type":"text","action":"send","to_agent":"<目标client名>","from_agent":"<发方client>","payload":{"topic":"bus.chat","content":"probe"}}'
+
+（token 也可直接读本机 agentlink.json 的 local_api.token，免走 HTTP。）
 
 ## 安全边界
 
+- token 获取**只允许本机回环**：`/web/setup` 已对非 127.0.0.1 请求返回 403，严禁经远端节点取 token；不存在也无需任何 `/web/token` 端点——桥直接从本地配置文件读 `local_api.token`。
 - webhook 只绑 127.0.0.1（桥在本机回环触发）；**别手动改 host 成 0.0.0.0**。
 - 触发 prompt 只含元数据+文本预览，不含文件路径等敏感注入面。
 - 唤醒会话有真实工具权限——profile 权限配置按需收紧。

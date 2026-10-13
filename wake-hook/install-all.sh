@@ -121,7 +121,7 @@ echo "$RESP" | grep -q accepted && echo "   ok: webhook 已接受触发（对应
 
 printf '\n\033[1;32m完成 ✅\033[0m\n'
 cat <<DONE
- 桥目录 : $BRIDGE_DIR （状态口: curl http://127.0.0.1:8767/status）
+ 桥目录 : $BRIDGE_DIR （状态口: curl http://127.0.0.1:$BRIDGE_PORT/status）
  唤醒去 : hermes profile '$P'
  下一步 : 该机 agent 上线时照 SKILL.md 注册身份（client/agent_id 用 '$AGENT'）
  验证   : 从别的机器向本机 to_agent=$AGENT 发条消息，
