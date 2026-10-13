@@ -386,18 +386,16 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
-/// Windows: manage a per-user "at logon" scheduled task that starts the node
-/// headless (`run --no-open`), so a machine reboot brings the mesh back by
-/// itself — no browser page, no manual click. On other platforms this prints
-/// systemd guidance instead.
+/// Windows: manage per-user autostart so a reboot brings the node back by
+/// itself — no browser page, no manual click. Implemented via the Startup
+/// folder (`%APPDATA%\...\Startup\AgentLink.vbs`, hidden window, no admin
+/// rights needed; `schtasks /SC ONLOGON` requires elevation). On other
+/// platforms this prints systemd guidance instead.
 fn autostart(config_path: &std::path::Path, remove: bool, force: bool) -> Result<()> {
-    const TASK_NAME: &str = "AgentLink";
-
     if !cfg!(windows) {
-        println!("autostart is implemented via Windows Task Scheduler (schtasks /SC ONLOGON).");
+        println!("autostart is implemented via the Windows Startup folder (AgentLink.vbs).");
         println!("On Linux, install the systemd unit instead:");
         println!("  ./deploy/install-systemd.sh   # run from the node directory");
-        println!("  systemctl --user enable --now agentlink   # if the script sets a user unit");
         return Ok(());
     }
 
@@ -408,67 +406,56 @@ fn autostart(config_path: &std::path::Path, remove: bool, force: bool) -> Result
         std::path::absolute(config_path).unwrap_or_else(|_| config_path.to_path_buf())
     };
 
-    let exists = std::process::Command::new("schtasks")
-        .args(["/Query", "/TN", TASK_NAME])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let appdata = std::env::var("APPDATA").context("APPDATA environment variable not set")?;
+    let startup =
+        std::path::Path::new(&appdata).join(r"Microsoft\Windows\Start Menu\Programs\Startup");
+    let vbs = startup.join("AgentLink.vbs");
 
     if remove {
-        if !exists {
-            println!("no '{TASK_NAME}' scheduled task; nothing to remove");
-            return Ok(());
+        match std::fs::remove_file(&vbs) {
+            Ok(()) => println!("removed autostart entry: {}", vbs.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("no autostart entry found; nothing to remove");
+            }
+            Err(e) => return Err(e).with_context(|| format!("cannot remove {}", vbs.display())),
         }
-        let out = std::process::Command::new("schtasks")
-            .args(["/Delete", "/TN", TASK_NAME, "/F"])
-            .output()?;
-        if out.status.success() {
-            println!("removed scheduled task '{TASK_NAME}'");
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "schtasks /Delete failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        return Ok(());
+    }
+
+    if vbs.exists() && !force {
+        println!("autostart already registered: {}", vbs.display());
+        if let Ok(content) = std::fs::read_to_string(&vbs) {
+            for line in content.lines().filter(|l| l.starts_with("ws.Run")) {
+                println!("  {line}");
+            }
         }
-    } else {
-        if exists && !force {
-            println!("scheduled task '{TASK_NAME}' already exists. Details:");
-            let _ = std::process::Command::new("schtasks")
-                .args(["/Query", "/TN", TASK_NAME])
-                .stdout(std::process::Stdio::inherit())
-                .status();
-            println!("(use --force to re-register with current paths, --remove to delete)");
-            return Ok(());
-        }
-        if !cfg_abs.exists() {
-            anyhow::bail!(
-                "config '{}' does not exist; run this from the node directory or pass --config",
-                cfg_abs.display()
-            );
-        }
-        let action = format!(
-            "\"{}\" --config \"{}\" run --no-open",
-            exe.display(),
+        println!("(use --force to re-register with current paths, --remove to delete)");
+        return Ok(());
+    }
+    if !cfg_abs.exists() {
+        anyhow::bail!(
+            "config '{}' does not exist; run this from the node directory or pass --config",
             cfg_abs.display()
         );
-        let out = std::process::Command::new("schtasks")
-            .args([
-                "/Create", "/TN", TASK_NAME, "/SC", "ONLOGON", "/TR", &action, "/F",
-            ])
-            .output()?;
-        if out.status.success() {
-            println!("registered scheduled task '{TASK_NAME}' (starts at logon, headless):");
-            println!("  {action}");
-            println!("start it now without waiting for next logon:  schtasks /Run /TN {TASK_NAME}");
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "schtasks /Create failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
     }
+
+    // VBS quotes a literal " as "" — so the inner command reads ""..."" .
+    let script = format!(
+        "' AgentLink autostart (installed by `agentlink autostart`){}\n\
+         Set ws = CreateObject(\"Wscript.Shell\")\n\
+         ws.Run \"\"\"{}\"\" --config \"\"{}\"\" run --no-open\", 0, False\n",
+        "",
+        exe.display(),
+        cfg_abs.display()
+    );
+    std::fs::create_dir_all(&startup)
+        .with_context(|| format!("cannot open Startup folder {}", startup.display()))?;
+    std::fs::write(&vbs, script).context("cannot write AgentLink.vbs")?;
+    println!("registered autostart (hidden, at logon, no admin needed):");
+    println!("  {}", vbs.display());
+    println!(
+        "run it now without waiting for next logon:  wscript \"{}\"",
+        vbs.display()
+    );
+    Ok(())
 }
