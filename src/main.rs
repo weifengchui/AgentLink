@@ -14,6 +14,7 @@ mod mdns;
 mod peer;
 mod proto;
 mod router;
+mod store;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

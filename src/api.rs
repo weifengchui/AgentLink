@@ -194,6 +194,8 @@ async fn status(State(state): State<SharedState>, headers: HeaderMap) -> impl In
             "peers_online": online,
             "pending_acks": state.router.pending_acks(),
             "offline_queue": offline_queue,
+            "inbox": state.router.inbox_len(),
+            "durable": state.router.durable(),
             "local_pending": state.router.local_pending_count(),
             "active_transfers": state.files.active(),
         })),
@@ -1046,6 +1048,12 @@ row input{width:auto}
 .slider:before{content:"";position:absolute;width:14px;height:14px;left:3px;top:3px;background:#dbe2ea;border-radius:50%;transition:.2s}
 .switch input:checked+.slider{background:#2f6fe4}
 .switch input:checked+.slider:before{transform:translateX(18px)}
+th.srt{cursor:pointer;user-select:none}
+th.srt:hover{color:#dbe2ea}
+.msg{user-select:text}
+.msg .pay{user-select:text}
+.msg .det{color:#67748a;font-size:11px;margin-top:6px;line-height:1.6;word-break:break-all;background:#0b1017;border:1px solid #1c2330;border-radius:8px;padding:6px 8px}
+#toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#1c2a44;color:#cfe3ff;border:1px solid #2f6fe4;padding:8px 18px;border-radius:20px;font-size:13px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:90}
 </style></head>
 <body>
 <div id="modal"><div class="box">
@@ -1105,10 +1113,10 @@ row input{width:auto}
       </div>
     </section>
     <section id="p-nodes" class="hidden">
-      <div class="card"><h2>节点 Peers</h2><table><thead><tr><th>名称</th><th>node_id</th><th>地址</th><th>标签</th><th>状态</th></tr></thead><tbody id="peers-body"></tbody></table></div>
+      <div class="card"><h2>节点 Peers</h2><table><thead><tr><th class="srt" onclick="pSortBy('name')">名称<span id="ps-name"></span></th><th class="srt" onclick="pSortBy('node_id')">node_id<span id="ps-node_id"></span></th><th>地址</th><th>标签</th><th class="srt" onclick="pSortBy('online')">状态<span id="ps-online"></span></th><th>操作</th></tr></thead><tbody id="peers-body"></tbody></table></div>
     </section>
     <section id="p-agents" class="hidden">
-      <div class="card"><h2>Agent（全网）</h2><table><thead><tr><th>节点</th><th>agent_id</th><th>名字</th><th>能力</th><th>状态</th><th>操作</th></tr></thead><tbody id="agents-body"></tbody></table></div>
+      <div class="card"><h2>Agent（全网）</h2><table><thead><tr><th class="srt" onclick="aSortBy('node')">节点<span id="as-node"></span></th><th class="srt" onclick="aSortBy('id')">agent_id<span id="as-id"></span></th><th class="srt" onclick="aSortBy('name')">名字<span id="as-name"></span></th><th>能力</th><th class="srt" onclick="aSortBy('online')">状态<span id="as-online"></span></th><th>操作</th></tr></thead><tbody id="agents-body"></tbody></table></div>
     </section>
     <section id="p-chat" class="hidden">
       <div class="card"><h2>发送消息 / 文件</h2>
@@ -1144,6 +1152,7 @@ row input{width:auto}
   </div>
 </div>
 </div>
+<div id="toast"></div>
 
 <script>
 const $=id=>document.getElementById(id);
@@ -1153,18 +1162,27 @@ const HDR=()=>({'X-Auth-Token':TOKEN});
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(ts){try{return new Date(ts).toLocaleString();}catch{return ts;}}
 let HIST=[],OV={page:1},CH={page:1},NAMES={},AN={},AGENTS=[],SELF='';
+let PEERS=[],ST={},ASORT={k:'node',d:1},PSORT={k:'name',d:1},EXP=new Set(),LAST={ag:'',pe:'',op:'',hi:'',qt:''};
+// 用户正在选择文本时跳过所有 DOM 重写：选择/复制不再被 2 秒自动刷新打断
+function selecting(){const s=window.getSelection();return s&&s.rangeCount>0&&!s.isCollapsed;}
+function srtIcon(pfx,cur,k){const e=el(pfx+k);if(e)e.textContent=cur.k===k?(cur.d>0?' ↑':' ↓'):'';}
+function aSortBy(k){if(ASORT.k===k)ASORT.d=-ASORT.d;else ASORT={k:k,d:1};renderAgents();}
+function pSortBy(k){if(PSORT.k===k)PSORT.d=-PSORT.d;else PSORT={k:k,d:1};renderPeers();}
 function who(n){return NAMES[n]||n;}
 function whoa(n,a){return a?AN[n+'|'+a]||a:''}
 function dirLab(m){if(m.kind==='file')return '📄 文件';if(m.direction==='out')return '⬆ 发出';if(m.direction==='in')return '⬇ 收到';return '• 本机';}
-function prettyPay(m){
-  const p=m.payload||{};
-  if(p&&typeof p==='object'&&typeof p.content==='string'){const t=p.content;return t.length>260?t.slice(0,260)+'…':t;}
-  return JSON.stringify(p);
-}
+function fullPay(m){const p=m.payload;if(p&&typeof p==='object'&&typeof p.content==='string')return p.content;try{return JSON.stringify(p,null,2);}catch(e){return String(p);}}
+function tgExp(id){if(EXP.has(id))EXP.delete(id);else EXP.add(id);ovGo(OV.page);chGo(CH.page);}
+function toast(s){const t=el('toast');if(!t)return;t.textContent=s;t.style.opacity='1';clearTimeout(t._h);t._h=setTimeout(()=>{t.style.opacity='0';},1400);}
+function copyMsg(id){const m=HIST.find(x=>x.msg_id===id);if(!m)return;const p=m.payload||{};let t;if(m.kind==='file'){t=[p.file_name,(p.size!==undefined?humanSize(p.size):''),p.saved_path].filter(Boolean).join(' | ');}else{t=(p&&typeof p==='object'&&typeof p.content==='string')?p.content:JSON.stringify(p,null,2);}copyText(t);}
+function copyText(t){if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(()=>toast('已复制到剪贴板'),()=>fbCopy(t));}else{fbCopy(t);}}
+function fbCopy(t){const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.focus();ta.select();try{document.execCommand('copy');toast('已复制到剪贴板');}catch(e){toast('复制失败');}ta.remove();}
 function histRow(m){
   const dir=(m.direction==='out'?'out':m.direction==='in'?'in':'');
   const fromW=who(m.from)+(m.from_agent?` [${whoa(m.from,m.from_agent)}]`:'');
   const toW=who(m.to)+(m.to_agent?` [${whoa(m.to,m.to_agent)}]`:'');
+  const open=EXP.has(m.msg_id);
+  const cpy=`<button class="tbtn" title="复制消息内容" onclick="copyMsg('${esc(m.msg_id)}')">复制</button>`;
   if(m.kind==='file'){
     const nm=esc((m.payload&&m.payload.file_name)||'file');
     const sp=(m.payload&&m.payload.saved_path)||'';
@@ -1175,9 +1193,16 @@ function histRow(m){
       const dl=encodeURIComponent(nm);
       head=`<span class="fl">📄 <a href="/v1/files/${dl}" target="_blank" rel="noopener">${nm}</a> <span class="tool"><a class="tbtn" href="/v1/files/${dl}" target="_blank" rel="noopener">打开文件</a><button class="tbtn" onclick="openFl('${dl}')">打开文件夹</button></span></span>`;
     }else{head=`📤 ${nm}`;}
-    return `<div class="msg file"><div class="meta">${fmt(m.ts)} · ${dirLab(m)} · ${esc(fromW)} → ${esc(toW)}</div><div class="pay">${head} · ${sz}</div></div>`;
+    const ftg=`<button class="tbtn" onclick="tgExp('${esc(m.msg_id)}')">${open?'收起':'详情'}</button>`;
+    const fdet=open?`<div class="det">msg_id: ${esc(m.msg_id)} · ${esc(m.direction)} · from ${esc(m.from)}${m.from_agent?' / '+esc(m.from_agent):''} → to ${esc(m.to)}${m.to_agent?' / '+esc(m.to_agent):''} · size: ${esc(String((m.payload&&m.payload.size)||0))} B${sp?` · saved_path: ${esc(sp)}`:''} · ts: ${esc(m.ts)}</div>`:'';
+    return `<div class="msg file"><div class="meta">${fmt(m.ts)} · ${dirLab(m)} · ${esc(fromW)} → ${esc(toW)} · ${cpy}${ftg}</div><div class="pay">${head} · ${sz}</div>${fdet}</div>`;
   }
-  return `<div class="msg ${dir}"><div class="meta">${fmt(m.ts)} · ${dirLab(m)} · ${esc(fromW)} → ${esc(toW)} · <span class="k">${esc(m.kind)}/${esc(m.action)}</span></div><div class="pay">${esc(prettyPay(m))}</div></div>`;
+  const full=fullPay(m);
+  const long=full.length>260;
+  const showTxt=open?full:(long?full.slice(0,260)+'…':full);
+  const tg=long?`<button class="tbtn" onclick="tgExp('${esc(m.msg_id)}')">${open?'收起':'展开'}</button>`:'';
+  const det=open?`<div class="det">msg_id: ${esc(m.msg_id)} · ${esc(m.direction)} · from ${esc(m.from)}${m.from_agent?' / '+esc(m.from_agent):''} → to ${esc(m.to)}${m.to_agent?' / '+esc(m.to_agent):''} · 类型: ${esc(m.kind)}/${esc(m.action)} · ts: ${esc(m.ts)}</div>`:'';
+  return `<div class="msg ${dir}"><div class="meta">${fmt(m.ts)} · ${dirLab(m)} · ${esc(fromW)} → ${esc(toW)} · <span class="k">${esc(m.kind)}/${esc(m.action)}</span> · ${cpy}${tg}</div><div class="pay">${esc(showTxt)}</div>${det}</div>`;
 }
 function humanSize(n){if(!n)return '';if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(1)+' MB';}
 function filterHist(kw,arr){if(!kw)return arr.slice();return arr.filter(m=>JSON.stringify({f:m.from,a:m.from_agent,t:m.to,ta:m.to_agent,k:m.kind,p:m.payload}).toLowerCase().includes(kw.toLowerCase()));}
@@ -1282,42 +1307,68 @@ async function doFile(sfx){
     fe.value='';
   }catch(e){res.textContent='发送失败: '+(e.message||e);}
 }
+function renderAgents(){
+  ['node','id','name','online'].forEach(k=>srtIcon('as-',ASORT,k));
+  const rank=a=>(a.node_id===SELF?0:1);
+  const list=AGENTS.slice().sort((a,b)=>{
+    const r=rank(a)-rank(b); if(r) return r;
+    let c=0;
+    if(ASORT.k==='node')c=(a.node_name||a.node_id).localeCompare(b.node_name||b.node_id,'zh')||a.agent_id.localeCompare(b.agent_id);
+    else if(ASORT.k==='id')c=a.agent_id.localeCompare(b.agent_id);
+    else if(ASORT.k==='name')c=(a.name||'').localeCompare(b.name||'','zh');
+    else if(ASORT.k==='online')c=(b.online?1:0)-(a.online?1:0)||a.agent_id.localeCompare(b.agent_id);
+    return c*ASORT.d;});
+  let ag=''; list.forEach(a=>{const k=`'${esc(a.node_id)}','${esc(a.agent_id)}'`;const loc=a.node_id===SELF;
+  ag+=`<tr${loc?' class="local"':''}><td>${loc?'<span class="self-chip">本机</span>':''}${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td${loc?` class="ed-name" title="双击改名，回车保存" ondblclick="inlineName(this,${k})"`:''}>${esc(a.name)}</td><td>${(a.capabilities||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join('')}</td><td><span class="badge ${a.online?'on':'off'}"><span class="dot"></span>${a.online?'在线':'离线'}</span></td><td>${loc?`<button class="tbtn" onclick="editAgent(${k})">改名</button> <button class="tbtn" onclick="delAgent(${k})">删除</button>`:`<span class="hint" title="远端 Agent：请在其所属节点上改名/删除（本机 API 只管本机注册）">远端</span>`}</td></tr>`;});
+  if(ag!==LAST.ag){$('agents-body').innerHTML=ag;LAST.ag=ag;}
+}
+function renderPeers(){
+  ['name','node_id','online'].forEach(k=>srtIcon('ps-',PSORT,k));
+  const rank=p=>(ST.node_id&&p.node_id===ST.node_id?0:1);
+  const list=PEERS.slice().sort((a,b)=>{
+    const r=rank(a)-rank(b); if(r) return r;
+    let c=0;
+    if(PSORT.k==='name')c=(a.name||'').localeCompare(b.name||'','zh');
+    else if(PSORT.k==='node_id')c=a.node_id.localeCompare(b.node_id);
+    else if(PSORT.k==='online')c=(b.online?1:0)-(a.online?1:0)||(a.name||'').localeCompare(b.name||'','zh');
+    return c*PSORT.d;});
+  let pe=''; for(const p of list){const loc=ST&&p.node_id===ST.node_id;pe+=`<tr${loc?' class="local"':''}><td>${loc?'<span class="self-chip">本机</span>':''}${esc(p.name)}</td><td>${esc(p.node_id)}</td><td>${esc(p.addr)}</td><td>${(p.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</td><td><span class="badge ${p.online?'on':'off'}"><span class="dot"></span>${p.online?'在线':'离线'}</span></td><td>${(!p.online&&!loc)?`<button class="tbtn" title="从列表移除且忽略自动发现，直到该节点重新握手连上" onclick="forgetPeer('${esc(p.node_id)}')">遗忘</button>`:''}</td></tr>`;}
+  if(pe!==LAST.pe){$('peers-body').innerHTML=pe;LAST.pe=pe;}
+}
+function histSig(){return HIST.length+'|'+(HIST.length?HIST[HIST.length-1].msg_id:'')+'|'+EXP.size;}
 async function refresh(){
  try{
   if(el('ed-input'))return; // 行内改名编辑中：跳过本轮刷新，防止重绘冲掉编辑框
   const [st,peers,agents,hist]=await Promise.all([j('/v1/status'),j('/v1/peers'),j('/v1/fleet/agents'),j('/v1/history')]);
+  ST=st||{}; PEERS=(peers&&peers.ok)?peers.peers:[]; AGENTS=(agents&&agents.ok)?agents.agents:[]; SELF=ST.node_id||'';
   $('tb-self').textContent=st.name;
   $('tb-meta').textContent=`${st.node_id} · v${st.version} · 在线 ${st.peers_online}/${st.peers_known} · ${new Date().toLocaleTimeString()}`;
   $('m-nodes').textContent=`${st.peers_online}/${st.peers_known}`;
   $('m-history').textContent=hist.history.length;
   $('m-transfer').textContent=st.active_transfers;
   $('m-version').textContent=st.version;
-  let pe=''; if(peers&&peers.ok)for(const p of peers.peers){const loc=st&&p.node_id===st.node_id;pe+=`<tr${loc?' class="local"':''}><td>${loc?'<span class="self-chip">本机</span>':''}${esc(p.name)}</td><td>${esc(p.node_id)}</td><td>${esc(p.addr)}</td><td>${(p.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</td><td><span class="badge ${p.online?'on':'off'}"><span class="dot"></span>${p.online?'在线':'离线'}</span></td><td>${(!p.online&&!loc)?`<button class="tbtn" title="从列表移除且忽略自动发现，直到该节点重新握手连上" onclick="forgetPeer('${esc(p.node_id)}')">遗忘</button>`:''}</td></tr>`;}
-  $('peers-body').innerHTML=pe;
-  AGENTS=agents&&agents.ok?agents.agents:[];
-  SELF=(st&&st.node_id)||'';
-  let ag=''; AGENTS.forEach(a=>{const k=`'${esc(a.node_id)}','${esc(a.agent_id)}'`;const loc=a.node_id===SELF;
-  ag+=`<tr${loc?' class="local"':''}><td>${loc?'<span class="self-chip">本机</span>':''}${esc(a.node_name||a.node_id)}</td><td>${esc(a.agent_id)}</td><td${loc?` class="ed-name" title="双击改名，回车保存" ondblclick="inlineName(this,${k})"`:''}>${esc(a.name)}</td><td>${(a.capabilities||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join('')}</td><td><span class="badge ${a.online?'on':'off'}"><span class="dot"></span>${a.online?'在线':'离线'}</span></td><td>${loc?`<button class="tbtn" onclick="editAgent(${k})">改名</button> <button class="tbtn" onclick="delAgent(${k})">删除</button>`:`<span class="hint" title="远端 Agent：请在其所属节点上改名/删除（本机 API 只管本机注册）">远端</span>`}</td></tr>`;});
-  if(!el('ed-input'))$('agents-body').innerHTML=ag;
+  // 用户正在选择/复制文本：只更新内存数据，不重写 DOM（下一轮自动恢复渲染）
+  const sel=selecting();
   // 节点名 / agent 名映射（给人看）
   NAMES={}; AN={};
   if(st&&st.node_id){NAMES[st.node_id]=st.name||st.node_id;}
-  if(peers&&peers.ok)for(const p of peers.peers)NAMES[p.node_id]=p.name;
-  if(agents&&agents.ok)for(const a of agents.agents){AN[a.node_id+'|'+a.agent_id]=(a.name||a.agent_id); NAMES[a.node_id]=a.node_name||NAMES[a.node_id]||a.node_id;}
-  // 目标下拉（纯选择）
-  const curTo=el('to').value, curTo2=el('to2').value;
+  for(const p of PEERS)NAMES[p.node_id]=p.name;
+  for(const a of AGENTS){AN[a.node_id+'|'+a.agent_id]=(a.name||a.agent_id); NAMES[a.node_id]=a.node_name||NAMES[a.node_id]||a.node_id;}
+  if(!sel){renderPeers();renderAgents();}
+  // 目标下拉（纯选择）——签名相同不重写，保住控件状态
   let opn='<optgroup label="节点（发给整机）"><option value="*">* 广播（全部节点）</option>';
-  if(peers&&peers.ok)for(const p of peers.peers)opn+=`<option value="${esc(p.node_id)}">${esc(p.name)}${p.online?'':'（离线）'}</option>`;
+  for(const p of PEERS)opn+=`<option value="${esc(p.node_id)}">${esc(p.name)}${p.online?'':'（离线）'}</option>`;
   opn+='</optgroup><optgroup label="Agent（发给指定 Agent）">';
-  if(agents&&agents.ok)for(const a of agents.agents)opn+=`<option value="agent:${esc(a.node_id)}:${esc(a.agent_id)}">${esc(a.node_name||a.node_id)} · ${esc(a.agent_id)}${a.online?'':'（离线）'}</option>`;
+  for(const a of AGENTS)opn+=`<option value="agent:${esc(a.node_id)}:${esc(a.agent_id)}">${esc(a.node_name||a.node_id)} · ${esc(a.agent_id)}${a.online?'':'（离线）'}</option>`;
   opn+='</optgroup>';
-  [el('to'),el('to2')].forEach(x=>{const c=x===el('to')?curTo:curTo2;x.innerHTML=opn;if(c&&[...x.options].some(o=>o.value===c))x.value=c;});
+  if(!sel&&opn!==LAST.op){LAST.op=opn;
+    [el('to'),el('to2')].forEach(x=>{const c=x.value;x.innerHTML=opn;if(c&&[...x.options].some(o=>o.value===c))x.value=c;});}
   HIST=hist&&hist.ok?hist.history.slice():[];
-  ovGo(OV.page); chGo(CH.page);
+  if(!sel&&histSig()!==LAST.hi){LAST.hi=histSig();ovGo(OV.page);chGo(CH.page);}
   let qt='';
-  if(peers&&peers.ok)for(const p of peers.peers){if(p.online)qt+=`<button class="chip-btn" onclick="pick('${esc(p.node_id)}','')" title="${esc(p.name)}">${esc(p.name)}</button>`;}
-  if(agents&&agents.ok)for(const a of agents.agents){if(a.online)qt+=`<button class="chip-btn" onclick="pick('${esc(a.node_id)}','${esc(a.agent_id)}')" title="${esc(a.node_name||a.node_id)} / ${esc(a.agent_id)}">${esc(a.node_name||a.node_id)} · ${esc(a.agent_id)}</button>`;}
-  const qtEl=el('quick-targets'); if(qtEl)qtEl.innerHTML=qt?('快捷选择：'+qt):'';
+  for(const p of PEERS){if(p.online)qt+=`<button class="chip-btn" onclick="pick('${esc(p.node_id)}','')" title="${esc(p.name)}">${esc(p.name)}</button>`;}
+  for(const a of AGENTS){if(a.online)qt+=`<button class="chip-btn" onclick="pick('${esc(a.node_id)}','${esc(a.agent_id)}')" title="${esc(a.node_name||a.node_id)} / ${esc(a.agent_id)}">${esc(a.node_name||a.node_id)} · ${esc(a.agent_id)}</button>`;}
+  if(!sel&&qt!==LAST.qt){const qtEl=el('quick-targets'); if(qtEl){qtEl.innerHTML=qt?('快捷选择：'+qt):'';LAST.qt=qt;}}
  }catch(e){}
 }
 async function loadConfig(){

@@ -121,6 +121,12 @@ curl -X POST http://127.0.0.1:8765/v1/send-file -H "X-Auth-Token: $TOKEN" -d \
 
 首次运行请在防火墙放行这两个端口（见 [`docs/部署.md`](docs/部署.md)）。
 ## 版本提要
+- **v0.4.12**：消息可靠性持久化——队列（inbox/offline/pending/local/seen）以
+  `data_dir/journal.jsonl` 追加日志（每条 fsync，重启全量回放，过期离线件自动丢弃）；
+  agent 注册表原子快照 `data_dir/agents.json`；`history.jsonl` 重启回放、超 16MB 轮转。
+  开关：`delivery.persist=false` 关日志（临时测试节点）、`delivery.agent_stale_ttl_seconds`
+  清理久未重注册的离线 agent（默认 3600，0 关闭）。`/v1/status` 新增 inbox/durable 字段。
+  web 控制台：节点/Agent 表头排序、消息展开与复制、选中文本不再被自动刷新打断、toast 提示。
 - **v0.4.11**：`init/join --force` 保留 node_id/token/data_dir（堵死身份漂移事故）；
   fleet agents 在线状态联动节点（幽灵在线消除）；web 节点列表加「本机」标记与离线节点「遗忘」
   按钮（`DELETE /v1/peers/<id>/forget`，持久化 data_dir/forgotten_peers.json，真实握手自动解禁）。

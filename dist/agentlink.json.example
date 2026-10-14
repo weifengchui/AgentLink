@@ -30,7 +30,15 @@
     "ack_timeout_seconds": 5,
     "max_retries": 5,
     "offline_ttl_seconds": 300,
-    "dedup_cache_size": 2048
+    "dedup_cache_size": 2048,
+    "persist": true,
+    "agent_stale_ttl_seconds": 3600
+  },
+  "history": {
+    "enabled": true,
+    "len": 500,
+    "file": "history.jsonl",
+    "max_file_mb": 16
   },
   "log": {
     "level": "info",

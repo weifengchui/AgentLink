@@ -255,10 +255,15 @@ pub fn envelope_sign(token: &str, node_id: &str, msg_id: &str, ts: &str) -> Stri
 
 /// Validate the timestamp windows for replay protection (±`skew_seconds`).
 pub fn ts_within_skew(ts: &str, skew_seconds: i64) -> bool {
-    let Ok(t) = OffsetDateTime::parse(ts, &Rfc3339) else {
+    let Some(age) = ts_age_seconds(ts) else {
         return false;
     };
-    let now = OffsetDateTime::now_utc();
-    let delta = (now - t).whole_seconds();
-    delta.abs() <= skew_seconds
+    age.abs() <= skew_seconds
+}
+
+/// Seconds elapsed since `ts` (negative when `ts` is in the future);
+/// `None` if unparseable.
+pub fn ts_age_seconds(ts: &str) -> Option<i64> {
+    let t = OffsetDateTime::parse(ts, &Rfc3339).ok()?;
+    Some((OffsetDateTime::now_utc() - t).whole_seconds())
 }

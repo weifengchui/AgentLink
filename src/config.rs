@@ -104,6 +104,15 @@ pub struct DeliveryConfig {
     pub offline_ttl_seconds: u64,
     #[serde(default = "default_dedup_cache")]
     pub dedup_cache_size: usize,
+    /// Persist message queues to `data_dir/journal.jsonl` (fsync per record)
+    /// and the agent registry to `data_dir/agents.json`. Disable only for
+    /// throwaway/test nodes — a restart then loses in-flight messages.
+    #[serde(default = "default_true")]
+    pub persist: bool,
+    /// Local agents that are offline and have not re-registered within this
+    /// many seconds are auto-removed (0 disables the cleanup).
+    #[serde(default = "default_agent_stale_ttl")]
+    pub agent_stale_ttl_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,9 +135,13 @@ pub struct HistoryConfig {
     /// Ring-buffer capacity (most recent N messages kept in memory).
     #[serde(default = "default_history_len")]
     pub len: usize,
-    /// Optional append log under `data_dir` (e.g. "history.jsonl").
-    #[serde(default)]
+    /// Append log under `data_dir`; loaded back into the ring at boot so the
+    /// conversation view survives restarts. Empty string disables it.
+    #[serde(default = "default_history_file")]
     pub file: String,
+    /// Rotate the history file to `<file>.1` once it exceeds this size.
+    #[serde(default = "default_history_max_mb")]
+    pub max_file_mb: u64,
 }
 
 /// Web UI / browser behaviour.
@@ -238,13 +251,23 @@ fn default_log_format() -> String {
 fn default_history_len() -> usize {
     500
 }
+fn default_history_file() -> String {
+    "history.jsonl".to_string()
+}
+fn default_history_max_mb() -> u64 {
+    16
+}
+fn default_agent_stale_ttl() -> u64 {
+    3600
+}
 
 impl Default for HistoryConfig {
     fn default() -> Self {
         HistoryConfig {
             enabled: true,
             len: default_history_len(),
-            file: String::new(),
+            file: default_history_file(),
+            max_file_mb: default_history_max_mb(),
         }
     }
 }
@@ -309,6 +332,8 @@ impl Default for DeliveryConfig {
             max_retries: default_max_retries(),
             offline_ttl_seconds: default_offline_ttl(),
             dedup_cache_size: default_dedup_cache(),
+            persist: true,
+            agent_stale_ttl_seconds: default_agent_stale_ttl(),
         }
     }
 }
@@ -369,6 +394,8 @@ impl Config {
                 max_retries: 5,
                 offline_ttl_seconds: 300,
                 dedup_cache_size: 2048,
+                persist: true,
+                agent_stale_ttl_seconds: default_agent_stale_ttl(),
             },
             log: LogConfig {
                 level: "info".to_string(),
@@ -406,6 +433,12 @@ impl Config {
             Some(abs) => abs.clone(),
             None => self.data_dir.join("files"),
         });
+        // Upgrade-friendly default: pre-0.4.12 configs carried an explicit
+        // empty `history.file`; persist the conversation view now ("- opts
+        // back out, an empty string is treated the same as the default).
+        if self.history.file.is_empty() {
+            self.history.file = default_history_file();
+        }
     }
 
     /// Persist configuration as pretty JSON.

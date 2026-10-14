@@ -1,6 +1,6 @@
 [package]
 name = "agentlink"
-version = "0.4.11"
+version = "0.4.12"
 edition = "2021"
 description = "AgentLink - LAN message bus for AI agents"
 license = "MIT"
