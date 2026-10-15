@@ -130,3 +130,11 @@ curl -X POST http://127.0.0.1:8765/v1/send-file -H "X-Auth-Token: $TOKEN" -d \
 - **v0.4.11**：`init/join --force` 保留 node_id/token/data_dir（堵死身份漂移事故）；
   fleet agents 在线状态联动节点（幽灵在线消除）；web 节点列表加「本机」标记与离线节点「遗忘」
   按钮（`DELETE /v1/peers/<id>/forget`，持久化 data_dir/forgotten_peers.json，真实握手自动解禁）。
+
+## v0.4.14 发布物说明
+
+- 界面：标题/顶栏带版本号；「发送」按钮合并文本+附件；支持 Ctrl+V 贴图、拖拽投递区、
+  选择目录自动打包 `<目录名>.zip` 发送。
+- 错误可见性：HTTP 非 2xx 不再被静默当作成功（v0.4.13 之前 >2 MiB 上传会显示 `{}` 且清空选择，
+  看起来像「文件消失了」）。
+- 上传体积上限跟随 `agentlink.json` 的 `files.max_file_size`（默认 100 MB）。

@@ -1,0 +1,1 @@
+{"trigger": "msg:self-0413", "node": "4f793d7cd6fc", "old": "0.4.11", "new": "0.4.13", "zip": "AgentLink-v0.4.13.zip", "backup": "backups/v0.4.11_20261015-105649", "status": "done", "health_ok": true, "elapsed_ms": 2003, "node_version": "0.4.13", "time": "2026-10-15T10:56:53+0800"}

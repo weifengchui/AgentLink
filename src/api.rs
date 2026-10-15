@@ -981,7 +981,7 @@ async fn web_page(State(state): State<SharedState>) -> Response {
 fn web_html(history_len: usize) -> String {
     const HTML: &str = r#"<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AgentLink · Console</title>
+<title>AgentLink · Console v__VER__</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1027,6 +1027,14 @@ tr:hover td{background:#131a24}
 .msg.out{border-left-color:#4f8cff}
 .msg.in{border-left-color:#3fb950}
 select#to,select#to2{width:340px;max-width:340px}
+.ver-badge{font-size:11px;color:#a8cbff;background:#16233b;border:1px solid #26436f;border-radius:12px;padding:1px 9px;letter-spacing:.3px}
+.hide-in{position:absolute;left:-9999px;width:1px;height:1px;opacity:0}
+.dz{margin-top:8px;padding:10px 12px;border:1px dashed #2b3648;border-radius:10px;color:#7d8aa0;font-size:12px;text-align:center;transition:.15s}
+.dz.drag{border-color:#4f8cff;background:#12203a;color:#a8cbff}
+.dz a{color:#7fb0ff}
+.att-chip{display:inline-flex;align-items:center;gap:7px;padding:2px 10px;border-radius:14px;background:#182238;color:#9db4dd;font-size:12px}
+.lk{background:none;border:none;color:#7fb0ff;cursor:pointer;padding:0;font-size:12px;text-decoration:underline;font-family:inherit}
+.lk.red{color:#f85149;text-decoration:none;font-size:13px}
 optgroup{color:#7d8aa0;font-style:normal;font-weight:600}
 .row select{width:auto}
 .msg .meta{font-size:12px}
@@ -1098,6 +1106,7 @@ th.srt:hover{color:#dbe2ea}
 <div id="main">
   <div id="topbar">
     <div><div class="t" id="tb-self">—</div><div class="sub" id="tb-meta">—</div></div>
+    <span class="ver-badge" title="当前节点版本">v__VER__</span>
     <div class="spacer"></div>
     <span class="sub">自动刷新 <label class="switch"><input type="checkbox" id="auto-refresh" checked><span class="slider"></span></label></span>
     <button onclick="refresh()">刷新</button>
@@ -1112,8 +1121,9 @@ th.srt:hover{color:#dbe2ea}
       </div>
       <div class="card"><h2>快捷发送</h2>
         <div class="row"><span class="lbl">目标</span><select id="to"></select></div>
-        <div class="row"><textarea id="payload" rows="2" placeholder='{"content":"你好"}'></textarea></div>
-        <div class="row"><button class="primary" onclick="doSend()">发送消息</button><input type="file" id="file"><button onclick="doFile()">发送文件</button></div>
+        <div class="row"><textarea id="payload" rows="2" placeholder='{"content":"你好"}　可只发附件；在框内 Ctrl+V 可直接贴图'></textarea></div>
+        <div class="row"><button class="primary" onclick="doSendAll()">发送</button><span id="attinfo"></span></div>
+        <div class="dz" id="dz">📎 拖拽文件或文件夹到此　·　<button type="button" class="lk" onclick="el('file').click()">选文件</button>　·　<button type="button" class="lk" onclick="el('dir').click()">选目录（自动打包 zip）</button><input type="file" id="file" class="hide-in"><input type="file" id="dir" class="hide-in" webkitdirectory multiple></div>
         <div class="row" id="quick-targets"></div>
         <div id="sendres" class="hint"></div>
       </div>
@@ -1133,8 +1143,9 @@ th.srt:hover{color:#dbe2ea}
     <section id="p-chat" class="hidden">
       <div class="card"><h2>发送消息 / 文件</h2>
                 <div class="row"><span class="lbl">目标</span><select id="to2"></select></div>
-        <div class="row"><textarea id="payload2" rows="2" placeholder='{"content":"你好"}'></textarea></div>
-        <div class="row"><button class="primary" onclick="doSend('2')">发送消息</button><input type="file" id="file2"><button onclick="doFile('2')">发送文件</button></div>
+        <div class="row"><textarea id="payload2" rows="2" placeholder='{"content":"你好"}　可只发附件；在框内 Ctrl+V 可直接贴图'></textarea></div>
+        <div class="row"><button class="primary" onclick="doSendAll('2')">发送</button><span id="attinfo2"></span></div>
+        <div class="dz" id="dz2">📎 拖拽文件或文件夹到此　·　<button type="button" class="lk" onclick="el('file2').click()">选文件</button>　·　<button type="button" class="lk" onclick="el('dir2').click()">选目录（自动打包 zip）</button><input type="file" id="file2" class="hide-in"><input type="file" id="dir2" class="hide-in" webkitdirectory multiple></div>
         <div id="sendres2" class="hint"></div>
       </div>
       <div class="card"><h2>对话记录（最近 __LEN__ 条）</h2>
@@ -1286,39 +1297,97 @@ async function boot(){
  $('modal').classList.remove('hidden');
 }
 boot();
-async function j(p,opt){const o=opt||{};const r=await fetch(p,{...o,headers:{...HDR(),...(o.headers||{})}});const d=await r.json().catch(()=>({}));if(r.status===401){alert('token 无效，请重新输入');sessionStorage.removeItem(LS_KEY);location.reload();throw new Error('401');}return d;}
+async function j(p,opt){const o=opt||{};const r=await fetch(p,{...o,headers:{...HDR(),...(o.headers||{})}});const txt=await r.text();let d={};try{d=txt?JSON.parse(txt):{};}catch{d={error:txt.slice(0,300)};}if(r.status===401){alert('token 无效，请重新输入');sessionStorage.removeItem(LS_KEY);location.reload();throw new Error('401');}if(!r.ok)throw new Error('HTTP '+r.status+' '+((d&&(d.error||d.err))||txt.slice(0,200)||r.statusText));return d;}
 function show(panel){document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.p===panel));document.querySelectorAll('.content>section').forEach(s=>s.classList.add('hidden'));$('p-'+panel).classList.remove('hidden');}
 function input(id){return ($(id)&&$(id).value||'').trim();}
 function el(id){return document.getElementById(id);}
 function val(id){const e=el(id);return e?(e.value||'').trim():'';}
-async function doSend(sfx){
+const ATT={'':null,'2':null};
+function fmtSize(n){n=Number(n)||0;if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(2)+' MB';}
+function setAtt(sfx,f){ATT[sfx]=f;renderAtt(sfx);}
+function clearAtt(sfx){sfx=sfx||'';ATT[sfx]=null;const a=el('file'+sfx);if(a)a.value='';const b=el('dir'+sfx);if(b)b.value='';renderAtt(sfx);}
+function renderAtt(sfx){const box=el('attinfo'+sfx);if(!box)return;const f=ATT[sfx];
+  box.innerHTML=f?`<span class="att-chip">📎 ${esc(f.name)} · ${fmtSize(f.size)}${f.__zip?'（目录打包）':''} <button type="button" class="lk red" title="移除附件" onclick="clearAtt('${sfx}')">✕</button></span>`:'<span class="hint">无附件</span>';}
+const CRC_T=(()=>{const t=new Uint32Array(256);for(let i=0;i<256;i++){let c=i;for(let k=0;k<8;k++)c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);t[i]=c>>>0;}return t;})();
+function crc32(u){let c=0xFFFFFFFF;for(let i=0;i<u.length;i++)c=CRC_T[(c^u[i])&255]^(c>>>8);return (c^0xFFFFFFFF)>>>0;}
+function dosT(d){return ((d.getHours()<<11)|(d.getMinutes()<<5)|(d.getSeconds()>>1))&65535;}
+function dosD(d){return (((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate())&65535;}
+// 极简 zip（store 不压缩，UTF-8 文件名），浏览器端把目录/多文件合成一个附件
+async function zipStore(entries){const enc=new TextEncoder(),parts=[],cen=[];let off=0;const now=new Date(),dt=dosT(now),dd=dosD(now);
+  for(const e of entries){const nm=enc.encode(e.name),u=e.u8,crc=crc32(u);
+    const lh=new DataView(new ArrayBuffer(30));
+    lh.setUint32(0,0x04034b50,true);lh.setUint16(4,20,true);lh.setUint16(6,0x0800,true);lh.setUint16(10,dt,true);lh.setUint16(12,dd,true);
+    lh.setUint32(14,crc,true);lh.setUint32(18,u.length,true);lh.setUint32(22,u.length,true);lh.setUint16(26,nm.length,true);
+    parts.push(lh.buffer,nm,u);
+    const ch=new DataView(new ArrayBuffer(46));
+    ch.setUint32(0,0x02014b50,true);ch.setUint16(4,20,true);ch.setUint16(6,20,true);ch.setUint16(8,0x0800,true);
+    ch.setUint16(12,dt,true);ch.setUint16(14,dd,true);ch.setUint32(16,crc,true);ch.setUint32(20,u.length,true);ch.setUint32(24,u.length,true);
+    ch.setUint16(28,nm.length,true);ch.setUint32(42,off,true);
+    cen.push(ch.buffer,nm);off+=30+nm.length+u.length;}
+  let csz=0;for(const c of cen)csz+=c.byteLength;
+  const end=new DataView(new ArrayBuffer(22));
+  end.setUint32(0,0x06054b50,true);end.setUint16(8,entries.length,true);end.setUint16(10,entries.length,true);
+  end.setUint32(12,csz,true);end.setUint32(16,off,true);
+  return new Blob([...parts,...cen,end.buffer],{type:'application/zip'});}
+function readFileU8(f){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(new Uint8Array(r.result));r.onerror=()=>rej(r.error);r.readAsArrayBuffer(f);});}
+async function walkEntry(entry,base,out){out=out||[];base=base||'';
+  if(entry.isFile){const f=await new Promise(r=>entry.file(r));out.push({name:base+entry.name,u8:await readFileU8(f)});}
+  else if(entry.isDirectory){const rd=entry.createReader();let batch;do{batch=await new Promise((res,rej)=>rd.readEntries(res,rej));for(const b of batch)await walkEntry(b,base+entry.name+'/',out);}while(batch&&batch.length);}
+  return out;}
+async function doSendAll(sfx){
   sfx=sfx||'';
   const res=el('sendres'+sfx);
   const tgt=targetOf(val('to'+sfx)); if(!tgt.to){res.textContent='请选择目标';return;}
-  const to=tgt.to, to_agent=tgt.to_agent;
-  let raw=val('payload'+sfx),payload;
-  try{payload=raw?JSON.parse(raw):{};}catch{payload={content:raw};}
-  try{
-    const d=await j('/v1/send',{method:'POST',body:JSON.stringify({to,to_agent,type:'text',action:'send',payload})});
-    res.textContent=JSON.stringify(d);refresh();
-  }catch(e){res.textContent='发送失败: '+(e.message||e);}
-}
-async function doFile(sfx){
-  sfx=sfx||'';
-  const res=el('sendres'+sfx);
-  const fe=el('file'+sfx);
-  const f=fe&&fe.files&&fe.files[0];
-  if(!f){res.textContent='请先选择文件';return;}
-  const tgt=targetOf(val('to'+sfx)); if(!tgt.to){res.textContent='请选择目标';return;}
-  const q=new URLSearchParams({to:tgt.to});
-  if(tgt.to_agent)q.set('to_agent',tgt.to_agent);
-  try{
-    res.textContent='上传发送中…';
-    const d=await j('/v1/send-file-upload?'+q,{method:'POST',headers:{'X-File-Name':f.name},body:f});
-    res.textContent=JSON.stringify(d);refresh();
-    fe.value='';
-  }catch(e){res.textContent='发送失败: '+(e.message||e);}
-}
+  const raw=val('payload'+sfx), att=ATT[sfx];
+  if(!raw&&!att){res.textContent='消息内容和附件都是空的';return;}
+  const done=[];
+  if(raw){let payload;try{payload=JSON.parse(raw);}catch{payload={content:raw};}
+    if(att&&!payload.file)payload.note='附件：'+att.name;
+    try{await j('/v1/send',{method:'POST',body:JSON.stringify({to:tgt.to,to_agent:tgt.to_agent,type:'text',action:'send',payload})});done.push('消息 ok');res.textContent='消息 ok，处理附件中…';}
+    catch(e){res.textContent='发送失败: '+(e.message||e);return;}}
+  if(att){const q=new URLSearchParams({to:tgt.to});if(tgt.to_agent)q.set('to_agent',tgt.to_agent);
+    res.textContent='上传附件中… '+fmtSize(att.size);
+    try{const d=await j('/v1/send-file-upload?'+q,{method:'POST',headers:{'X-File-Name':att.name},body:att});
+      done.push('附件 ok '+(d.file_id?'#'+String(d.file_id).slice(0,8):''));clearAtt(sfx);}
+    catch(e){res.textContent='发送失败: '+(e.message||e);return;}}
+  res.textContent=done.join(' · ');refresh();}
+function onPaste(e,sfx){const cd=e.clipboardData;if(!cd)return;let f=null;
+  for(const it of (cd.items||[])){if(it.kind==='file'&&it.type&&it.type.indexOf('image/')===0){f=it.getAsFile();break;}}
+  if(!f){for(const x of (cd.files||[])){if(x.type&&x.type.indexOf('image/')===0){f=x;break;}}}
+  if(!f)return;e.preventDefault();
+  const ts=new Date().toISOString().slice(0,19).replace(/[-:T]/g,'');
+  const named=(f.name&&f.name!=='image.png')?f:new File([f],'image-'+ts+'.png',{type:f.type||'image/png'});
+  setAtt(sfx,named);el('sendres'+sfx).textContent='已附上剪贴板图片 '+named.name;}
+async function packFromInput(inp,sfx,label){const fs=Array.from(inp.files||[]);if(!fs.length)return;
+  const res=el('sendres'+sfx);const top=(fs[0].webkitRelativePath||'').split('/')[0]||label||'folder';
+  res.textContent='打包目录中… '+fs.length+' 个文件';
+  try{const es=[];for(const x of fs)es.push({name:x.webkitRelativePath||x.name,u8:new Uint8Array(await x.arrayBuffer())});
+    const blob=await zipStore(es);const zf=new File([blob],top+'.zip',{type:'application/zip'});zf.__zip=true;
+    setAtt(sfx,zf);res.textContent=`已打包 ${es.length} 个文件 → ${top}.zip（${fmtSize(zf.size)}）`;}
+  catch(e){res.textContent='打包失败: '+(e.message||e);}}
+async function onDrop(e,sfx){e.preventDefault();const dz=el('dz'+sfx);if(dz)dz.classList.remove('drag');const res=el('sendres'+sfx);
+  const its=(e.dataTransfer&&e.dataTransfer.items)?Array.from(e.dataTransfer.items):[];
+  const ents=its.map(i=>i.webkitGetAsEntry?i.webkitGetAsEntry():null).filter(Boolean);
+  const dirs=ents.filter(x=>x.isDirectory);
+  if(dirs.length){res.textContent='打包目录中… '+dirs[0].name;
+    try{const es=await walkEntry(dirs[0],'',[]);if(!es.length){res.textContent='目录是空的';return;}
+      const blob=await zipStore(es);const zf=new File([blob],dirs[0].name+'.zip',{type:'application/zip'});zf.__zip=true;
+      setAtt(sfx,zf);res.textContent=`已打包 ${es.length} 个文件 → ${dirs[0].name}.zip（${fmtSize(zf.size)}）`;}
+    catch(err){res.textContent='目录打包失败: '+(err.message||err);}return;}
+  const fl=(e.dataTransfer&&e.dataTransfer.files)?Array.from(e.dataTransfer.files):[];
+  if(fl.length){setAtt(sfx,fl[0]);res.textContent='';return;}
+  if(ents.some(x=>x.isFile)){const fe=ents.find(x=>x.isFile);const f=await new Promise(r=>fe.file(r));setAtt(sfx,f);res.textContent='';return;}
+  res.textContent='没识别到文件';}
+function bindPanel(sfx){
+  const fi=el('file'+sfx);if(fi)fi.onchange=()=>{if(fi.files[0])setAtt(sfx,fi.files[0]);};
+  const di=el('dir'+sfx);if(di)di.onchange=()=>packFromInput(di,sfx);
+  const dz=el('dz'+sfx);
+  if(dz){['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag');}));
+    ['dragleave','dragend'].forEach(ev=>dz.addEventListener(ev,()=>dz.classList.remove('drag')));
+    dz.addEventListener('drop',e=>onDrop(e,sfx));}
+  const ta=el('payload'+sfx);if(ta)ta.addEventListener('paste',e=>onPaste(e,sfx));
+  renderAtt(sfx);}
+bindPanel('');bindPanel('2');
 function renderAgents(){
   ['node','id','name','online'].forEach(k=>srtIcon('as-',ASORT,k));
   const rank=a=>(a.node_id===SELF?0:1);
@@ -1405,6 +1474,7 @@ async function saveConfig(){
 setInterval(()=>{if($('auto-refresh').checked)refresh();},2000);
 </script></body></html>"#;
     HTML.replace("__LEN__", &history_len.to_string())
+        .replace("__VER__", VERSION)
 }
 // ---- local subscription -----------------------------------------------------
 
