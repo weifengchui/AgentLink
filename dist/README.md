@@ -79,7 +79,7 @@ curl -H 'X-Auth-Token: <local token>' http://127.0.0.1:8765/v1/peers
 | GET | `/v1/peers` | `X-Auth-Token` | 已知节点及在线状态 |
 | POST | `/v1/send` | `X-Auth-Token` | 发消息（点对点 / `"*"` 广播）；body 无需 Content-Type |
 | POST | `/v1/send-file` | `X-Auth-Token` | 传本地文件（`to` + `file_path`） |
-| POST | `/v1/send-file-upload` | `X-Auth-Token` | 上传字节流发文件（`?to=` + 头 `X-File-Name`），供 `/web` 页面使用 |
+| POST | `/v1/send-file-upload` | `X-Auth-Token` | 上传字节流发文件（`?to=` + 头 `X-File-Name`），供 `/web` 页面使用；上限 = `files.max_file_size`（默认 100 MB）。**v0.4.13 前实际卡在 2 MiB**（axum 默认体上限），超 2 MiB 会报纯文本 413 |
 | POST | `/v1/ack-inbox` | `X-Auth-Token` | 确认已读的本机消息 |
 | GET/POST/DELETE | `/v1/agents` | `X-Auth-Token` | 注册/查看/注销本机 Agent（多 Agent，能力标签） |
 | GET | `/v1/fleet/agents` | `X-Auth-Token` | 全网 Agent 目录（节点间自动同步） |

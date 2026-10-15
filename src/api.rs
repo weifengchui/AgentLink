@@ -14,7 +14,7 @@ use std::time::Instant;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::Path as UrlPath;
-use axum::extract::{ConnectInfo, FromRequest, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -125,6 +125,18 @@ pub type SharedState = Arc<AppState>;
 
 /// Build the router: local API and the peer WebSocket endpoint.
 pub fn router(state: SharedState) -> AxRouter {
+    // Browser uploads stream raw bytes into `Bytes`. Axum's default body limit is
+    // 2 MiB, which would reject larger files with a plain-text 413 *before* the
+    // handler runs, silently overriding `files.max_file_size`. Raise the limit on
+    // that route to the configured ceiling (plus one byte, so a file that is one
+    // byte too big still reaches the handler's own check and gets the clean JSON
+    // "file too large" message instead of axum's terse text). Taken at startup:
+    // changing `max_file_size` via `/v1/config` needs a node restart to move it.
+    let upload_route = AxRouter::new()
+        .route("/v1/send-file-upload", post(send_file_upload))
+        .layer(DefaultBodyLimit::max(
+            state.config.files.max_file_size as usize + 1,
+        ));
     AxRouter::new()
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
@@ -139,7 +151,6 @@ pub fn router(state: SharedState) -> AxRouter {
         )
         .route("/v1/send", post(send))
         .route("/v1/send-file", post(send_file))
-        .route("/v1/send-file-upload", post(send_file_upload))
         .route("/v1/ack-inbox", post(ack_inbox))
         .route(
             "/v1/agents",
@@ -156,6 +167,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/ws", get(subscribe_ws))
         .route("/peer/ws", get(peer_ws))
         .route("/peer/file/ws", get(file_ws))
+        .merge(upload_route)
         .with_state(state)
 }
 
