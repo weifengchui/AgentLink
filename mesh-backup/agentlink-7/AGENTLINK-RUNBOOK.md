@@ -44,5 +44,10 @@
 - 网格互备：本 RUNBOOK 已 send-file 存证 .50/.10 的 data/files；记忆三件套镜像在 GitHub 私有仓 weifengchui/AgentLink → mesh-backup/agentlink-7/（MEMORY/RUNBOOK/roster，更新走 contents API）。
 - **节点 REST 鉴权头 = `X-Auth-Token: <agentlink.json local_api.token>`**（不是 X-AgentLink-Token）。
 - **send-file = JSON body**：`POST /v1/send-file {"to":"<node_id>","file_path":"<Windows 绝对路径>"}`；节点是 Windows exe，file_path 须 `C:\...` 形态（WSL 文件先拷 /mnt/c 可见区）；完成不推送，轮询 /v1/status active_transfers=0。
-- **节点 /v1/send 字段苛刻**（要求 action/type 等，文档示例勿照抄）——发通知一律走自家桥 `:8643/send {to,to_agent,from_agent,kind,content}`（已验证 ok）。
+- **节点 /v1/send 字段苛刻**（要求 action/type 等，文档示例勿照抄）——发通知走自家桥 `:8643/send`，但桥是**严格白名单转发**：只透传 `to/type/action/payload/to_agent/from_agent/reply_to/ttl_seconds`，正文必须嵌在 `payload:{content:"…"}` 里。❌ 顶层 `kind`/`content` 会被桥**静默丢弃**，对端收到信封完好但 `payload={}` 的幽灵件（10-15 21:18 实测踩坑，本行旧版即错源，已勘正）。首选入口仍是 `agentlink-bus-ops/scripts/agentlink_api.py send <to> "正文" --to-agent agentlink`（序列化已验证正确）。
 - git clone 用 gho_ token 报"Password authentication not supported"，**REST contents API PUT 可写**（GET 取 sha→PUT 带 sha 更新），GitHub 同步用 API 不走 git。
+
+## 八、幽灵空件对账（10-15 21:18 事故记录）
+- 21:18:25Z+8 互备 CLI 会话按第七节旧错误配方发 .50/.10 两条桥通知，正文被白名单吞掉，节点台账两条均 `payload={}`（msg 7715f903…→.10 等）。
+- .10 于 21:25 主动对账（ea6700ae…），本机已定位根因、勘正第七节、重写 MEMORY 配方、补 skill 坑位，并按正确格式补发原件+对账结论；.50 同步收到说明件。
+- 通用防御：发完重要通知后可查节点 `history.jsonl`（direction=out）确认 payload 非空。
