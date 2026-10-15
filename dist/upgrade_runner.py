@@ -18,7 +18,7 @@ import urllib.request
 CMD = "/mnt/c/Windows/System32/cmd.exe"
 
 def win_path(p):
-    r = subprocess.run(["wslpath", "-w", p], capture_output=True, text=True)
+    r = subprocess.run(["wslpath", "-w", p], capture_output=True, text=True, errors="replace")
     return r.stdout.strip() if r.returncode == 0 else p
 
 def read_node_cfg(path):
@@ -56,7 +56,9 @@ def ledger_append(node_dir, entry, git_copy=None):
 
 def kill_node(base, timeout=10):
     """taskkill 后等待 health 不可达（启动.bat 有端口占用防重入检查，必须确认旧进程死透）。"""
-    subprocess.run([CMD, "/c", "taskkill /F /IM agentlink.exe"], capture_output=True, text=True)
+    # taskkill 在中文 Windows 上输出 GBK，text=True 默认按 UTF-8 严格解码会抛
+    # UnicodeDecodeError —— v0.4.12 那次就崩在「已 kill、未启动」的半截态。
+    subprocess.run([CMD, "/c", "taskkill /F /IM agentlink.exe"], capture_output=True, text=True, errors="replace")
     t0 = time.time()
     while time.time() - t0 < timeout:
         if not health(base, timeout=2).get("ok"):
@@ -153,8 +155,32 @@ def main():
 
         # 4) 换二进制 + 重启
         kill_node(base)
-        shutil.copy2(new_exe, exe_path)
-        start_node(node_dir)
+        try:
+            shutil.copy2(new_exe, exe_path)
+            start_node(node_dir)
+        except Exception as e:
+            # 节点已停，这里任何异常都不能留「已 kill、未启动」的半截态：
+            # 立刻装回旧二进制并尽力拉起，再抛给上层记账（v0.4.12 那次就崩在这一步）。
+            print(f"[upgrade] 换件/启动异常（{e}），立即回滚旧二进制并重启…")
+            restored = False
+            try:
+                shutil.copy2(os.path.join(bak, exe_name), exe_path)
+                if os.path.exists(os.path.join(bak, "agentlink.json")):
+                    shutil.copy2(os.path.join(bak, "agentlink.json"),
+                                 os.path.join(node_dir, "agentlink.json"))
+                restored = True
+            except Exception as e2:
+                print(f"[upgrade] 旧二进制装回失败: {e2}")
+            started = False
+            try:
+                start_node(node_dir)
+                started = bool(wait_health(base, old_version, 15)[0])
+            except Exception as e3:
+                print(f"[upgrade] 回滚启动失败: {e3}")
+            result.update(status="failed_after_kill", reason=str(e)[:200],
+                          restored_exe=restored, old_node_alive=started, backup=os.path.relpath(bak, node_dir))
+            ledger_append(node_dir, result, args.git_ledger)
+            raise
 
         # 5) health 轮询
         ok, h, ms = wait_health(base, args.expect_version, args.health_timeout)
