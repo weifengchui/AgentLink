@@ -32,6 +32,31 @@ def health(base, timeout=3):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+def pick_base(cfg, probe_timeout=3):
+    """health 探测入口：优先 127.0.0.1；打不通则回退 ip route 默认网关。
+
+    WSL2 NAT 模式没有 localhost 转发时，WSL 里的 runner 经 127.0.0.1 摸不到
+    Windows 宿主上的节点——2026-10-15 十号机 0.4.14 实跑成功却被误判 health
+    timeout 而回滚（exit=3）即此坑。NAT 下默认网关就是 Windows 宿主，与桥的
+    _wsl_gateway 同一逻辑。两处都摸不通时保持 127.0.0.1（行为同旧版）。"""
+    port = cfg.get("listen_port", 8765)
+    lo = f"http://127.0.0.1:{port}"
+    if health(lo, timeout=probe_timeout).get("ok"):
+        return lo
+    try:
+        r = subprocess.run(["ip", "route"], capture_output=True, text=True,
+                           errors="replace", timeout=5)
+        gw = next((p[2] for p in (l.split() for l in r.stdout.splitlines())
+                   if len(p) >= 3 and p[0] == "default"), None)
+        if gw:
+            via_gw = f"http://{gw}:{port}"
+            if health(via_gw, timeout=probe_timeout).get("ok"):
+                print(f"[base] 127.0.0.1 不可达，回退默认网关(Windows 宿主): {via_gw}")
+                return via_gw
+    except Exception as e:
+        print(f"[base] 网关探测失败: {e}", file=sys.stderr)
+    return lo
+
 def sha256_of(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -117,7 +142,7 @@ def main():
 
     node_dir = os.path.dirname(os.path.abspath(args.config))
     cfg = read_node_cfg(args.config)
-    base = f"http://127.0.0.1:{cfg.get('listen_port', 8765)}"
+    base = pick_base(cfg)
     old_version = health(base).get("version")
     exe_name = args.exe_name
     exe_path = os.path.join(node_dir, exe_name)
