@@ -85,6 +85,10 @@ curl -H 'X-Auth-Token: <local token>' http://127.0.0.1:8765/v1/peers
 | GET | `/v1/fleet/agents` | `X-Auth-Token` | 全网 Agent 目录（节点间自动同步） |
 | GET/PUT | `/v1/config` | `X-Auth-Token` | 查看/修改配置（掩码显示；名称/标签即时生效） |
 | GET | `/v1/history` | `X-Auth-Token` | 最近对话记录（环形缓冲） |
+| GET | `/v1/history/stats` | `X-Auth-Token` | 对话记录体积统计（活动/归档/合计、滚动阈值，v0.4.15+） |
+| GET | `/v1/history/export?format=json\|text&scope=all\|active\|archive:<名>` | `X-Auth-Token` | 导出对话记录（带下载名；只读，不动源文件，v0.4.15+） |
+| GET | `/v1/history/search?from=&to=&who=&direction=&kind=&q=&since=&until=&limit=&max_mb=&scope=` | `X-Auth-Token` | 对话记录检索：按收发方/方向/类型/关键词/时间过滤（v0.4.15+） |
+| GET/PUT | `/v1/colors` | `X-Auth-Token` | 节点与 Agent 的标识颜色：自动配色 + 手动覆盖（v0.4.15+） |
 | GET | `/web` | 无（token 页内输入） | **人工可看页面**（V1 风格）：总览/节点/Agent/对话/发送/配置；token 只存会话不进 URL |
 | WS | `/v1/ws?token=…&client=…` | query token | 订阅本机入站消息（`client` 即 agent_id，按 `to_agent` 定向投递）与 join/leave 事件 |
 | WS | `/peer/ws` | cluster token（握手） | 对等节点消息连接 |
@@ -130,6 +134,18 @@ curl -X POST http://127.0.0.1:8765/v1/send-file -H "X-Auth-Token: $TOKEN" -d \
 - **v0.4.11**：`init/join --force` 保留 node_id/token/data_dir（堵死身份漂移事故）；
   fleet agents 在线状态联动节点（幽灵在线消除）；web 节点列表加「本机」标记与离线节点「遗忘」
   按钮（`DELETE /v1/peers/<id>/forget`，持久化 data_dir/forgotten_peers.json，真实握手自动解禁）。
+
+## v0.4.15 发布物说明
+
+- 对话记录不再丢：活动文件写满或超龄后**整份搬进** `data/history_archive/`（按滚动时刻命名），
+  旧的单份 `.1` 备份（覆盖即删记录）已废弃；启动时自动收编遗留 `.1` 为 `history-legacy.jsonl`。
+  `history.archive_keep=0`（默认）= 归档永久保留，不自动删。
+- 界面导出：对话页与总览页显示「当前/归档/合计体积 + 滚动阈值」，只读导出 JSONL / 可读文本
+  （可选含归档或仅当前）；**当前**活动文件达到阈值 80% 时标红提醒「接近阈值，建议导出备份」。
+- 布局：版本号徽章挪到「AgentLink」标题之后；两个发送面板的「发送」按钮挪到文件/拖拽/目录控件下面。
+- 默认阈值：活动文件 1 GB（`history.max_file_mb=1024`）或 7 天（`history.archive_days=7`）双触发滚动；
+  导出为流式响应（多文件按行拼接、256 KiB 分块），大体积导出不吃服务端内存；
+  后端另支持 `scope=archive:<文件名>` 单份归档导出。
 
 ## v0.4.14 发布物说明
 

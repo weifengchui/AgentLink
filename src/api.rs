@@ -22,6 +22,7 @@ use axum::{async_trait, Json, Router as AxRouter};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::config::Config;
@@ -158,6 +159,10 @@ pub fn router(state: SharedState) -> AxRouter {
         )
         .route("/v1/fleet/agents", get(fleet_agents))
         .route("/v1/history", get(history_get))
+        .route("/v1/history/search", get(history_search_get))
+        .route("/v1/colors", get(colors_get).put(colors_put))
+        .route("/v1/history/stats", get(history_stats_get))
+        .route("/v1/history/export", get(history_export_get))
         .route("/v1/files/:file_name", get(file_download))
         .route("/v1/open-folder", post(open_folder))
         .route("/v1/config", get(config_get).put(config_put))
@@ -635,6 +640,312 @@ async fn history_get(State(state): State<SharedState>, headers: HeaderMap) -> im
     )
 }
 
+/// Conversation-history footprint for the web console. Metadata only, and it
+/// never mutates records — history is append/roll-over, never deleted.
+async fn history_stats_get(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let h = &state.config.history;
+    if !h.enabled || h.file.is_empty() || h.file == "-" {
+        return (
+            StatusCode::OK,
+            Json(json!({ "ok": false, "error": "history disabled" })),
+        );
+    }
+    let mut v = crate::store::history_stats(
+        &state.config.data_dir,
+        &h.file,
+        h.max_file_mb,
+        h.archive_days,
+        h.archive_keep,
+    );
+    v["ok"] = json!(true);
+    (StatusCode::OK, Json(v))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HistorySearchQuery {
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    who: String,
+    #[serde(default)]
+    direction: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    since: String,
+    #[serde(default)]
+    until: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    max_mb: Option<u64>,
+    #[serde(default)]
+    scope: String,
+}
+
+/// Disk-backed conversation-history search with filters (sender / receiver /
+/// time window / keyword / max results). Streams the JSONL backwards, so hits
+/// near the tail of a huge log return fast. Read-only.
+async fn history_search_get(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(qs): Query<HistorySearchQuery>,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized().into_response();
+    }
+    let h = &state.config.history;
+    if !h.enabled || h.file.is_empty() || h.file == "-" {
+        return (
+            StatusCode::OK,
+            Json(json!({ "ok": false, "error": "history disabled" })),
+        )
+            .into_response();
+    }
+    let f = crate::store::HistSearch {
+        from: qs.from,
+        to: qs.to,
+        who: qs.who,
+        direction: qs.direction,
+        kind: qs.kind,
+        q: qs.q,
+        since: qs.since,
+        until: qs.until,
+        limit: qs.limit.unwrap_or(200).clamp(1, 2000),
+        max_bytes: qs.max_mb.unwrap_or(128).clamp(1, 2048) * 1_048_576,
+        scope_all: qs.scope != "active",
+    };
+    let dir = state.config.data_dir.clone();
+    let file = h.file.clone();
+    let v = tokio::task::spawn_blocking(move || crate::store::history_search(&dir, &file, &f))
+        .await
+        .unwrap_or_else(|_| json!({ "ok": false, "error": "search panicked" }));
+    (StatusCode::OK, Json(v)).into_response()
+}
+
+/// Identity colors for the console (see `store::COLORS_FILE`).
+async fn colors_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let dir = state.config.data_dir.clone();
+    let m = tokio::task::spawn_blocking(move || crate::store::load_colors(&dir))
+        .await
+        .unwrap_or_default();
+    (StatusCode::OK, Json(json!({ "ok": true, "colors": m })))
+}
+
+/// Replace the whole color map. Keys `node:<id>` / `agent:<node>|<agent>`,
+/// values `#rrggbb`. Colors live on the node, so every viewer sees the same
+/// palette without touching any agent's own config.
+async fn colors_put(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let Some(map) = body.get("colors").and_then(|c| c.as_object()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "expected {\"colors\": {...}}" })),
+        );
+    };
+    if map.len() > 2000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "too many entries (max 2000)" })),
+        );
+    }
+    for (k, v) in map {
+        let hex = v.as_str().unwrap_or("");
+        let good_hex = hex.len() == 7
+            && hex.starts_with('#')
+            && hex.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit);
+        let good_key = (k.starts_with("node:") || k.starts_with("agent:")) && k.len() <= 200;
+        if !good_hex || !good_key {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": format!("bad entry {k}={hex}") })),
+            );
+        }
+    }
+    let dir = state.config.data_dir.clone();
+    let m = map.clone();
+    match tokio::task::spawn_blocking(move || crate::store::save_colors(&dir, &m)).await {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": "join error" })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryExportQuery {
+    /// `json` (raw JSONL, default) or `text` (human readable).
+    #[serde(default)]
+    format: String,
+    /// `all` (archives + active, default), `active`, or `archive:<name>`.
+    #[serde(default = "default_export_scope")]
+    scope: String,
+}
+
+fn default_export_scope() -> String {
+    "all".to_string()
+}
+
+/// Stream the conversation history out as a downloadable attachment.
+///
+/// Export is strictly read-only: the node copies records out and deletes
+/// nothing, so an operator can archive to taste (grep-able text, or JSONL for
+/// re-ingest) whenever the console warns about size.
+async fn history_export_get(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(q): Query<HistoryExportQuery>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return unauthorized().into_response();
+    }
+    let h = &state.config.history;
+    if !h.enabled || h.file.is_empty() || h.file == "-" {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "history disabled" })),
+        )
+            .into_response();
+    }
+    let files = crate::store::history_export_files(&state.config.data_dir, &h.file, &q.scope);
+    if files.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "no history files to export" })),
+        )
+            .into_response();
+    }
+    let as_text = matches!(q.format.as_str(), "text" | "txt" | "md");
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let scope_tag = q
+        .scope
+        .replace("archive:", "")
+        .replace('/', "_")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
+        .collect::<String>();
+    let scope_tag = if scope_tag.is_empty() {
+        "all".to_string()
+    } else {
+        scope_tag
+    };
+    let ext = if as_text { "txt" } else { "jsonl" };
+    let name = format!("agentlink-history-{scope_tag}-{secs}.{ext}");
+
+    struct Step {
+        files: Vec<PathBuf>,
+        idx: usize,
+        file: Option<tokio::fs::File>,
+        carry: Vec<u8>,
+        text: bool,
+    }
+    let step = Step {
+        files,
+        idx: 0,
+        file: None,
+        carry: Vec::new(),
+        text: as_text,
+    };
+    let stream = futures_util::stream::unfold(step, |mut s| async move {
+        loop {
+            if s.file.is_none() {
+                if s.idx >= s.files.len() {
+                    if s.carry.is_empty() {
+                        return None;
+                    }
+                    let out = std::mem::take(&mut s.carry);
+                    return Some((Ok::<_, std::io::Error>(Bytes::from(out)), s));
+                }
+                s.file = tokio::fs::File::open(&s.files[s.idx]).await.ok();
+                s.idx += 1;
+                if s.file.is_none() {
+                    continue;
+                }
+            }
+            let mut buf = vec![0u8; 256 * 1024];
+            let read = match s.file.as_mut() {
+                Some(f) => f.read(&mut buf).await,
+                None => return None,
+            };
+            match read {
+                Ok(0) => {
+                    s.file = None;
+                    continue;
+                }
+                Ok(n) => {
+                    buf.truncate(n);
+                    if !s.text {
+                        let mut out = std::mem::take(&mut s.carry);
+                        out.extend_from_slice(&buf);
+                        return Some((Ok::<_, std::io::Error>(Bytes::from(out)), s));
+                    }
+                    s.carry.extend_from_slice(&buf);
+                    let mut chunk: Vec<u8> = Vec::new();
+                    let mut consumed = 0usize;
+                    while let Some(rel) = s.carry[consumed..].iter().position(|b| *b == b'\n') {
+                        let line =
+                            String::from_utf8_lossy(&s.carry[consumed..consumed + rel]).to_string();
+                        consumed += rel + 1;
+                        chunk.extend_from_slice(
+                            crate::store::history_line_to_text(&line).as_bytes(),
+                        );
+                        chunk.push(b'\n');
+                    }
+                    s.carry.drain(..consumed);
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    return Some((Ok::<_, std::io::Error>(Bytes::from(chunk)), s));
+                }
+                Err(e) => return Some((Err(e), s)),
+            }
+        }
+    });
+
+    let mut resp = Response::new(Body::from_stream(stream));
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(if as_text {
+            "text/plain; charset=utf-8"
+        } else {
+            "application/x-ndjson; charset=utf-8"
+        }),
+    );
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+        resp.headers_mut()
+            .insert(axum::http::header::CONTENT_DISPOSITION, v);
+    }
+    resp
+}
+
 /// Download a file that this node received (served from `files.recv_dir`).
 async fn file_download(
     UrlPath(file_name): UrlPath<String>,
@@ -846,7 +1157,8 @@ async fn config_get(State(state): State<SharedState>, headers: HeaderMap) -> imp
                     "max_concurrent": c.files.max_concurrent,
                 },
                 "log": { "level": c.log.level, "format": c.log.format, "file": c.log.file },
-                "history": { "enabled": c.history.enabled, "len": c.history.len },
+                "history": { "enabled": c.history.enabled, "len": c.history.len, "file": c.history.file,
+                    "max_file_mb": c.history.max_file_mb, "archive_days": c.history.archive_days, "archive_keep": c.history.archive_keep },
                 "web": { "auto_open": c.web.auto_open },
             }
         })),
@@ -1033,6 +1345,8 @@ select#to,select#to2{width:340px;max-width:340px}
 .dz.drag{border-color:#4f8cff;background:#12203a;color:#a8cbff}
 .dz a{color:#7fb0ff}
 .att-chip{display:inline-flex;align-items:center;gap:7px;padding:2px 10px;border-radius:14px;background:#182238;color:#9db4dd;font-size:12px}
+.idc{color:#fff;border-radius:9px;padding:1px 8px;font-weight:600;font-size:12px;line-height:17px;white-space:nowrap;margin-right:3px}
+.idn{opacity:.62;font-size:11px;margin-right:2px}
 .lk{background:none;border:none;color:#7fb0ff;cursor:pointer;padding:0;font-size:12px;text-decoration:underline;font-family:inherit}
 .lk.red{color:#f85149;text-decoration:none;font-size:13px}
 optgroup{color:#7d8aa0;font-style:normal;font-weight:600}
@@ -1096,7 +1410,7 @@ th.srt:hover{color:#dbe2ea}
 </div>
 <div id="app" class="hidden">
 <aside id="sidebar">
-  <div id="logo"><span class="dot"></span>AgentLink</div>
+  <div id="logo"><span class="dot"></span>AgentLink <span class="ver-badge" title="当前节点版本">v__VER__</span></div>
   <div class="nav active" data-p="overview" onclick="show('overview')">总览</div>
   <div class="nav" data-p="nodes" onclick="show('nodes')">节点</div>
   <div class="nav" data-p="agents" onclick="show('agents')">Agent</div>
@@ -1106,7 +1420,6 @@ th.srt:hover{color:#dbe2ea}
 <div id="main">
   <div id="topbar">
     <div><div class="t" id="tb-self">—</div><div class="sub" id="tb-meta">—</div></div>
-    <span class="ver-badge" title="当前节点版本">v__VER__</span>
     <div class="spacer"></div>
     <span class="sub">自动刷新 <label class="switch"><input type="checkbox" id="auto-refresh" checked><span class="slider"></span></label></span>
     <button onclick="refresh()">刷新</button>
@@ -1122,14 +1435,15 @@ th.srt:hover{color:#dbe2ea}
       <div class="card"><h2>快捷发送</h2>
         <div class="row"><span class="lbl">目标</span><select id="to"></select></div>
         <div class="row"><textarea id="payload" rows="2" placeholder='{"content":"你好"}　可只发附件；在框内 Ctrl+V 可直接贴图'></textarea></div>
+        <div class="dz" id="dz">📎 拖拽文件或文件夹到此　·　<button type="button" class="lk" onclick="el('file').click()">选文件</button>　·　<button type="button" class="lk" onclick="el('dir').click()">选目录（自动打包 zip）</button><input type="file" id="file" class="hide-in" multiple><input type="file" id="dir" class="hide-in" webkitdirectory multiple></div>
         <div class="row"><button class="primary" onclick="doSendAll()">发送</button><span id="attinfo"></span></div>
-        <div class="dz" id="dz">📎 拖拽文件或文件夹到此　·　<button type="button" class="lk" onclick="el('file').click()">选文件</button>　·　<button type="button" class="lk" onclick="el('dir').click()">选目录（自动打包 zip）</button><input type="file" id="file" class="hide-in"><input type="file" id="dir" class="hide-in" webkitdirectory multiple></div>
         <div class="row" id="quick-targets"></div>
         <div id="sendres" class="hint"></div>
       </div>
       <div class="card"><h2>最近对话（总览 · 分页与查询）</h2>
         <div class="row"><input id="ov-kw" placeholder="搜索：内容 / 节点 / agent…" style="flex:2" oninput="ovGo(1)">
         <select id="ov-size" onchange="ovGo(1)"><option value="10">10</option><option value="20">20</option><option value="30" selected>30</option><option value="50">50</option></select></div>
+        <div class="row"><span class="hint" id="ov-stats" style="flex:1">对话记录：—</span><select id="ov-scope"><option value="all">全部（含归档）</option><option value="active">仅当前文件</option></select><button onclick="exportHist('ov','json')">导出 JSON</button><button onclick="exportHist('ov','text')">导出 文本</button></div>
         <div id="ov-hist"></div>
         <div class="row"><button onclick="ovGo(OV.page-1)">上一页</button><span class="hint" id="ov-info"></span><button onclick="ovGo(OV.page+1)">下一页</button></div>
       </div>
@@ -1144,18 +1458,36 @@ th.srt:hover{color:#dbe2ea}
       <div class="card"><h2>发送消息 / 文件</h2>
                 <div class="row"><span class="lbl">目标</span><select id="to2"></select></div>
         <div class="row"><textarea id="payload2" rows="2" placeholder='{"content":"你好"}　可只发附件；在框内 Ctrl+V 可直接贴图'></textarea></div>
+        <div class="dz" id="dz2">📎 拖拽文件或文件夹到此　·　<button type="button" class="lk" onclick="el('file2').click()">选文件</button>　·　<button type="button" class="lk" onclick="el('dir2').click()">选目录（自动打包 zip）</button><input type="file" id="file2" class="hide-in" multiple><input type="file" id="dir2" class="hide-in" webkitdirectory multiple></div>
         <div class="row"><button class="primary" onclick="doSendAll('2')">发送</button><span id="attinfo2"></span></div>
-        <div class="dz" id="dz2">📎 拖拽文件或文件夹到此　·　<button type="button" class="lk" onclick="el('file2').click()">选文件</button>　·　<button type="button" class="lk" onclick="el('dir2').click()">选目录（自动打包 zip）</button><input type="file" id="file2" class="hide-in"><input type="file" id="dir2" class="hide-in" webkitdirectory multiple></div>
         <div id="sendres2" class="hint"></div>
       </div>
-      <div class="card"><h2>对话记录（最近 __LEN__ 条）</h2>
+      <div class="card"><h2>对话记录（内存显示最近 __LEN__ 条 · 下方可按条件查磁盘全量）</h2>
         <div class="row"><input id="ch-kw" placeholder="搜索：内容 / 节点 / agent…" style="flex:2" oninput="chGo(1)">
         <select id="ch-size" onchange="chGo(1)"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option></select></div>
+        <div class="row">
+          <input id="ch-from" list="ch-agents" placeholder="发送方（agent/节点/IP）" style="flex:1">
+          <input id="ch-to" list="ch-agents" placeholder="接收方（agent/节点/IP）" style="flex:1">
+          <input type="datetime-local" id="ch-since" title="起始时间（本机时区，服务端按 UTC 过滤）">
+          <span class="hint">→</span>
+          <input type="datetime-local" id="ch-until" title="结束时间">
+          <select id="ch-limit" title="最多返回条数"><option value="50">最多 50</option><option value="200" selected>最多 200</option><option value="1000">最多 1000</option><option value="2000">最多 2000</option></select>
+          <label class="hint" style="font-size:12px"><input type="checkbox" id="ch-all">含归档</label>
+          <button class="primary" onclick="histSearch()">查磁盘</button>
+          <button onclick="histReset()">重置</button>
+        </div>
+        <datalist id="ch-agents"></datalist>
+        <div class="hint" id="ch-qmeta"></div>
+        <div class="row"><span class="hint" id="ch-stats" style="flex:1">对话记录：—</span><select id="ch-scope"><option value="all">全部（含归档）</option><option value="active">仅当前文件</option></select><button onclick="exportHist('ch','json')">导出 JSON</button><button onclick="exportHist('ch','text')">导出 文本</button></div>
         <div id="history"></div>
         <div class="row"><button onclick="chGo(CH.page-1)">上一页</button><span class="hint" id="ch-info"></span><button onclick="chGo(CH.page+1)">下一页</button></div>
       </div>
     </section>
     <section id="p-config" class="hidden">
+      <div class="card"><h2>对话记录颜色标识</h2>
+        <div class="hint" style="margin-bottom:8px">默认按「节点+agent」名称哈希自动配色——跨机器稳定、零配置，同名同色。这里手动选色会保存到本节点 colors.json，所有查看这个节点控制台的人共享同一套配色；勾回「自动色」即恢复算法色。</div>
+        <div id="cf-colors"><span class="hint">加载中…</span></div>
+      </div>
       <div class="card"><h2>节点配置</h2>
         <div class="cfg-grid">
           <div><label>节点名称（改后即时生效）</label><input id="cf-name"></div>
@@ -1184,7 +1516,7 @@ let TOKEN=sessionStorage.getItem(LS_KEY)||'';
 const HDR=()=>({'X-Auth-Token':TOKEN});
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(ts){try{return new Date(ts).toLocaleString();}catch{return ts;}}
-let HIST=[],OV={page:1},CH={page:1},NAMES={},AN={},AGENTS=[],SELF='';
+let HIST=[],CHQ=null,COLORS={},OV={page:1},CH={page:1},NAMES={},AN={},AGENTS=[],SELF='';
 let PEERS=[],ST={},ASORT={k:'node',d:1},PSORT={k:'name',d:1},EXP=new Set(),LAST={ag:'',pe:'',op:'',hi:'',qt:''};
 // 用户正在选择文本时跳过所有 DOM 重写：选择/复制不再被 2 秒自动刷新打断
 function selecting(){const s=window.getSelection();return s&&s.rangeCount>0&&!s.isCollapsed;}
@@ -1200,10 +1532,13 @@ function toast(s){const t=el('toast');if(!t)return;t.textContent=s;t.style.opaci
 function copyMsg(id){const m=HIST.find(x=>x.msg_id===id);if(!m)return;const p=m.payload||{};let t;if(m.kind==='file'){t=[p.file_name,(p.size!==undefined?humanSize(p.size):''),p.saved_path].filter(Boolean).join(' | ');}else{t=(p&&typeof p==='object'&&typeof p.content==='string')?p.content:JSON.stringify(p,null,2);}copyText(t);}
 function copyText(t){if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(()=>toast('已复制到剪贴板'),()=>fbCopy(t));}else{fbCopy(t);}}
 function fbCopy(t){const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.focus();ta.select();try{document.execCommand('copy');toast('已复制到剪贴板');}catch(e){toast('复制失败');}ta.remove();}
+function autoCol(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)>>>0;}return 'hsl('+(h%360)+',50%,42%)';}
+function colFor(n,a){if(a&&COLORS['agent:'+n+'|'+a])return COLORS['agent:'+n+'|'+a];if(COLORS['node:'+n])return COLORS['node:'+n];return autoCol(a?(n+'|'+a):String(n));}
+function chip(n,a){
+  if(a)return `<span class="idc" style="background:${colFor(n,a)}" title="${esc(String(n))} / ${esc(String(a))}">${esc(whoa(n,a)||a)}</span><span class="idn">${esc(who(n))}</span>`;
+  return `<span style="color:${colFor(n,'')}" title="${esc(String(n))}">●</span><span class="idn">${esc(who(n))}</span>`;}
 function histRow(m){
   const dir=(m.direction==='out'?'out':m.direction==='in'?'in':'');
-  const fromW=who(m.from)+(m.from_agent?` [${whoa(m.from,m.from_agent)}]`:'');
-  const toW=who(m.to)+(m.to_agent?` [${whoa(m.to,m.to_agent)}]`:'');
   const open=EXP.has(m.msg_id);
   const cpy=`<button class="tbtn" title="复制消息内容" onclick="copyMsg('${esc(m.msg_id)}')">复制</button>`;
   if(m.kind==='file'){
@@ -1218,14 +1553,14 @@ function histRow(m){
     }else{head=`📤 ${nm}`;}
     const ftg=`<button class="tbtn" onclick="tgExp('${esc(m.msg_id)}')">${open?'收起':'详情'}</button>`;
     const fdet=open?`<div class="det">msg_id: ${esc(m.msg_id)} · ${esc(m.direction)} · from ${esc(m.from)}${m.from_agent?' / '+esc(m.from_agent):''} → to ${esc(m.to)}${m.to_agent?' / '+esc(m.to_agent):''} · size: ${esc(String((m.payload&&m.payload.size)||0))} B${sp?` · saved_path: ${esc(sp)}`:''} · ts: ${esc(m.ts)}</div>`:'';
-    return `<div class="msg file"><div class="meta">${fmt(m.ts)} · ${dirLab(m)} · ${esc(fromW)} → ${esc(toW)} · ${cpy}${ftg}</div><div class="pay">${head} · ${sz}</div>${fdet}</div>`;
+    return `<div class="msg file"><div class="meta">${fmt(m.ts)} · ${dirLab(m)} · ${chip(m.from,m.from_agent)} → ${chip(m.to,m.to_agent)} · ${cpy}${ftg}</div><div class="pay">${head} · ${sz}</div>${fdet}</div>`;
   }
   const full=fullPay(m);
   const long=full.length>260;
   const showTxt=open?full:(long?full.slice(0,260)+'…':full);
   const tg=long?`<button class="tbtn" onclick="tgExp('${esc(m.msg_id)}')">${open?'收起':'展开'}</button>`:'';
   const det=open?`<div class="det">msg_id: ${esc(m.msg_id)} · ${esc(m.direction)} · from ${esc(m.from)}${m.from_agent?' / '+esc(m.from_agent):''} → to ${esc(m.to)}${m.to_agent?' / '+esc(m.to_agent):''} · 类型: ${esc(m.kind)}/${esc(m.action)} · ts: ${esc(m.ts)}</div>`:'';
-  return `<div class="msg ${dir}"><div class="meta">${fmt(m.ts)} · ${dirLab(m)} · ${esc(fromW)} → ${esc(toW)} · <span class="k">${esc(m.kind)}/${esc(m.action)}</span> · ${cpy}${tg}</div><div class="pay">${esc(showTxt)}</div>${det}</div>`;
+  return `<div class="msg ${dir}"><div class="meta">${fmt(m.ts)} · ${dirLab(m)} · ${chip(m.from,m.from_agent)} → ${chip(m.to,m.to_agent)} · <span class="k">${esc(m.kind)}/${esc(m.action)}</span> · ${cpy}${tg}</div><div class="pay">${esc(showTxt)}</div>${det}</div>`;
 }
 function humanSize(n){if(!n)return '';if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(1)+' MB';}
 function filterHist(kw,arr){if(!kw)return arr.slice();return arr.filter(m=>JSON.stringify({f:m.from,a:m.from_agent,t:m.to,ta:m.to_agent,k:m.kind,p:m.payload}).toLowerCase().includes(kw.toLowerCase()));}
@@ -1238,7 +1573,7 @@ function renderList(elx,info,arr,page,size){
   return page;
 }
 function ovGo(p){OV.page=renderList(el('ov-hist'),el('ov-info'),filterHist(el('ov-kw').value,HIST),p,parseInt(el('ov-size').value)||20);}
-function chGo(p){CH.page=renderList(el('history'),el('ch-info'),filterHist(el('ch-kw').value,HIST),p,parseInt(el('ch-size').value)||50);}
+function chGo(p){CH.page=renderList(el('history'),el('ch-info'),filterHist(el('ch-kw').value,CHQ||HIST),p,parseInt(el('ch-size').value)||50);}
 async function openFl(nm){try{await j('/v1/open-folder',{method:'POST',body:JSON.stringify({file:decodeURIComponent(nm)})});}catch(e){}}
 function findAg(nodeId,agentId){return AGENTS.find(x=>x.node_id===nodeId&&x.agent_id===agentId)||{};}
 function editAgent(nodeId,agentId){const a=findAg(nodeId,agentId);el('ag-id').value=a.agent_id||'';el('ag-node').textContent=a.node_name||nodeId;el('ag-name').value=a.name||'';el('ag-caps').value=(a.capabilities||[]).join(', ');el('ag-res').textContent='';const m=el('agent-modal');m.hidden=false;m.style.display='flex';}
@@ -1302,12 +1637,14 @@ function show(panel){document.querySelectorAll('.nav').forEach(n=>n.classList.to
 function input(id){return ($(id)&&$(id).value||'').trim();}
 function el(id){return document.getElementById(id);}
 function val(id){const e=el(id);return e?(e.value||'').trim():'';}
-const ATT={'':null,'2':null};
+const ATT={'':[],'2':[]};
 function fmtSize(n){n=Number(n)||0;if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(2)+' MB';}
-function setAtt(sfx,f){ATT[sfx]=f;renderAtt(sfx);}
-function clearAtt(sfx){sfx=sfx||'';ATT[sfx]=null;const a=el('file'+sfx);if(a)a.value='';const b=el('dir'+sfx);if(b)b.value='';renderAtt(sfx);}
-function renderAtt(sfx){const box=el('attinfo'+sfx);if(!box)return;const f=ATT[sfx];
-  box.innerHTML=f?`<span class="att-chip">📎 ${esc(f.name)} · ${fmtSize(f.size)}${f.__zip?'（目录打包）':''} <button type="button" class="lk red" title="移除附件" onclick="clearAtt('${sfx}')">✕</button></span>`:'<span class="hint">无附件</span>';}
+function setAtt(sfx,f){ATT[sfx]=f?[f]:[];renderAtt(sfx);}
+function addAtt(sfx,fs){const arr=Array.isArray(fs)?fs:Array.from(fs||[]);if(!arr.length)return;for(const x of arr)ATT[sfx].push(x);renderAtt(sfx);}
+function delAtt(sfx,i){ATT[sfx].splice(i,1);const a=el('file'+sfx);if(a)a.value='';renderAtt(sfx);}
+function clearAtt(sfx){sfx=sfx||'';ATT[sfx]=[];const a=el('file'+sfx);if(a)a.value='';const b=el('dir'+sfx);if(b)b.value='';renderAtt(sfx);}
+function renderAtt(sfx){const box=el('attinfo'+sfx);if(!box)return;const L=ATT[sfx]||[];
+  box.innerHTML=L.length?L.map((f,i)=>`<span class="att-chip">📎 ${esc(f.name)} · ${fmtSize(f.size)}${f.__zip?'（目录打包）':''} <button type="button" class="lk red" title="移除该附件" onclick="delAtt('${sfx}',${i})">✕</button></span>`).join('')+` <span class="hint">共 ${L.length} 个 · ${fmtSize(L.reduce((s,f)=>s+Number(f.size||0),0))}</span>`:'<span class="hint">无附件（可多选、可叠加拖拽/粘贴）</span>';}
 const CRC_T=(()=>{const t=new Uint32Array(256);for(let i=0;i<256;i++){let c=i;for(let k=0;k<8;k++)c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);t[i]=c>>>0;}return t;})();
 function crc32(u){let c=0xFFFFFFFF;for(let i=0;i<u.length;i++)c=CRC_T[(c^u[i])&255]^(c>>>8);return (c^0xFFFFFFFF)>>>0;}
 function dosT(d){return ((d.getHours()<<11)|(d.getMinutes()<<5)|(d.getSeconds()>>1))&65535;}
@@ -1338,48 +1675,52 @@ async function doSendAll(sfx){
   sfx=sfx||'';
   const res=el('sendres'+sfx);
   const tgt=targetOf(val('to'+sfx)); if(!tgt.to){res.textContent='请选择目标';return;}
-  const raw=val('payload'+sfx), att=ATT[sfx];
-  if(!raw&&!att){res.textContent='消息内容和附件都是空的';return;}
+  const raw=val('payload'+sfx), atts=ATT[sfx]||[];
+  if(!raw&&!atts.length){res.textContent='消息内容和附件都是空的';return;}
   const done=[];
   if(raw){let payload;try{payload=JSON.parse(raw);}catch{payload={content:raw};}
-    if(att&&!payload.file)payload.note='附件：'+att.name;
+    if(atts.length&&!payload.file)payload.note='附件：'+atts.map(a=>a.name).join('、');
     try{await j('/v1/send',{method:'POST',body:JSON.stringify({to:tgt.to,to_agent:tgt.to_agent,type:'text',action:'send',payload})});done.push('消息 ok');res.textContent='消息 ok，处理附件中…';}
     catch(e){res.textContent='发送失败: '+(e.message||e);return;}}
-  if(att){const q=new URLSearchParams({to:tgt.to});if(tgt.to_agent)q.set('to_agent',tgt.to_agent);
-    res.textContent='上传附件中… '+fmtSize(att.size);
+  let okn=0;
+  for(let i=0;i<atts.length;i++){const att=atts[i];const q=new URLSearchParams({to:tgt.to});if(tgt.to_agent)q.set('to_agent',tgt.to_agent);
+    res.textContent=`上传附件 ${i+1}/${atts.length}：${att.name}（${fmtSize(att.size)}）`;
     try{const d=await j('/v1/send-file-upload?'+q,{method:'POST',headers:{'X-File-Name':att.name},body:att});
-      done.push('附件 ok '+(d.file_id?'#'+String(d.file_id).slice(0,8):''));clearAtt(sfx);}
-    catch(e){res.textContent='发送失败: '+(e.message||e);return;}}
-  res.textContent=done.join(' · ');refresh();}
+      okn++;done.push('📎'+att.name+' ok'+(d.file_id?' #'+String(d.file_id).slice(0,8):''));}
+    catch(e){done.push('📎'+att.name+' 失败: '+(e.message||e));}}
+  if(atts.length)clearAtt(sfx);
+  res.textContent=done.join(' · ')||'完成';refresh();}
 function onPaste(e,sfx){const cd=e.clipboardData;if(!cd)return;let f=null;
   for(const it of (cd.items||[])){if(it.kind==='file'&&it.type&&it.type.indexOf('image/')===0){f=it.getAsFile();break;}}
   if(!f){for(const x of (cd.files||[])){if(x.type&&x.type.indexOf('image/')===0){f=x;break;}}}
   if(!f)return;e.preventDefault();
   const ts=new Date().toISOString().slice(0,19).replace(/[-:T]/g,'');
   const named=(f.name&&f.name!=='image.png')?f:new File([f],'image-'+ts+'.png',{type:f.type||'image/png'});
-  setAtt(sfx,named);el('sendres'+sfx).textContent='已附上剪贴板图片 '+named.name;}
+  addAtt(sfx,[named]);el('sendres'+sfx).textContent='已附上剪贴板图片 '+named.name;}
 async function packFromInput(inp,sfx,label){const fs=Array.from(inp.files||[]);if(!fs.length)return;
   const res=el('sendres'+sfx);const top=(fs[0].webkitRelativePath||'').split('/')[0]||label||'folder';
   res.textContent='打包目录中… '+fs.length+' 个文件';
   try{const es=[];for(const x of fs)es.push({name:x.webkitRelativePath||x.name,u8:new Uint8Array(await x.arrayBuffer())});
     const blob=await zipStore(es);const zf=new File([blob],top+'.zip',{type:'application/zip'});zf.__zip=true;
-    setAtt(sfx,zf);res.textContent=`已打包 ${es.length} 个文件 → ${top}.zip（${fmtSize(zf.size)}）`;}
+    addAtt(sfx,[zf]);res.textContent=`已打包 ${es.length} 个文件 → ${top}.zip（${fmtSize(zf.size)}）`;}
   catch(e){res.textContent='打包失败: '+(e.message||e);}}
 async function onDrop(e,sfx){e.preventDefault();const dz=el('dz'+sfx);if(dz)dz.classList.remove('drag');const res=el('sendres'+sfx);
   const its=(e.dataTransfer&&e.dataTransfer.items)?Array.from(e.dataTransfer.items):[];
   const ents=its.map(i=>i.webkitGetAsEntry?i.webkitGetAsEntry():null).filter(Boolean);
   const dirs=ents.filter(x=>x.isDirectory);
-  if(dirs.length){res.textContent='打包目录中… '+dirs[0].name;
-    try{const es=await walkEntry(dirs[0],'',[]);if(!es.length){res.textContent='目录是空的';return;}
-      const blob=await zipStore(es);const zf=new File([blob],dirs[0].name+'.zip',{type:'application/zip'});zf.__zip=true;
-      setAtt(sfx,zf);res.textContent=`已打包 ${es.length} 个文件 → ${dirs[0].name}.zip（${fmtSize(zf.size)}）`;}
-    catch(err){res.textContent='目录打包失败: '+(err.message||err);}return;}
+  if(dirs.length){const made=[];
+    for(const d of dirs){res.textContent='打包目录中… '+d.name;
+      try{const es=await walkEntry(d,'',[]);if(!es.length){res.textContent='目录是空的';continue;}
+        const blob=await zipStore(es);const zf=new File([blob],d.name+'.zip',{type:'application/zip'});zf.__zip=true;
+        addAtt(sfx,[zf]);made.push(d.name+'.zip');}
+      catch(err){res.textContent='目录打包失败: '+(err.message||err);}}
+    if(made.length)res.textContent='已打包 '+made.length+' 个目录 → '+made.join('、');return;}
   const fl=(e.dataTransfer&&e.dataTransfer.files)?Array.from(e.dataTransfer.files):[];
-  if(fl.length){setAtt(sfx,fl[0]);res.textContent='';return;}
-  if(ents.some(x=>x.isFile)){const fe=ents.find(x=>x.isFile);const f=await new Promise(r=>fe.file(r));setAtt(sfx,f);res.textContent='';return;}
+  if(fl.length){addAtt(sfx,fl);res.textContent='';return;}
+  if(ents.some(x=>x.isFile)){const fe=ents.find(x=>x.isFile);const f=await new Promise(r=>fe.file(r));addAtt(sfx,[f]);res.textContent='';return;}
   res.textContent='没识别到文件';}
 function bindPanel(sfx){
-  const fi=el('file'+sfx);if(fi)fi.onchange=()=>{if(fi.files[0])setAtt(sfx,fi.files[0]);};
+  const fi=el('file'+sfx);if(fi)fi.onchange=()=>{addAtt(sfx,Array.from(fi.files||[]));fi.value='';};
   const di=el('dir'+sfx);if(di)di.onchange=()=>packFromInput(di,sfx);
   const dz=el('dz'+sfx);
   if(dz){['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag');}));
@@ -1417,10 +1758,54 @@ function renderPeers(){
   if(pe!==LAST.pe){$('peers-body').innerHTML=pe;LAST.pe=pe;}
 }
 function histSig(){return HIST.length+'|'+(HIST.length?HIST[HIST.length-1].msg_id:'')+'|'+EXP.size;}
+let LAST_HSTAT=0;
+async function histStats(){if(Date.now()-LAST_HSTAT<30000)return;LAST_HSTAT=Date.now();try{const d=await j('/v1/history/stats');if(!d||d.ok!==true)return;const mb=Number(d.rotate_mb)||1024;const lim=mb*1048576;const tot=Number(d.total_bytes)||0;const act=Number(d.active_bytes)||0;const warn=act>=lim*0.8;let txt='当前 '+fmtSize(d.active_bytes)+' · 归档 '+fmtSize(d.archive_bytes)+'（'+(d.archive_count||0)+' 个）· 合计 '+fmtSize(tot)+' · 满 '+mb+' MB 或 '+(d.archive_days||0)+' 天自动归档，记录不删除';if(d.archive_keep)txt+=' · 仅保留最近 '+d.archive_keep+' 份归档';if(warn)txt+=' · 接近阈值，建议导出备份';for(const id of ['ov-stats','ch-stats']){const e=el(id);if(!e)continue;e.textContent=txt;e.style.color=warn?'#f85149':'';}}catch(err){}}
+function exportHist(p,fmt){const s=el(p+'-scope');const sc=s?s.value:'all';window.location.href='/v1/history/export?format='+fmt+'&scope='+sc;}
+async function histSearch(){
+ const p=new URLSearchParams();
+ const put=(k,id)=>{const v=val(id);if(v)p.set(k,v);};
+ put('from','ch-from');put('to','ch-to');put('q','ch-kw');
+ const sv=val('ch-since');if(sv)p.set('since',new Date(sv).toISOString());
+ const uv=val('ch-until');if(uv)p.set('until',new Date(uv).toISOString());
+ p.set('limit',el('ch-limit').value);
+ p.set('scope',el('ch-all').checked?'all':'active');
+ el('ch-qmeta').textContent='磁盘查询中…';
+ try{
+  const d=await j('/v1/history/search?'+p.toString());
+  if(!d||d.ok!==true){el('ch-qmeta').textContent='查询失败：'+((d&&d.error)||'');return;}
+  CHQ=d.matches||[];
+  const kb=Math.round((d.scanned_bytes||0)/1024);
+  let note='服务器命中 '+d.count+' 条 · 扫描 '+kb+' KB';
+  if(d.stopped==='budget')note+=' · 达到扫描上限（可收窄时间范围或调低条数）';
+  else if(d.stopped==='limit')note+=' · 已达上限截断（更早记录未扫，可提高上限）';
+  else if(d.stopped==='older')note+=' · 早于起始时间自动停止';
+  el('ch-qmeta').textContent=note+' · 结果在下方分页，可继续用上方关键词二次筛选';
+  chGo(1);
+ }catch(e){el('ch-qmeta').textContent='查询失败：'+(e.message||e);}
+}
+function histReset(){CHQ=null;for(const i of ['ch-from','ch-to','ch-since','ch-until','ch-kw'])if(el(i))el(i).value='';if(el('ch-all'))el('ch-all').checked=false;el('ch-qmeta').textContent='';chGo(1);}
+function fillAgDl(){const d=el('ch-agents');if(!d)return;const s=new Set();
+ for(const a of AGENTS){if(a.agent_id)s.add(a.agent_id);if(a.name)s.add(a.name);if(a.node_id)s.add(a.node_id);if(a.node_name)s.add(a.node_name);}
+ d.innerHTML=[...s].map(x=>`<option value="${esc(x)}"></option>`).join('');}
+function renderColorCfg(){const box=el('cf-colors');if(!box)return;box._n=box._n||{};
+ const ids=new Map();
+ for(const a of AGENTS){ids.set('agent:'+a.node_id+'|'+a.agent_id,(a.node_name||who(a.node_id))+' · '+(a.name||a.agent_id));}
+ for(const n of Object.keys(NAMES)){ids.set('node:'+n,'节点：'+NAMES[n]);}
+ const rows=[...ids.entries()].sort((x,y)=>x[1].localeCompare(y[1]));
+ if(!rows.length){box.innerHTML='<span class="hint">暂无节点/agent，等 fleet 同步后自动出现。</span>';return;}
+ box.innerHTML=rows.map(([k,lbl])=>{const cur=COLORS[k]||'';const sep=k.indexOf('|');
+  const n=sep>0?k.slice(6,sep):k.slice(5);const a=sep>0?k.slice(sep+1):'';
+  const prev=`<span class="idc" style="background:${cur||colFor(n,a)}">${esc(lbl)}</span>`;
+  return `<div class="row" style="align-items:center">${prev}<input type="color" ${cur?'value="'+cur+'"':''} ${cur?'':'disabled'} onchange="setColor('${k}',this.value)"><label style="font-size:12px;margin-left:6px"><input type="checkbox" ${cur?'':'checked'} onchange="tgAutoCol('${k}',this.checked)">自动色</label></div>`;}).join('');}
+async function setColor(k,v){COLORS[k]=v;await putColors();}
+async function tgAutoCol(k,on){if(on)delete COLORS[k];else COLORS[k]='#5b8def';await putColors();}
+async function putColors(){try{await j('/v1/colors',{method:'PUT',body:JSON.stringify({colors:COLORS})});renderColorCfg();}catch(e){alert('保存颜色失败：'+(e.message||e));}}
 async function refresh(){
+ histStats();
  try{
   if(el('ed-input'))return; // 行内改名编辑中：跳过本轮刷新，防止重绘冲掉编辑框
-  const [st,peers,agents,hist]=await Promise.all([j('/v1/status'),j('/v1/peers'),j('/v1/fleet/agents'),j('/v1/history')]);
+  const [st,peers,agents,hist,cols]=await Promise.all([j('/v1/status'),j('/v1/peers'),j('/v1/fleet/agents'),j('/v1/history'),j('/v1/colors')]);
+  COLORS=(cols&&cols.colors)||{};
   ST=st||{}; PEERS=(peers&&peers.ok)?peers.peers:[]; AGENTS=(agents&&agents.ok)?agents.agents:[]; SELF=ST.node_id||'';
   $('tb-self').textContent=st.name;
   $('tb-meta').textContent=`${st.node_id} · v${st.version} · 在线 ${st.peers_online}/${st.peers_known} · ${new Date().toLocaleTimeString()}`;
@@ -1435,7 +1820,7 @@ async function refresh(){
   if(st&&st.node_id){NAMES[st.node_id]=st.name||st.node_id;}
   for(const p of PEERS)NAMES[p.node_id]=p.name;
   for(const a of AGENTS){AN[a.node_id+'|'+a.agent_id]=(a.name||a.agent_id); NAMES[a.node_id]=a.node_name||NAMES[a.node_id]||a.node_id;}
-  if(!sel){renderPeers();renderAgents();}
+  if(!sel){renderPeers();renderAgents();fillAgDl();if(el('p-config')&&!el('p-config').classList.contains('hidden'))renderColorCfg();}
   // 目标下拉（纯选择）——签名相同不重写，保住控件状态
   let opn='<optgroup label="节点（发给整机）"><option value="*">* 广播（全部节点）</option>';
   for(const p of PEERS)opn+=`<option value="${esc(p.node_id)}">${esc(p.name)}${p.online?'':'（离线）'}</option>`;

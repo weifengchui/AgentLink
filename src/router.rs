@@ -1088,7 +1088,11 @@ impl Router {
                     file,
                     &line,
                     self.cfg.history.max_file_mb,
+                    self.cfg.history.archive_days,
                 );
+                if self.cfg.history.archive_keep > 0 {
+                    store::prune_archives(&self.cfg.data_dir, self.cfg.history.archive_keep);
+                }
             }
         }
     }

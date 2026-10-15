@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>AgentLink · 消息星图 — 概念 v3</title>
+<style>
+:root{--ink:#04070d;--panel:rgba(11,17,27,.92);--edge:rgba(108,168,255,.14);
+--txt:#d7e2ee;--mut:#6b7d94;--cyan:#38d6e6;--red:#ff5c7a;--green:#43d97b;--blue:#7fb0ff;--amber:#ffb347}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;background:var(--ink);color:var(--txt);
+font-family:"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.mono{font-family:Cascadia Code,Consolas,monospace}
+#bg{position:fixed;inset:0;background:
+ radial-gradient(1200px 700px at 20% 30%,rgba(56,214,230,.07),transparent 60%),
+ radial-gradient(1000px 600px at 80% 60%,rgba(127,176,255,.06),transparent 60%),
+ linear-gradient(rgba(108,168,255,.045) 1px,transparent 1px) 0 0/56px 56px,
+ linear-gradient(90deg,rgba(108,168,255,.045) 1px,transparent 1px) 0 0/56px 56px,var(--ink)}
+#viewport{position:fixed;inset:0;overflow:hidden}
+#world{position:absolute;inset:0;transition:transform .9s cubic-bezier(.22,.8,.28,1);transform-origin:0 0}
+#stage{position:absolute;inset:0}
+svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.chan{fill:none;stroke-linecap:round}
+.chan.f{stroke:var(--cyan);stroke-width:1.6;opacity:.8}
+.chan.r{stroke:var(--blue);stroke-width:1.2;opacity:.55;stroke-dasharray:7 5}
+.chan.idle{opacity:.12}
+.chan.alarm{stroke:var(--red)!important;opacity:1!important;animation:alarm 1s infinite}
+@keyframes alarm{0%,100%{stroke-width:1.6}50%{stroke-width:3.4}}
+/* stations */
+.stn{position:absolute;transform:translate(-50%,-50%);text-align:center;cursor:pointer}
+.stn .hex{width:96px;height:84px;position:relative}
+.stn .hex svg{position:static;width:96px;height:84px}
+.stn .nm{margin-top:2px;font-size:13px;font-weight:600;letter-spacing:.06em}
+.stn .ip{font-size:10px;color:var(--mut)}
+.stn .ag{display:flex;gap:5px;justify-content:center;margin-top:6px}
+.stn .dot{width:9px;height:9px;border-radius:50%;background:var(--ac);
+ box-shadow:0 0 8px var(--ac);animation:breathe 2.6s infinite}
+@keyframes breathe{0%,100%{opacity:.85}50%{opacity:.35}}
+.stn .dot.off{background:#555;box-shadow:none;animation:none}
+.stn .stat{position:absolute;top:-2px;right:-6px;width:12px;height:12px;border-radius:50%;
+ background:var(--green);box-shadow:0 0 10px var(--green);animation:breathe 2s infinite}
+.stn.warn .stat{background:var(--amber);box-shadow:0 0 10px var(--amber)}
+.stn.down .stat{background:var(--red);box-shadow:0 0 14px var(--red);animation:alarm 1s infinite}
+/* message cards & decks */
+.deck{position:absolute;transform:translate(-50%,-50%);cursor:pointer;--bc:var(--cyan)}
+.deck .card{position:absolute;left:50%;top:0;margin-left:-88px;width:176px;height:92px;
+ background:rgba(13,20,32,.94);border:1px solid rgba(108,168,255,.25);border-radius:10px;
+ padding:7px 9px;transform-origin:center;
+ transform:translateY(calc(var(--i)*-6px)) translateX(calc(var(--i)*4px)) rotate(calc(var(--i)*1.6deg)) scale(calc(1 - var(--i)*.02));
+ box-shadow:0 6px 18px rgba(0,0,0,.55);transition:transform .22s,box-shadow .15s;overflow:hidden}
+.deck.open .card,.deck.pin .card{
+ transform:translateX(calc((var(--i) - var(--m))*52px)) translateY(calc((var(--i) - var(--m))*7px))
+           rotate(calc((var(--i) - var(--m))*4deg))}
+.card .hd{font-size:9.5px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .k{position:absolute;left:9px;top:7px;width:7px;height:7px;border-radius:2px;background:var(--kc)}
+.card .t{font-size:11px;font-weight:600;margin:14px 0 3px 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .sn{font-size:10.5px;line-height:1.45;color:#a9bad0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card .ft{position:absolute;bottom:6px;right:9px;font-size:9px;color:var(--mut)}
+.card.hot{z-index:40!important;box-shadow:0 0 0 1.5px var(--bc),0 0 22px -6px var(--bc),0 10px 26px rgba(0,0,0,.6)!important}
+.card.sel{z-index:41!important;box-shadow:0 0 0 2px var(--bc),0 0 30px -6px var(--bc),0 10px 26px rgba(0,0,0,.6)!important}
+.card.sel::after{content:"✓ 正在查看";position:absolute;top:-15px;left:0;font-size:9px;color:var(--bc)}
+.deck .tag{position:absolute;left:50%;top:-24px;transform:translateX(-50%);font-size:9.5px;
+ color:var(--mut);background:rgba(6,10,17,.8);border:1px solid var(--edge);border-radius:8px;padding:1px 8px;white-space:nowrap}
+.deck.open .tag,.deck.pin .tag{color:var(--bc);border-color:var(--bc)}
+/* reader dock card */
+#reader{position:absolute;z-index:90;display:none;width:284px;transform:translateX(-50%);cursor:pointer;
+ transition:left .2s,top .2s;filter:drop-shadow(0 0 26px rgba(56,214,230,.22))}
+#reader .cap{position:absolute;top:-30px;left:0;right:0;text-align:center;font-size:11.5px;color:var(--txt);
+ background:rgba(8,14,24,.96);border:1px solid var(--edge);border-radius:9px;padding:3px 8px}
+#reader .box{background:#0b1320;border:2px solid var(--rc,var(--cyan));border-radius:14px;
+ box-shadow:0 0 34px -6px var(--rc,var(--cyan)),0 14px 40px rgba(0,0,0,.7);padding:11px 14px}
+#reader .rk{display:inline-block;font-size:10px;border-radius:4px;padding:1px 7px;color:#04070d;font-weight:700}
+#reader .rh{font-size:11.5px;color:#9fb4cc;margin:7px 0 4px;word-break:break-all}
+#reader .rb{font-size:13px;line-height:1.6;color:#eaf2fb;max-height:120px;overflow:hidden}
+#reader .nf{display:flex;align-items:center;justify-content:space-between;margin-top:8px;font-size:10.5px;color:var(--mut)}
+#reader .nav{position:absolute;top:50%;transform:translateY(-50%);width:40px;height:58px;border-radius:12px;
+ background:rgba(13,20,32,.96);border:1.5px solid var(--rc,var(--edge));display:flex;align-items:center;justify-content:center;
+ font-size:24px;color:var(--txt);cursor:pointer;transition:background .12s,transform .12s;pointer-events:auto}
+#reader .nav:hover{background:var(--rc);color:#04070d;transform:translateY(-50%) scale(1.08)}
+#reader .nav:active{transform:translateY(-50%) scale(.92)}
+#reader .nav.l{left:-46px}#reader .nav.r{right:-46px}
+/* HUD */
+#hud{position:fixed;top:14px;right:16px;z-index:110;display:flex;gap:8px}
+.hud{background:var(--panel);border:1px solid var(--edge);border-radius:10px;padding:6px 12px;font-size:11px;color:var(--mut)}
+.hud b{display:block;font-size:17px;color:var(--txt);font-weight:600}
+.hud.alarmn{color:var(--red)}.hud.alarmn b{color:var(--red)}
+#brand{position:fixed;top:16px;left:18px;z-index:110;font-size:15px;letter-spacing:.14em;color:#cfe0f2}
+#brand small{color:var(--mut);letter-spacing:.05em;margin-left:8px}
+#banner{position:fixed;top:52px;left:50%;transform:translateX(-50%);z-index:120;display:none;
+ background:rgba(60,10,20,.92);border:1px solid var(--red);border-radius:10px;padding:7px 18px;
+ font-size:13px;color:#ffd7de;box-shadow:0 0 30px rgba(255,92,122,.35);animation:alarm 1.2s infinite}
+/* toolbar */
+#bar{position:fixed;bottom:0;left:0;right:0;z-index:110;display:flex;align-items:center;gap:10px;
+ padding:10px 16px;background:linear-gradient(transparent,rgba(4,7,13,.9) 30%)}
+.btn{background:var(--panel);border:1px solid var(--edge);color:var(--txt);border-radius:9px;
+ padding:6px 13px;font-size:12px;cursor:pointer}
+.btn:hover{border-color:var(--cyan);color:var(--cyan)}
+.btn.on{background:rgba(56,214,230,.16);border-color:var(--cyan);color:var(--cyan)}
+.btn.rec{color:var(--red)}
+#recdot{display:none;width:9px;height:9px;border-radius:50%;background:var(--red);animation:breathe 1s infinite}
+#reclabel{display:none;font-size:11px;color:var(--red)}
+.winlbl{font-size:11px;color:var(--mut);min-width:150px}
+input[type=range]{width:180px;accent-color:var(--cyan)}
+#help{position:fixed;bottom:52px;left:16px;z-index:100;font-size:10.5px;color:var(--mut);line-height:1.7}
+/* detail modal master-detail */
+#detail{position:fixed;inset:0;z-index:200;display:none;background:rgba(2,4,8,.72);backdrop-filter:blur(3px)}
+#detail.show{display:flex;align-items:center;justify-content:center}
+#dwrap{display:flex;width:min(920px,92vw);height:min(600px,80vh);background:#0b1320;--dtc:var(--cyan);
+ border:1.5px solid var(--dtc);border-radius:16px;overflow:hidden;
+ box-shadow:0 0 44px -8px var(--dtc),0 30px 80px rgba(0,0,0,.8)}
+#dlist{width:280px;border-right:1px solid var(--edge);overflow-y:auto;background:rgba(6,10,17,.6);padding:10px}
+#dlist .row{display:flex;gap:8px;align-items:center;padding:8px 9px;border-radius:8px;cursor:pointer;border:1px solid transparent}
+#dlist .row:hover{background:rgba(108,168,255,.07)}
+#dlist .row.on{border-color:var(--dtc);background:color-mix(in srgb,var(--dtc) 9%,transparent)}
+#dlist .row .k{width:8px;height:8px;border-radius:2px;flex:none}
+#dlist .row .t{font-size:10px;color:var(--mut);flex:none}
+#dlist .row .s{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#dmain{flex:1;padding:22px 26px;overflow-y:auto}
+#d-tp{font-size:17px;font-weight:700;color:var(--dtc)}
+#d-seq{font-size:11px;color:var(--mut);margin:4px 0 14px}
+#d-hd{font-size:12.5px;color:#9fb4cc;background:rgba(108,168,255,.06);border:1px dashed var(--edge);
+ border-left:3px solid var(--dtc);border-radius:8px;padding:7px 11px;margin-bottom:12px;word-break:break-all}
+#d-body{font-size:14px;line-height:1.75;white-space:pre-wrap}
+#d-meta{margin-top:16px;font-size:11.5px;color:var(--mut)}
+#dclose{position:absolute;top:10px;right:14px;font-size:20px;color:var(--mut);cursor:pointer}
+#dcard{position:relative}
+/* toast */
+#toast{position:fixed;top:80px;left:50%;transform:translateX(-50%);z-index:300;background:var(--panel);
+ border:1px solid var(--cyan);border-radius:10px;padding:8px 18px;font-size:12.5px;display:none;
+ box-shadow:0 0 26px rgba(56,214,230,.25)}
+</style>
+</head>
+<body>
+<div id="bg"></div>
+<div id="brand">AGENTLINK · 消息星图 <small>概念 v3 · 双向通道 / 巡视 / 回放 / 摄录</small></div>
+<div id="hud"></div>
+<div id="banner"></div>
+<div id="viewport"><div id="world"><div id="stage">
+ <svg id="svg"></svg><div id="decks"></div>
+</div></div></div>
+<div id="bar">
+ <button class="btn" id="bTour">◈ 巡视</button>
+ <button class="btn" id="bReplay">⏮ 回放</button>
+ <button class="btn" id="bSnap">📷 快照PNG</button>
+ <button class="btn rec" id="bRec"><span id="recdot"></span>🎬 录制 <span id="reclabel"></span></button>
+ <button class="btn" id="bAlarm">⚠ 模拟故障</button>
+ <button class="btn" id="bReset">⌂ 复位</button>
+ <span class="winlbl" id="winlbl"></span>
+ <input type="range" id="win" min="60" max="600" step="10" value="600">
+ <button class="btn" id="bFull">⛶ 全屏</button>
+</div>
+<div id="help">悬停牌堆自动摊开，正下方紧贴阅读器卡 · 滚轮/‹›/扫动 翻卡 · 单击卡进详情<br>
+点牌堆空白钉住 · 点画布空白收起 · 巡视/回放/摄录见底栏 · 链路红色脉冲=故障告警</div>
+<div id="detail"><div id="dwrap">
+ <div id="dlist"></div>
+ <div id="dmain"><span id="dclose">×</span>
+  <div id="d-tp"></div><div id="d-seq" class="mono"></div>
+  <div id="d-hd" class="mono"></div><div id="d-body"></div><div id="d-meta" class="mono"></div>
+ </div></div></div>
+<div id="toast"></div>
+<script>
+"use strict";
+const KD={file:{c:"#38d6e6",n:"文件"},up:{c:"#43d97b",n:"升级"},sys:{c:"#7fb0ff",n:"系统"},
+ chat:{c:"#ffb347",n:"对话"},ok:{c:"#43d97b",n:"回执"},al:{c:"#ff5c7a",n:"告警"}};
+const MACH={
+ A:{key:"A",name:"本机 50",ip:"192.168.1.50",fx:.16,fy:.62,ags:[["agentlink","#38d6e6"],["study","#ffb347"],["liteguard","#7fb0ff"]]},
+ B:{key:"B",name:"机位 7",ip:"192.168.1.7",fx:.52,fy:.18,ags:[["agentlink","#38d6e6"],["study","#ffb347"]]},
+ C:{key:"C",name:"机位 10",ip:"192.168.1.10",fx:.85,fy:.58,ags:[["agentlink","#38d6e6"],["study","#ffb347"],["hermes","#ff5c7a"]]}};
+const BASE=new Date();
+const T=s=>new Date(BASE.getTime()+s*1000).toLocaleTimeString("zh-CN",{hour12:false});
+/* topics: pair + msgs with direction */
+const TOPICS=[
+ {id:"up15",name:"v0.4.15 发布链路",pair:["A","B"],color:"#43d97b",msgs:[
+  {from:"A",to:"B",k:"up",hd:"【agentlink@192.168.1.50 -> agentlink@192.168.1.7】",sn:"升级预告：v0.4.15 将于 13:30 推送，请报备。",body:"升级预告：v0.4.15 已发布（多文件/检索/配色/历史导出）。将于 13:30 推送至 e5827032190c，收到请报备；22:00-08:00 折扣保护窗内不执行。",t:-420},
+  {from:"A",to:"B",k:"file",hd:"【agentlink@192.168.1.50 -> agentlink@192.168.1.7】",sn:"包已上传 D:\\HermesSpace\\AgentLink\\dist",body:"发布包已推送到目标机 dist 目录，runner md5 7113133c…，请以 Windows 路径校验。",t:-380},
+  {from:"A",to:"B",k:"up",hd:"【agentlink@192.168.1.50 -> agentlink@192.168.1.7】",sn:"倒计时 5 分钟 · 请进入待命",body:"提前 5min 预告生效，120s 报备窗口开启。超时视为就绪（尽力原则）。",t:-360},
+  {from:"B",to:"A",k:"up",hd:"【agentlink@192.168.1.7 -> agentlink@192.168.1.50】",sn:"ready · 回滚点就位",body:"已报备就绪。备份已写入 backups/v0.4.14_xxx，回滚窗口 30s 生效。",t:-300},
+  {from:"A",to:"B",k:"up",hd:"【agentlink@192.168.1.50 -> agentlink@192.168.1.7】",sn:"批准执行 · 窗口 13:30-13:45",body:"批准执行。窗口 13:30-13:45，失败自动回滚并上报。",t:-240},
+  {from:"B",to:"A",k:"sys",hd:"【agentlink@192.168.1.7 -> agentlink@192.168.1.50】",sn:"切换二进制 · 重启中",body:"runner 已完成 exe 替换与 systemd 等价位重启，正在等待 health 探测。",t:-180},
+  {from:"B",to:"A",k:"ok",hd:"【agentlink@192.168.1.7 -> agentlink@192.168.1.50】",sn:"upgrade_done · health 200",body:"升级完成：/v1/health version=0.4.15，uptime 310s，历史台账已双写。",t:-120},
+  {from:"A",to:"B",k:"sys",hd:"【agentlink@192.168.1.50 -> agentlink@192.168.1.7】",sn:"台账已双写 · 版本 0.4.15",body:"upgrade-ledger.json 已更新（data_dir + git 双写），本轮滚动升级闭环。",t:-90}]},
+ {id:"up10",name:".10 滚动升级",pair:["A","C"],color:"#43d97b",msgs:[
+  {from:"A",to:"C",k:"up",hd:"【agentlink@192.168.1.50 -> agentlink@192.168.1.10】",sn:"v0.4.15 预告 · 13:30 推送",body:"升级预告：目标 f013cdcb7c91，runner 需默认网关回退（WSL NAT）。",t:-400},
+  {from:"C",to:"A",k:"up",hd:"【agentlink@192.168.1.10 -> agentlink@192.168.1.50】",sn:"ready · 备份完成",body:"backups/v0.4.14_xxx 已写入，30s 回滚窗生效。",t:-260},
+  {from:"A",to:"C",k:"up",hd:"【agentlink@192.168.1.50 -> agentlink@192.168.1.10】",sn:"批准执行",body:"批准执行，失败自动回滚。",t:-200},
+  {from:"C",to:"A",k:"ok",hd:"【agentlink@192.168.1.10 -> agentlink@192.168.1.50】",sn:"upgrade_done · 0.4.15",body:"升级完成，health 200，uptime 782s。",t:-90}]},
+ {id:"smoke",name:"回归冒烟",pair:["A","B"],color:"#ffb347",msgs:[
+  {from:"B",to:"A",k:"sys",hd:"【agentlink@192.168.1.7 -> agentlink@192.168.1.50】",sn:"history smoke 13/13 PASS",body:"历史归档/导出冒烟 13/13 PASS；upload 6/6 PASS。",t:-200},
+  {from:"B",to:"A",k:"sys",hd:"【agentlink@192.168.1.7 -> agentlink@192.168.1.50】",sn:"search/colors/multifile 22/22 PASS",body:"特性冒烟：/v1/history/search 过滤、/v1/colors 持久化、多文件附件，全链路 22/22 PASS。",t:-170},
+  {from:"A",to:"B",k:"sys",hd:"【agentlink@192.168.1.50 -> agentlink@192.168.1.7】",sn:"已确认 · 台账已记",body:"结果已写入 upgrade-ledger.json 双写（data_dir + git）。",t:-150},
+  {from:"A",to:"B",k:"chat",hd:"【study@192.168.1.50 -> study@192.168.1.7】",sn:"clippy 还有两个 warning 看下",body:"cargo clippy --release --all-targets 输出里 map_or 与 needless_borrow 两处，发版前清一下。",t:-140},
+  {from:"B",to:"A",k:"chat",hd:"【study@192.168.1.7 -> study@192.168.1.50】",sn:"已修 · push 完成",body:"两个 warning 已修，fmt+clippy 全绿，已 push 到 main。",t:-100}]},
+ {id:"daily",name:"日常巡检",pair:["A","C"],color:"#7fb0ff",msgs:[
+  {from:"A",to:"C",k:"sys",hd:"【liteguard@192.168.1.50 -> liteguard@192.168.1.10】",sn:"心跳询问 · 磁盘/内存",body:"例行巡检：请回报磁盘水位、内存占用、history.jsonl 大小。",t:-330},
+  {from:"C",to:"A",k:"ok",hd:"【liteguard@192.168.1.10 -> liteguard@192.168.1.50】",sn:"磁盘 61% · 内存 3.2G · hist 480MB",body:"D 盘 61%，内存 3.2/32G，历史文件 480MB，距 1GB 阈值尚远。",t:-310},
+  {from:"A",to:"C",k:"sys",hd:"【agentlink@192.168.1.50 -> agentlink@192.168.1.10】",sn:"mesh 邻居数确认",body:"当前 mesh 三节点互联，邻居表 2/2 在线。",t:-250},
+  {from:"C",to:"A",k:"ok",hd:"【agentlink@192.168.1.10 -> agentlink@192.168.1.50】",sn:"邻居 2/2 · RTT 3ms",body:"邻居 .50/.7 均在线，平均 RTT 3ms，无丢包。",t:-245},
+  {from:"A",to:"C",k:"chat",hd:"【study@192.168.1.50 -> hermes@192.168.1.10】",sn:"折扣窗内别重启任何服务",body:"提醒：22:00-08:00 TokenPlan 折扣窗，升级/重启一律顺延到 08:00 后。",t:-230},
+  {from:"C",to:"A",k:"chat",hd:"【hermes@192.168.1.10 -> study@192.168.1.50】",sn:"收到 · 已加入待办窗口检查",body:"已在 daemon 升级预检里加保护窗判断，窗口内 notice 自动顺延。",t:-215},
+  {from:"A",to:"C",k:"sys",hd:"【agentlink@192.168.1.50 -> agentlink@192.168.1.10】",sn:"令牌轮换提示 · 30 天后到期",body:"web 控制台令牌将于 30 天后过期，建议下次维护窗轮换。",t:-130}]},
+ {id:"cfgsync",name:"配置同步",pair:["B","C"],color:"#38d6e6",msgs:[
+  {from:"B",to:"C",k:"file",hd:"【agentlink@192.168.1.7 -> agentlink@192.168.1.10】",sn:"新版 runner.py 同步",body:"新版 runner（md5 7113133c…）已同步，含默认网关回退修复。",t:-350},
+  {from:"C",to:"B",k:"ok",hd:"【agentlink@192.168.1.10 -> agentlink@192.168.1.7】",sn:"已接收 · md5 校验一致",body:"文件落地并校验通过。",t:-340},
+  {from:"B",to:"C",k:"sys",hd:"【study@192.168.1.7 -> study@192.168.1.10】",sn:"no_proxy 缺 maas 修复分发",body:"50 台账问题根因修复：daemon 与两桥继承注入 :1080，no_proxy 补 maas 域。",t:-280},
+  {from:"C",to:"B",k:"chat",hd:"【study@192.168.1.10 -> study@192.168.1.7】",sn:"注意勿重启在役桥",body:"修复脚本只覆盖配置，不自动重启在役桥，人工确认后再滚动。",t:-260},
+  {from:"B",to:"C",k:"ok",hd:"【agentlink@192.168.1.7 -> agentlink@192.168.1.10】",sn:"确认 · 台账双写完成",body:"配置版本与脚本哈希已双写台账。",t:-240}]},
+ {id:"weekly",name:"周报协作长对话",pair:["A","B"],color:"#c77dff",msgs:[
+  {from:"A",to:"B",k:"chat",hd:"【study@192.168.1.50 -> study@192.168.1.7】",sn:"本周周报初稿发你，帮我过一遍",body:"初稿覆盖：v0.4.13 上传修复、v0.4.14 界面发布、滚动升级闭环。请补充 .7 侧的观察。",t:-410},
+  {from:"B",to:"A",k:"chat",hd:"【study@192.168.1.7 -> study@192.168.1.50】",sn:"收到 · 三点意见",body:"1) 折扣保护窗值得单列一节 2) 身份碰撞警报要写清 agentid+IP 铁律 3) runner 网关回退是本周最大坑。",t:-400},
+  {from:"A",to:"B",k:"chat",hd:"【study@192.168.1.50 -> study@192.168.1.7】",sn:"第2点展开说说",body:"碰撞警报指多机同名 agent 并存时，仅按名字寻址会串会话。这条背景要写进协议文档吗？",t:-390},
+  {from:"B",to:"A",k:"chat",hd:"【study@192.168.1.7 -> study@192.168.1.50】",sn:"建议进 protocol.md",body:"写进 protocol.md 的寻址章节，附本次 .7 实测的回复串台案例。",t:-380},
+  {from:"A",to:"B",k:"file",hd:"【study@192.168.1.50 -> study@192.168.1.7】",sn:"周报 v2 已上传",body:"修订版已推 D:\\HermesSpace\\AgentLink\\docs\\weekly-2026-42.md，请终审。",t:-360},
+  {from:"B",to:"A",k:"chat",hd:"【study@192.168.1.7 -> study@192.168.1.50】",sn:"终审通过 · 两处笔误已标注",body:"3.2 节时间写反了，5 节表格少一列。改完即可发布。",t:-330},
+  {from:"A",to:"B",k:"ok",hd:"【study@192.168.1.50 -> study@192.168.1.7】",sn:"已修 · 发布归档",body:"两处已修，周报发布并归档，链接同步到巡检台账。",t:-300},
+  {from:"B",to:"A",k:"chat",hd:"【study@192.168.1.7 -> study@192.168.1.50】",sn:"下周议题预登记",body:"建议：星图面板接入 /v1/history/search 实数据、令牌轮换、archive 压缩率观察。",t:-280},
+  {from:"A",to:"B",k:"chat",hd:"【study@192.168.1.50 -> study@192.168.1.7】",sn:"同意 · 排期已写",body:"三项都排进 v0.4.16 候选清单，优先级：星图实数据 > 令牌 > 压缩率。",t:-260}]},
+ {id:"probe",name:"自检探针（本机内）",pair:["A","A"],color:"#7fb0ff",msgs:[
+  {from:"A",to:"A",k:"sys",hd:"【agentlink@192.168.1.50 -> study@192.168.1.50】",sn:"wake_probe · HMAC 自检",body:"install-all.sh 第6步自检消息，非总线消息、无需回复。链路健康证明。",t:-60},
+  {from:"A",to:"A",k:"sys",hd:"【agentlink@192.168.1.50 -> agentlink@192.168.1.50】",sn:"webhook multiplex 自检",body:"default 家 :8644 / p/agentlink/webhooks/agentlink-msg-al 路由可达，处置规程三段式加载正常。",t:-45},
+  {from:"A",to:"A",k:"chat",hd:"【study@192.168.1.50 -> liteguard@192.168.1.50】",sn:"daemon 升级协调器心跳",body:"daemon.py 协调器在线，topic upgrade_* 订阅 7/7 注册成功。",t:-20}]}];
+let alarm=false;
+let stage=document.getElementById("stage"),dkEl=document.getElementById("decks"),
+    svg=document.getElementById("svg"),world=document.getElementById("world"),
+    HIST=600;
+const pos={}; function layout(){const W=innerWidth,H=innerHeight-120;
+ for(const k in MACH){pos[k]={x:MACH[k].fx*W,y:MACH[k].fy*H};}}
+function hexPts(cx,cy,r){let p=[];for(let i=0;i<6;i++){const a=Math.PI/6+i*Math.PI/3;
+ p.push((cx+r*Math.cos(a)).toFixed(1)+","+(cy+r*Math.sin(a)).toFixed(1));}return p.join(" ");}
+/* build lanes: for pair X!=Y, two lens channels; X==X loop near station */
+function chanPath(a,b,side){const dx=b.x-a.x,dy=b.y-a.y,len=Math.hypot(dx,dy);
+ const nx=-dy/len,ny=dx/len,off=side*len*.16;
+ const c1={x:a.x+dx*.3+nx*off,y:a.y+dy*.3+ny*off},c2={x:a.x+dx*.7+nx*off,y:a.y+dy*.7+ny*off};
+ return `M${a.x},${a.y} C${c1.x},${c1.y} ${c2.x},${c2.y} ${b.x},${b.y}`;}
+function loopPath(a){return `M${a.x+30},${a.y-40} C${a.x+130},${a.y-170} ${a.x+200},${a.y-40} ${a.x+40},${a.y+10}`;}
+function renderStations(){document.querySelectorAll(".stn").forEach(e=>e.remove());
+ for(const k in MACH){const m=MACH[k],p=pos[k];
+  const el=document.createElement("div");el.className="stn";el.style.left=p.x+"px";el.style.top=p.y+"px";
+  el.innerHTML=`<div class="stat"></div>
+   <div class="hex"><svg viewBox="0 0 96 84">
+     <polygon points="${hexPts(48,42,38)}" fill="rgba(10,18,30,.9)" stroke="var(--cyan)" stroke-width="2" opacity=".9"/>
+     <polygon points="${hexPts(48,42,30)}" fill="#070d16" stroke="rgba(108,168,255,.35)" stroke-width="1"/>
+     <text x="48" y="47" text-anchor="middle" fill="var(--cyan)" font-size="17" font-weight="700">${k}</text>
+   </svg></div>
+   <div class="nm">${m.name}</div><div class="ip mono">${m.ip}</div>
+   <div class="ag">${m.ags.map(a=>`<span class="dot${(alarm&&k==="B"&&a[0]==="agentlink")?" off":""}" style="--ac:${a[1]}" title="${a[0]}"></span>`).join("")}</div>`;
+  stage.appendChild(el);}}
+/* decks on path midpoints */
+let D=null;
+function buildDecks(visible){
+ dkEl.querySelectorAll(".deck,#reader").forEach(e=>e.remove());
+ D=[];const ns=innerWidth,H=innerHeight-120;
+ for(const tp of TOPICS){const[a,b]=tp.pair;
+  const byDir={};
+  for(const mm of tp.msgs){if(visible!=null&&-mm.t>visible)continue;
+    (byDir[mm.from+mm.to]=byDir[mm.from+mm.to]||[]).push(mm);}
+  for(const dir in byDir){const msgs=byDir[dir];
+   const f=MACH[dir[0]],t=MACH[dir[1]];
+   let d_,anchor;
+   if(a===b){/*self loop single path*/d_=loopPath(pos[a]);
+     anchor=tp._anchor||(tp._anchor=0);}
+   else d_=chanPath(pos[dir[0]],pos[dir[1]],dir===a+b?-1:1);
+   const el=svg.querySelector(`[data-p="${tp.id}${dir}"]`)||document.createElementNS("http://www.w3.org/2000/svg","path");
+   el.setAttribute("data-p",tp.id+dir);el.setAttribute("d",d_);
+   el.setAttribute("class","chan "+(a===b||dir===a+b?"f":"r"));
+   if(alarm&&(dir.includes("B")))el.classList.add("alarm");
+   if(!el.parentNode)svg.appendChild(el);
+   const L=el.getTotalLength(),mid=el.getPointAtLength(L*.52);
+   const deck=document.createElement("div");deck.className="deck";
+   deck.style.left=mid.x+"px";deck.style.top=mid.y+"px";
+   deck.style.setProperty("--bc",tp.color);deck.dataset.tp=tp.id;deck.dataset.dir=dir;
+   const n=msgs.length,m=(n-1)/2;
+   deck.innerHTML=`<span class="tag mono">${tp.name} · ${f.key}→${t.key} · ${n}</span>`+
+    msgs.map((mm,i)=>{const kk=KD[mm.k];
+     return `<div class="card" data-i="${i}" style="--i:${i};--m:${m};--kc:${kk.c};z-index:${i+1}">
+      <span class="k"></span><div class="t">${kk.n} ${T(mm.t)}</div>
+      <div class="hd mono">${mm.hd}</div><div class="sn">${mm.sn}</div>
+      <div class="ft mono">#${i+1}</div></div>`;}).join("");
+   dkEl.appendChild(deck);bindDeck(deck,tp,dir,msgs);
+   D.push({tp,dir,el:deck,msgs});}}
+ ensureReader();}
+/* ---- reader dock ---- */
+function ensureReader(){if(document.getElementById("reader"))return;
+ const g=document.createElement("div");g.id="reader";g.innerHTML=`<div class="cap mono"></div>
+  <div class="box"><span class="rk"></span><div class="rh mono"></div><div class="rb"></div>
+   <div class="nf"><span class="ft mono"></span><span>点击看全文</span></div></div>
+  <div class="nav l mono">‹</div><div class="nav r mono">›</div>`;
+ document.body.appendChild(g);
+ g.addEventListener("click",ev=>{if(ev.target.closest(".nav"))return;
+   if(g._tp&&g._mi!=null)openDetail(g._tp,g._dir,g._msgs,g._mi);});
+ g.querySelector(".nav.l").addEventListener("click",()=>g._mv&&g._mv(-1));
+ g.querySelector(".nav.r").addEventListener("click",()=>g._mv&&g._mv(1));}
+function bindDeck(d,tp,dir,msgs){
+ const n=msgs.length,m=(n-1)/2;
+ const cards=()=>[...d.querySelectorAll(".card")];
+ const snapTo=x=>{const r=d.getBoundingClientRect();
+  return Math.max(0,Math.min(n-1,Math.round((x-(r.left+88))/52+m)));};
+ const setCur=i=>{
+  d.querySelectorAll(".card.hot").forEach(c=>c.classList.remove("hot"));
+  d._cur=i;const g=document.getElementById("reader");
+  if(i==null){if(g._d===d){g.style.display="none";g._d=null;}return;}
+  cards()[i].classList.add("hot");
+  const mm=msgs[i],kk=KD[mm.k];
+  g.style.setProperty("--rc",tp.color);
+  g.querySelector(".cap").textContent=`${tp.name} · ${MACH[dir[0]].key}→${MACH[dir[1]].key} · ${i+1}/${n} · 滚轮翻卡`;
+  g.querySelector(".rk").textContent=kk.n;g.querySelector(".rk").style.background=kk.c;
+  g.querySelector(".rh").textContent=mm.hd;
+  g.querySelector(".rb").textContent=mm.body;
+  g.querySelector(".ft").textContent=T(mm.t);
+  g._tp=tp;g._dir=dir;g._msgs=msgs;g._mi=i;g._d=d;g._mv=mv;
+  const dx=parseFloat(d.style.left),dy=parseFloat(d.style.top);
+  g.style.display="block";g.style.left=dx+"px";
+  const gh=g.offsetHeight;let top=dy+58;
+  if(top+gh>innerHeight-140)top=dy-46-gh-20;
+  g.style.top=top+"px";};
+ const mv=dir2=>setCur(d._cur==null?(dir2>0?0:n-1):(d._cur+dir2+n)%n);
+ d._set=setCur;
+ d.addEventListener("pointerenter",()=>{
+  dkEl.querySelectorAll(".deck.open").forEach(x=>{if(x!==d&&!x.classList.contains("pin")){
+   x.classList.remove("open");x._set&&x._set(null);}});
+  d.classList.add("open");setCur(d._cur==null?n-1:d._cur);});
+ d.addEventListener("pointermove",ev=>{if(!d.classList.contains("open"))return;
+  const i=snapTo(ev.clientX);if(i!==d._cur)setCur(i);});
+ d.addEventListener("wheel",ev=>{if(!d.classList.contains("open"))return;
+  ev.preventDefault();mv(ev.deltaY>0?1:-1);},{passive:false});
+ d.addEventListener("click",ev=>{
+  if(d._drag)return;
+  const card=ev.target.closest(".card");
+  if(card){setCur(cards().indexOf(card));openDetail(tp,dir,msgs,cards().indexOf(card));}
+  else{d.classList.toggle("pin");if(!d.classList.contains("pin")){d.classList.remove("open");d._set&&d._set(null);}}});
+}
+/* ---- master-detail modal ---- */
+const detail=document.getElementById("detail");let DT=null;
+function openDetail(tp,dir,msgs,mi){
+ DT={tp,dir,msgs,mi};
+ document.getElementById("dwrap").style.setProperty("--dtc",tp.color);
+ document.getElementById("d-seq").style.color=tp.color;
+ fill();detail.classList.add("show");
+ const g=document.getElementById("reader");g.style.display="none";g._d=null; /* 打开消息窗即隐藏阅读器 */
+ document.getElementById("d-tp").textContent=tp.name+" · "+MACH[dir[0]].key+"→"+MACH[dir[1]].key;
+ const dl=document.getElementById("dlist");
+ dl.innerHTML=msgs.map((mm,i)=>{const kk=KD[mm.k];
+  return `<div class="row${i===mi?" on":""}" data-i="${i}"><span class="k" style="background:${kk.c}"></span>
+   <span class="t mono">${T(mm.t)}</span><span class="s">${mm.sn}</span></div>`;}).join("");
+ dl.querySelectorAll(".row").forEach(r=>r.addEventListener("click",()=>{DT.mi=+r.dataset.i;fill();}));
+}
+function fill(){const{msgs,mi,tp}=DT,mm=msgs[mi],kk=KD[mm.k];
+ document.getElementById("d-seq").textContent=`第 ${mi+1} / ${msgs.length} 条 · 点左侧列表或 ←/→ 切换 · 发送方→接收方：${mm.from}→${mm.to}`;
+ document.getElementById("d-hd").textContent=mm.hd;
+ document.getElementById("d-body").textContent=mm.body;
+ document.getElementById("d-meta").textContent=`${kk.n} · ${T(mm.t)} · topic=${tp.id} · dir=${mm.from}→${mm.to}`;
+ document.querySelectorAll("#dlist .row").forEach((r,i)=>r.classList.toggle("on",i===mi));
+ const cur=document.querySelector("#dlist .row.on");if(cur)cur.scrollIntoView({block:"nearest"});}
+function closeDetail(){detail.classList.remove("show");DT=null;}
+document.getElementById("dclose").addEventListener("click",closeDetail);
+detail.addEventListener("click",ev=>{if(ev.target===detail)closeDetail();});
+/* ---- HUD ---- */
+function hud(){const total=TOPICS.reduce((s,t)=>s+t.msgs.length,0);
+ const dirs=new Set(TOPICS.flatMap(t=>t.msgs.map(m=>m.from+m.to)));
+ document.getElementById("hud").innerHTML=
+  `<div class="hud">消息<b>${total}</b></div>
+   <div class="hud">活跃话题<b>${TOPICS.length}</b></div>
+   <div class="hud">通信方向<b>${dirs.size}</b></div>
+   <div class="hud">在线节点<b>${alarm?"2/3":"3/3"}</b></div>
+   ${alarm?'<div class="hud alarmn">告警<b>1</b></div>':""}`;}
+/* ---- camera: fly to / tour / reset ---- */
+function flyTo(x,y,s){world.style.transform=`scale(${s}) translate(${-x*(s-1)/s+SX}px,${-y*(s-1)/s}px)`;}
+let SX=0;
+function focusTopic(tp){const g=document.getElementById("reader");g.style.display="none";g._d=null;
+ let sx=0,sy=0,c=0;
+ for(const d of D)if(d.tp===tp){const p={x:parseFloat(d.el.style.left),y:parseFloat(d.el.style.top)};sx+=p.x;sy+=p.y;c++;}
+ if(!c)return;flyTo(sx/c,sy/c,1.55);}
+stage.addEventListener("click",ev=>{if(ev.target===stage||ev.target.id==="decks"){
+ dkEl.querySelectorAll(".deck").forEach(x=>{x.classList.remove("pin","open");x._set&&x._set(null);});
+ const g=document.getElementById("reader");g.style.display="none";g._d=null;}});
+let tour=null;
+document.getElementById("bTour").addEventListener("click",function(){
+ if(tour){clearInterval(tour);tour=null;this.classList.remove("on");world.style.transform="";return;}
+ this.classList.add("on");let i=0;
+ tour=setInterval(()=>{focusTopic(TOPICS[i%TOPICS.length]);i++;},4500);
+ focusTopic(TOPICS[0]);});
+document.getElementById("bReset").addEventListener("click",()=>{
+ if(tour){clearInterval(tour);tour=null;document.getElementById("bTour").classList.remove("on");}
+ world.style.transform="";});
+/* ---- replay: reveal msgs one by one along time ---- */
+let playing=false;
+document.getElementById("bReplay").addEventListener("click",function(){
+ if(playing)return;playing=true;this.classList.add("on");
+ const all=TOPICS.flatMap(tp=>tp.msgs.map(mm=>({tp,mm}))).sort((a,b)=>a.mm.t-b.mm.t);
+ const maxT=-all[all.length-1].mm.t;let v=60;
+ const step=()=>{v+=Math.max(30,maxT/40);buildDecks(v);
+  document.getElementById("win").value=Math.min(600,v);winLbl(Math.min(600,v));
+  if(v>=maxT){playing=false;document.getElementById("bReplay").classList.remove("on");
+   buildDecks(null);toast("回放完成 · 已恢复全量视图");}};
+ buildDecks(60);let n=0;const iv=setInterval(()=>{step();if(!playing)clearInterval(iv);},500);});
+/* ---- time window ---- */
+function winLbl(v){document.getElementById("winlbl").textContent=
+  v>=600?"窗口：全部（近10分钟）":"窗口：最近 "+v+" 秒";}
+document.getElementById("win").addEventListener("input",function(){
+ winLbl(+this.value);buildDecks(+this.value>=600?null:+this.value);});
+/* ---- particles ---- */
+function tick(t){for(const el of svg.querySelectorAll(".chan")){
+ const L=el.getTotalLength?el.getTotalLength():0;if(!L)continue;
+ const rev=el.classList.contains("r")?1:0;
+ const p=el.getPointAtLength(L*((rev?1-t/6000%1:t/6000%1)));
+ let dot=el.parentNode.querySelector(`[data-tr="${el.getAttribute("data-p")}"]`);
+ if(!dot){dot=document.createElementNS("http://www.w3.org/2000/svg","circle");
+  dot.setAttribute("data-tr",el.getAttribute("data-p"));dot.setAttribute("r","3");
+  dot.setAttribute("fill",el.classList.contains("alarm")?"var(--red)":(el.classList.contains("r")?"var(--blue)":"var(--cyan)"));
+  dot.style.filter="drop-shadow(0 0 6px currentColor)";svg.appendChild(dot);}
+ dot.setAttribute("cx",p.x);dot.setAttribute("cy",p.y);}}
+function loop(ts){tick((ts%6000)/6000);requestAnimationFrame(loop);}
+/* ---- alarm demo ---- */
+document.getElementById("bAlarm").addEventListener("click",function(){
+ alarm=!alarm;this.classList.toggle("on",alarm);
+ const bn=document.getElementById("banner");
+ if(alarm){bn.style.display="block";bn.textContent="⚠ 链路告警：机位 .7 心跳超时 45s —— 升级通道已熔断，等待恢复";}
+ else bn.style.display="none";
+ buildDecks(document.getElementById("win").value>=600?null:+document.getElementById("win").value);
+ hud();});
+/* ---- snapshot / record: canvas twin scene ---- */
+function canvasTwin(){const c=document.createElement("canvas");c.width=1920;c.height=1080;
+ const g=c.getContext("2d");g.fillStyle="#04070d";g.fillRect(0,0,c.width,c.height);
+ const grd=g.createRadialGradient(400,300,60,400,300,900);
+ grd.addColorStop(0,"rgba(56,214,230,.08)");grd.addColorStop(1,"transparent");
+ g.fillStyle=grd;g.fillRect(0,0,c.width,c.height);
+ for(const el of svg.querySelectorAll(".chan")){const L=el.getTotalLength();
+  g.strokeStyle=getComputedStyle(el).stroke;g.lineWidth=1.6;g.globalAlpha=.7;g.beginPath();
+  for(let i=0;i<=40;i++){const p=el.getPointAtLength(L*i/40);i?g.lineTo(p.x*(c.width/innerWidth),p.y*(c.height/(innerHeight-120))):g.moveTo(p.x*(c.width/innerWidth),p.y*(c.height/(innerHeight-120)));}
+  g.stroke();}
+ g.globalAlpha=1;
+ for(const k in MACH){const p=pos[k],x=p.x*(c.width/innerWidth),y=p.y*(c.height/(innerHeight-120));
+  g.beginPath();for(let i=0;i<6;i++){const a=Math.PI/6+i*Math.PI/3,px=x+40*Math.cos(a),py=y+40*Math.sin(a);
+   i?g.lineTo(px,py):g.moveTo(px,py);}g.closePath();
+  g.fillStyle="rgba(10,18,30,.9)";g.fill();g.strokeStyle="#38d6e6";g.lineWidth=2;g.stroke();
+  g.fillStyle="#38d6e6";g.font="700 17px monospace";g.textAlign="center";g.fillText(k,x,y+6);
+  g.fillStyle="#d7e2ee";g.font="13px sans-serif";g.fillText(MACH[k].name,x,y+62);}
+ for(const d of dkEl.querySelectorAll(".deck")){const x=parseFloat(d.style.left)*(c.width/innerWidth),y=parseFloat(d.style.top)*(c.height/(innerHeight-120));
+  g.fillStyle="rgba(13,20,32,.95)";g.strokeStyle=d.style.getPropertyValue("--bc")||"#38d6e6";g.lineWidth=1.5;
+  rr(g,x-92,y-48,184,96,10);g.fill();g.stroke();}
+ g.fillStyle="#6b7d94";g.font="12px sans-serif";g.textAlign="left";
+ g.fillText("AgentLink · 消息星图 · "+new Date().toLocaleString("zh-CN"),16,c.height-14);
+ return c;}
+function rr(g,x,y,w,h,r){g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,y+h,r);
+ g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath();}
+document.getElementById("bSnap").addEventListener("click",()=>{
+ const a=document.createElement("a");a.download="agentlink-starmap-"+Date.now()+".png";
+ a.href=canvasTwin().toDataURL("image/png");a.click();toast("已保存星图 PNG 快照");});
+document.getElementById("bRec").addEventListener("click",function(){
+ if(this._busy)return;this._busy=1;
+ document.getElementById("recdot").style.display="inline-block";
+ const dur=6,label=document.getElementById("reclabel");
+ const c=document.createElement("canvas");c.width=1920;c.height=1080;
+ const stream=c.captureStream(30);
+ let mr;try{mr=new MediaRecorder(stream,{mimeType:"video/webm"});}catch(e){toast("浏览器不支持录制");this._busy=0;return;}
+ const chunks=[];mr.ondataavailable=e=>chunks.push(e.data);
+ mr.onstop=()=>{const a=document.createElement("a");a.download="agentlink-starmap-"+Date.now()+".webm";
+  a.href=URL.createObjectURL(new Blob(chunks,{type:"video/webm"}));a.click();
+  document.getElementById("recdot").style.display="none";label.textContent="";
+  toast("已保存星图动态影像 webm（"+dur+"s）");that._busy=0;};
+ mr.start();
+ const g=c.getContext("2d");let t0=performance.now();
+ (function draw(){const el=(performance.now()-t0)/1000;
+  const src=canvasTwin();g.drawImage(src,0,0);
+  /* moving particles overlay */
+  for(const ch of svg.querySelectorAll(".chan")){const L=ch.getTotalLength();
+   const rev=ch.classList.contains("r");const tt=((rev?1-el/4:el/4)%1+1)%1;
+   const p=ch.getPointAtLength(L*tt);const x=p.x*(c.width/innerWidth),y=p.y*(c.height/(innerHeight-120));
+   g.fillStyle=ch.classList.contains("alarm")?"#ff5c7a":(rev?"#7fb0ff":"#38d6e6");
+   g.shadowColor=g.fillStyle;g.shadowBlur=10;g.beginPath();g.arc(x,y,5,0,7);g.fill();g.shadowBlur=0;}
+  g.fillStyle="rgba(255,92,122,"+(Math.sin(el*4)>0?".9":".3")+")";g.beginPath();g.arc(40,40,10,0,7);g.fill();
+  g.fillStyle="#ffd7de";g.font="16px monospace";g.textAlign="left";
+  g.fillText("REC "+(dur-Math.min(el,dur)).toFixed(1)+"s",60,46);
+  label.textContent=(dur-Math.min(el,dur)).toFixed(1)+"s";
+  if(el<dur&&!document.hidden)requestAnimationFrame(draw);else mr.stop();})();
+ const that=this;});
+/* ---- toast ---- */
+let toastIV=null;
+function toast(s){const t=document.getElementById("toast");t.textContent=s;t.style.display="block";
+ clearTimeout(toastIV);toastIV=setTimeout(()=>t.style.display="none",2600);}
+/* ---- fullscreen ---- */
+document.getElementById("bFull").addEventListener("click",()=>{
+ if(document.fullscreenElement)document.exitFullscreen();else document.documentElement.requestFullscreen();});
+/* ---- refresh guard: never rebuild decks while user is picking ---- */
+let lastMsgHash=0;
+function msgHash(){return TOPICS.reduce((s,t)=>s+t.msgs.length,0);}
+function liveRefresh(){setInterval(()=>{
+ if(msgHash()===lastMsgHash)return;lastMsgHash=msgHash();
+ const busy=dkEl.querySelector(".deck.open,.deck.pin")||
+  [...dkEl.querySelectorAll(".card")].some(c=>c.matches(":hover"));
+ if(busy){setTimeout(liveRefreshOne,1500);return;}
+ buildDecks(document.getElementById("win").value>=600?null:+document.getElementById("win").value);
+ hud();},8000);}
+function liveRefreshOne(){if(dkEl.querySelector(".deck.open,.deck.pin")){setTimeout(()=>liveRefreshOne(),1500);return;}
+ buildDecks(document.getElementById("win").value>=600?null:+document.getElementById("win").value);hud();}
+/* ---- keyboard ---- */
+addEventListener("keydown",ev=>{
+ if(ev.key==="Escape"){closeDetail();if(tour){clearInterval(tour);tour=null;document.getElementById("bTour").classList.remove("on");world.style.transform="";}}
+ if(detail.classList.contains("show")&&DT){
+  if(ev.key==="ArrowRight"){DT.mi=Math.min(DT.msgs.length-1,DT.mi+1);fill();}
+  if(ev.key==="ArrowLeft"){DT.mi=Math.max(0,DT.mi-1);fill();}}
+ if(ev.key.toLowerCase()==="f")document.getElementById("bFull").click();});
+addEventListener("resize",()=>{layout();renderStations();buildDecks(null);ensureReader();});
+/* boot */
+layout();renderStations();buildDecks(null);hud();winLbl(600);liveRefresh();requestAnimationFrame(loop);
+</script>
+</body>
+</html>

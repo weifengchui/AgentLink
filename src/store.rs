@@ -221,25 +221,449 @@ pub fn read_json_opt<T: DeserializeOwned>(path: &Path) -> Option<T> {
 
 // ---- conversation history ---------------------------------------------------
 
-/// Append one history entry (a JSON line) to `data_dir/<file>`, rotating the
-/// file to `<file>.1` (keeping exactly one archive) once it exceeds the cap.
-pub fn append_history(data_dir: &Path, file: &str, line: &str, max_mb: u64) {
+/// Sub-directory of `data_dir` that holds rolled-over conversation history.
+pub const HISTORY_ARCHIVE_DIR: &str = "history_archive";
+
+/// Append one history entry (a JSON line) to `data_dir/<file>`.
+///
+/// The active file is *rolled over*, never truncated: once it exceeds
+/// `max_mb`, or is older than `archive_days` days, it is moved into
+/// `history_archive/` with a timestamped name and a fresh active file is
+/// started. Conversation records are therefore never deleted by the node.
+pub fn append_history(data_dir: &Path, file: &str, line: &str, max_mb: u64, archive_days: u64) {
     let path = data_dir.join(file);
-    let cap = max_mb.max(1) * 1024 * 1024;
     if let Ok(meta) = path.metadata() {
-        if meta.len() >= cap {
-            let archive = format!("{file}.1");
-            let apath = data_dir.join(&archive);
-            let _ = std::fs::remove_file(&apath);
-            if std::fs::rename(&path, &apath).is_err() {
-                // Rotate failed: truncate instead of growing without bound.
-                let _ = std::fs::write(&path, "");
-            }
+        let cap = max_mb.max(1) * 1024 * 1024;
+        let by_age = archive_days > 0
+            && meta
+                .modified()
+                .ok()
+                .map(|m| {
+                    let secs = m
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    now_wall().saturating_sub(secs) >= (archive_days * 86_400) as i64
+                })
+                .unwrap_or(false);
+        if meta.len() >= cap || by_age {
+            let _ = rotate_history(data_dir, file);
         }
     }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
         let _ = f.write_all(b"\n");
+    }
+}
+
+/// Move the active history file into `history_archive/` as
+/// `history-YYYYMMDD-HHMMSS.jsonl`. Returns the archive file name.
+///
+/// A rename failure leaves the active file untouched (we prefer an oversized
+/// log over losing records); the next append retries.
+pub fn rotate_history(data_dir: &Path, file: &str) -> Option<String> {
+    let src = data_dir.join(file);
+    if !src.is_file() || src.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+        return None;
+    }
+    let adir = data_dir.join(HISTORY_ARCHIVE_DIR);
+    std::fs::create_dir_all(&adir).ok()?;
+    // Legacy single-archive scheme (`<file>.1`): fold it into the archive dir.
+    std::fs::rename(
+        data_dir.join(format!("{file}.1")),
+        adir.join("history-legacy.jsonl"),
+    )
+    .ok();
+    let now = OffsetDateTime::from(
+        std::fs::metadata(&src)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::now()),
+    );
+    let stem = format!(
+        "history-{:04}{:02}{:02}-{:02}{:02}{:02}.jsonl",
+        now.year(),
+        now.month() as u8,
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    );
+    let mut name = stem.clone();
+    let mut i = 1;
+    while adir.join(&name).exists() {
+        name = stem.replace(".jsonl", &format!("-{i}.jsonl"));
+        i += 1;
+    }
+    let dst = adir.join(&name);
+    std::fs::rename(&src, &dst).ok()?;
+    let _ = std::fs::File::create(src); // start the new active file
+    Some(name)
+}
+
+/// Prune archives down to `keep` newest files (keep = 0 means keep everything —
+/// the node never throws conversation records away unless the operator opts in).
+pub fn prune_archives(data_dir: &Path, keep: usize) -> usize {
+    if keep == 0 {
+        return 0;
+    }
+    let mut files = list_archives(data_dir);
+    files.retain(|f| {
+        f.get("name")
+            .and_then(|v| v.as_str())
+            .map(|n| !n.starts_with("export-"))
+            .unwrap_or(true)
+    });
+    let excess = files.len().saturating_sub(keep);
+    for doomed in files.into_iter().take(excess) {
+        if let Some(n) = doomed.get("name").and_then(|v| v.as_str()) {
+            let _ = std::fs::remove_file(data_dir.join(HISTORY_ARCHIVE_DIR).join(n));
+        }
+    }
+    excess
+}
+
+/// Archive files (oldest first) as `{name, bytes, mtime}` objects.
+pub fn list_archives(data_dir: &Path) -> Vec<serde_json::Value> {
+    let adir = data_dir.join(HISTORY_ARCHIVE_DIR);
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&adir) else {
+        return out;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".jsonl") {
+            continue;
+        }
+        let Ok(m) = ent.metadata() else { continue };
+        let mt = m
+            .modified()
+            .ok()
+            .map(|t| {
+                let d = OffsetDateTime::from(t);
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    d.year(),
+                    d.month() as u8,
+                    d.day(),
+                    d.hour(),
+                    d.minute(),
+                    d.second()
+                )
+            })
+            .unwrap_or_default();
+        out.push(serde_json::json!({ "name": name, "bytes": m.len(), "mtime": mt }));
+    }
+    out.sort_by(|a, b| a["mtime"].as_str().cmp(&b["mtime"].as_str()));
+    out
+}
+
+/// Filters for `history_search` (all optional; empty string = match anything).
+#[derive(Debug, Clone, Default)]
+pub struct HistSearch {
+    /// sender: node id / name / IP or agent id (substring, case-insensitive)
+    pub from: String,
+    /// receiver, same semantics as `from`
+    pub to: String,
+    /// matches either side
+    pub who: String,
+    pub direction: String,
+    pub kind: String,
+    /// substring of the JSON payload
+    pub q: String,
+    /// UTC ISO-8601 bounds, compared on the first 19 characters
+    pub since: String,
+    pub until: String,
+    pub limit: usize,
+    /// total bytes to scan before giving up (newest-first, so recent hits stay cheap)
+    pub max_bytes: u64,
+    /// also scan archive files (newest archive first)
+    pub scope_all: bool,
+}
+
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    hay.to_lowercase().contains(needle)
+}
+
+/// Stream-scan the history JSONL newest-first with filters. Files are read
+/// backwards in 512 KiB chunks, so a filtered query against a multi-GB log
+/// answers as soon as `limit` matches are found near the tail. Read-only —
+/// never touches the files. `stopped` says why scanning ended:
+/// `"eof" | "limit" | "budget" | "older"` (walked past `since`).
+pub fn history_search(data_dir: &Path, file: &str, f: &HistSearch) -> serde_json::Value {
+    let norm19 = |s: &str| -> String { s.chars().take(19).collect() };
+    let since = norm19(&f.since);
+    let until = norm19(&f.until);
+    let (q_from, q_to) = (f.from.to_lowercase(), f.to.to_lowercase());
+    let (q_who, q_dir) = (f.who.to_lowercase(), f.direction.to_lowercase());
+    let (q_kind, q_q) = (f.kind.to_lowercase(), f.q.to_lowercase());
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut scanned: u64 = 0;
+    let mut stopped = "eof";
+
+    let mut paths: Vec<PathBuf> = vec![data_dir.join(file)];
+    if f.scope_all {
+        for a in list_archives(data_dir).into_iter().rev() {
+            if let Some(n) = a["name"].as_str() {
+                paths.push(data_dir.join(HISTORY_ARCHIVE_DIR).join(n));
+            }
+        }
+    }
+
+    let mut handle = |line: &str| -> bool {
+        // Returns false when scanning must stop (limit reached / older than since).
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return true; // not JSON (legacy raw line): ignore for structured search
+        };
+        let ts = norm19(v["ts"].as_str().unwrap_or(""));
+        if !until.is_empty() && ts.as_str() > until.as_str() {
+            return true; // newer than the window, keep walking backwards
+        }
+        if !since.is_empty() && !ts.is_empty() && ts.as_str() < since.as_str() {
+            stopped = "older";
+            return false; // everything further back is older still
+        }
+        let fr = v["from"].as_str().unwrap_or("");
+        let fa = v["from_agent"].as_str().unwrap_or("");
+        let tto = v["to"].as_str().unwrap_or("");
+        let ta = v["to_agent"].as_str().unwrap_or("");
+        let mfrom = q_from.is_empty() || contains_ci(fr, &q_from) || contains_ci(fa, &q_from);
+        let mto = q_to.is_empty() || contains_ci(tto, &q_to) || contains_ci(ta, &q_to);
+        let mwho = q_who.is_empty()
+            || contains_ci(fr, &q_who)
+            || contains_ci(fa, &q_who)
+            || contains_ci(tto, &q_who)
+            || contains_ci(ta, &q_who);
+        let mdir = q_dir.is_empty() || v["direction"].as_str().unwrap_or("") == q_dir;
+        let mkind = q_kind.is_empty() || v["kind"].as_str().unwrap_or("") == q_kind;
+        let mq = q_q.is_empty() || contains_ci(&v["payload"].to_string(), &q_q);
+        if mfrom && mto && mwho && mdir && mkind && mq {
+            out.push(v);
+            if out.len() >= f.limit {
+                stopped = "limit";
+                return false;
+            }
+        }
+        true
+    };
+
+    'files: for path in &paths {
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        let mut pos = meta.len();
+        if pos == 0 {
+            continue;
+        }
+        // `carry` = bytes of a line whose head lies further LEFT (older); it is
+        // joined with the previous chunk's tail on the next iteration.
+        let mut carry: Vec<u8> = Vec::new();
+        loop {
+            if pos == 0 {
+                if !carry.is_empty() {
+                    let s = String::from_utf8_lossy(&carry).trim().to_string();
+                    if !s.is_empty() && !handle(&s) {
+                        break 'files;
+                    }
+                }
+                break;
+            }
+            let n = pos.min(1 << 19);
+            pos -= n;
+            let mut buf = vec![0u8; n as usize];
+            let mut fh = match File::open(path) {
+                Ok(x) => x,
+                Err(_) => break,
+            };
+            if fh.seek(SeekFrom::Start(pos)).is_err() || fh.read_exact(&mut buf).is_err() {
+                break;
+            }
+            scanned += n;
+            if scanned > f.max_bytes {
+                stopped = "budget";
+                break 'files;
+            }
+            if !carry.is_empty() {
+                buf.extend_from_slice(&carry);
+            }
+            carry.clear();
+            let parts: Vec<&[u8]> = buf.split(|b| *b == b'\n').collect();
+            if parts.len() == 1 {
+                carry = buf; // window sits inside one enormous line
+                continue;
+            }
+            // last piece is terminated (by the newline that opened `carry`, or EOF)
+            let last = parts[parts.len() - 1];
+            if !last.is_empty() {
+                let s = String::from_utf8_lossy(last).trim().to_string();
+                if !s.is_empty() && !handle(&s) {
+                    break 'files;
+                }
+            }
+            let hi = parts.len() - 2;
+            let lo = if pos > 0 { 1 } else { 0 };
+            for i in (lo..=hi).rev() {
+                if parts[i].is_empty() {
+                    continue;
+                }
+                let s = String::from_utf8_lossy(parts[i]).trim().to_string();
+                if !s.is_empty() && !handle(&s) {
+                    break 'files;
+                }
+            }
+            if pos > 0 {
+                carry = parts[0].to_vec();
+            }
+        }
+    }
+
+    serde_json::json!({
+        "ok": true,
+        "count": out.len(),
+        "matches": out,
+        "scanned_bytes": scanned,
+        "stopped": stopped,
+        "limit": f.limit,
+    })
+}
+
+/// Identity colors for the web console:
+/// `{ "node:<id>": "#rrggbb", "agent:<node>|<agent>": "#rrggbb" }`.
+/// Missing keys fall back to a stable hash color computed in the browser, so
+/// the console is colorful with zero configuration; overrides persist on the
+/// node and are shared by every viewer.
+pub const COLORS_FILE: &str = "colors.json";
+
+pub fn load_colors(data_dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read(data_dir.join(COLORS_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+pub fn save_colors(
+    data_dir: &Path,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> std::io::Result<()> {
+    write_json_atomic(
+        &data_dir.join(COLORS_FILE),
+        &serde_json::Value::Object(map.clone()),
+    )
+}
+
+/// Size/footprint summary for the web console (metadata only — cheap).
+pub fn history_stats(
+    data_dir: &Path,
+    file: &str,
+    max_mb: u64,
+    archive_days: u64,
+    archive_keep: usize,
+) -> serde_json::Value {
+    let active = data_dir.join(file);
+    let active_bytes = std::fs::metadata(&active).map(|m| m.len()).unwrap_or(0);
+    let archives = list_archives(data_dir);
+    let archive_bytes: u64 = archives.iter().filter_map(|a| a["bytes"].as_u64()).sum();
+    serde_json::json!({
+        "file": file,
+        "active_bytes": active_bytes,
+        "rotate_mb": max_mb,
+        "archive_days": archive_days,
+        "archive_keep": archive_keep,
+        "archive_dir": data_dir.join(HISTORY_ARCHIVE_DIR).to_string_lossy(),
+        "archives": archives,
+        "archive_count": archives.len(),
+        "archive_bytes": archive_bytes,
+        "total_bytes": active_bytes + archive_bytes,
+    })
+}
+
+/// Files to export, oldest first: every archive, then the active file.
+pub fn history_export_files(data_dir: &Path, file: &str, scope: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    match scope {
+        "active" => out.push(data_dir.join(file)),
+        other if other.starts_with("archive:") => {
+            if let Some(name) = crate::file::sanitize_name(&other[8..]) {
+                let p = data_dir.join(HISTORY_ARCHIVE_DIR).join(name);
+                if p.is_file() {
+                    out.push(p);
+                }
+            }
+        }
+        _ => {
+            for a in list_archives(data_dir) {
+                if let Some(n) = a["name"].as_str() {
+                    let p = data_dir.join(HISTORY_ARCHIVE_DIR).join(n);
+                    if p.is_file() {
+                        out.push(p);
+                    }
+                }
+            }
+            out.push(data_dir.join(file));
+        }
+    }
+    out.retain(|p| p.is_file());
+    out
+}
+
+/// Render one history JSONL line as a readable text line. Falls back to the
+/// raw line when it cannot be parsed (an export must never drop records).
+pub fn history_line_to_text(line: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return line.to_string();
+    };
+    let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
+    let ts = s("ts");
+    let when: String = ts
+        .strip_suffix('Z')
+        .map(|t| t.replace('T', " ").chars().take(19).collect())
+        .unwrap_or(ts.clone());
+    let dirv = s("direction");
+    let dir = match dirv.as_str() {
+        "in" => "收",
+        "out" => "发",
+        "local" => "本",
+        other => other,
+    };
+    let mut who = format!("{} → {}", short_node(&s("from")), short_node(&s("to")));
+    let fa = s("from_agent");
+    let ta = s("to_agent");
+    if !fa.is_empty() || !ta.is_empty() {
+        who.push_str(&format!(
+            " [{} → {}]",
+            if fa.is_empty() { "-" } else { &fa },
+            if ta.is_empty() { "-" } else { &ta }
+        ));
+    }
+    let body = match s("kind").as_str() {
+        "file" => {
+            let name = v["payload"]["file_name"].as_str().unwrap_or("?");
+            let size = v["payload"]["size"].as_u64().unwrap_or(0);
+            format!("📎 {name} ({size} B)")
+        }
+        _ => {
+            let c = v["payload"]["content"].as_str();
+            match c {
+                Some(t) => t.replace('\n', " ⏎ "),
+                None => v["payload"].to_string(),
+            }
+        }
+    };
+    let id = s("msg_id");
+    format!(
+        "{when} [{dir}] {who} | {body} | #{}",
+        &id[..id.len().min(8)]
+    )
+}
+
+fn short_node(raw: &str) -> String {
+    if raw.is_empty() {
+        return "*".into();
+    }
+    if raw.len() <= 12 {
+        raw.to_string()
+    } else {
+        raw.chars().take(12).collect()
     }
 }
 

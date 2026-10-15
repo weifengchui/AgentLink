@@ -139,9 +139,18 @@ pub struct HistoryConfig {
     /// conversation view survives restarts. Empty string disables it.
     #[serde(default = "default_history_file")]
     pub file: String,
-    /// Rotate the history file to `<file>.1` once it exceeds this size.
+    /// Rotate the active file once it exceeds this many MB.
     #[serde(default = "default_history_max_mb")]
     pub max_file_mb: u64,
+    /// Also roll the active file over once it is older than this many days
+    /// (0 = size-based rollover only). Rolled files move to `history_archive/`
+    /// and are never deleted.
+    #[serde(default = "default_history_archive_days")]
+    pub archive_days: u64,
+    /// Keep at most this many archive files; 0 (default) keeps every archive.
+    /// Set > 0 only if you deliberately want the node to discard oldest records.
+    #[serde(default)]
+    pub archive_keep: usize,
 }
 
 /// Web UI / browser behaviour.
@@ -255,7 +264,13 @@ fn default_history_file() -> String {
     "history.jsonl".to_string()
 }
 fn default_history_max_mb() -> u64 {
-    16
+    // Active file rolls into history_archive/ at 1 GiB; the console warns as
+    // it approaches that size. Nothing is ever deleted by default.
+    1024
+}
+fn default_history_archive_days() -> u64 {
+    // Periodic rollover so a quiet node still archives regularly.
+    7
 }
 fn default_agent_stale_ttl() -> u64 {
     3600
@@ -268,6 +283,8 @@ impl Default for HistoryConfig {
             len: default_history_len(),
             file: default_history_file(),
             max_file_mb: default_history_max_mb(),
+            archive_days: default_history_archive_days(),
+            archive_keep: 0,
         }
     }
 }
