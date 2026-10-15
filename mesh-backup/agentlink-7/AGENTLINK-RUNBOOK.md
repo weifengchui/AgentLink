@@ -39,3 +39,10 @@
 - 看门狗 cron `agentlink-watchdog`（fd502509df0a，*/5m，no_agent）：查节点/桥/webhook/积压，异常自动拉起并报告，健康零输出
 - 记忆备份 cron `memory-backup`（本文件配套，*/60m）：MEMORY.md+roster.md+本手册 hash 变化才快照，留 30 份于 /home/yxf/.agentlink/backups/doc/
 - 教训（工具坑）：memory replace 会顶掉整条 entry，改局部须全文合并重写；HOME 在 wake 会话被重定向，桥文件一律绝对路径；本手册即防丢镜像，重要记忆变更后应落文档
+
+## 七、互备与 API 新坑（10-15 晚实测）
+- 网格互备：本 RUNBOOK 已 send-file 存证 .50/.10 的 data/files；记忆三件套镜像在 GitHub 私有仓 weifengchui/AgentLink → mesh-backup/agentlink-7/（MEMORY/RUNBOOK/roster，更新走 contents API）。
+- **节点 REST 鉴权头 = `X-Auth-Token: <agentlink.json local_api.token>`**（不是 X-AgentLink-Token）。
+- **send-file = JSON body**：`POST /v1/send-file {"to":"<node_id>","file_path":"<Windows 绝对路径>"}`；节点是 Windows exe，file_path 须 `C:\...` 形态（WSL 文件先拷 /mnt/c 可见区）；完成不推送，轮询 /v1/status active_transfers=0。
+- **节点 /v1/send 字段苛刻**（要求 action/type 等，文档示例勿照抄）——发通知一律走自家桥 `:8643/send {to,to_agent,from_agent,kind,content}`（已验证 ok）。
+- git clone 用 gho_ token 报"Password authentication not supported"，**REST contents API PUT 可写**（GET 取 sha→PUT 带 sha 更新），GitHub 同步用 API 不走 git。
