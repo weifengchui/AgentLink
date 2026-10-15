@@ -168,6 +168,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/config", get(config_get).put(config_put))
         .route("/web", get(web_page))
         .route("/v1/web", get(web_page))
+        .route("/v1/starmap", get(starmap_page))
         .route("/web/setup", get(web_setup))
         .route("/v1/ws", get(subscribe_ws))
         .route("/peer/ws", get(peer_ws))
@@ -1290,6 +1291,19 @@ async fn web_page(State(state): State<SharedState>) -> Response {
         .into_response()
 }
 
+/// 消息星图（v0.4.16）：总览页 iframe 嵌入；数据源 /v1/history/search + 拓扑接口。
+async fn starmap_page() -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert("Cache-Control", "no-store".parse().unwrap());
+    headers.insert("Pragma", "no-cache".parse().unwrap());
+    (
+        StatusCode::OK,
+        headers,
+        Html(include_str!("../web/starmap.html")),
+    )
+        .into_response()
+}
+
 fn web_html(history_len: usize) -> String {
     const HTML: &str = r#"<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1432,13 +1446,10 @@ th.srt:hover{color:#dbe2ea}
         <div class="m"><div class="k">传输中</div><div class="v" id="m-transfer">0</div></div>
         <div class="m"><div class="k">版本</div><div class="v" id="m-version">—</div></div>
       </div>
-      <div class="card"><h2>快捷发送</h2>
-        <div class="row"><span class="lbl">目标</span><select id="to"></select></div>
-        <div class="row"><textarea id="payload" rows="2" placeholder='{"content":"你好"}　可只发附件；在框内 Ctrl+V 可直接贴图'></textarea></div>
-        <div class="dz" id="dz">📎 拖拽文件或文件夹到此　·　<button type="button" class="lk" onclick="el('file').click()">选文件</button>　·　<button type="button" class="lk" onclick="el('dir').click()">选目录（自动打包 zip）</button><input type="file" id="file" class="hide-in" multiple><input type="file" id="dir" class="hide-in" webkitdirectory multiple></div>
-        <div class="row"><button class="primary" onclick="doSendAll()">发送</button><span id="attinfo"></span></div>
-        <div class="row" id="quick-targets"></div>
-        <div id="sendres" class="hint"></div>
+      <div class="card"><h2>消息星图　<span class="hint">只画真实消息：悬停/点选节点、agent、消息卡片时，仅显示相关连线与目的地</span></h2>
+        <div class="row"><button onclick="const f=el('sm-fr');if(f&&f.requestFullscreen)f.requestFullscreen()">全屏面板</button><span class="hint">5 秒自动刷新 · 双击卡片浏览整个话题链 · Esc 退出全屏</span></div>
+        <iframe id="sm-fr" src="/v1/starmap" title="消息星图" style="width:100%;height:72vh;min-height:540px;border:1px solid #1c2b40;border-radius:12px;background:#04070d"></iframe>
+      </div>
       </div>
       <div class="card"><h2>最近对话（总览 · 分页与查询）</h2>
         <div class="row"><input id="ov-kw" placeholder="搜索：内容 / 节点 / agent…" style="flex:2" oninput="ovGo(1)">
@@ -1828,7 +1839,7 @@ async function refresh(){
   for(const a of AGENTS)opn+=`<option value="agent:${esc(a.node_id)}:${esc(a.agent_id)}">${esc(a.node_name||a.node_id)} · ${esc(a.agent_id)}${a.online?'':'（离线）'}</option>`;
   opn+='</optgroup>';
   if(!sel&&opn!==LAST.op){LAST.op=opn;
-    [el('to'),el('to2')].forEach(x=>{const c=x.value;x.innerHTML=opn;if(c&&[...x.options].some(o=>o.value===c))x.value=c;});}
+    [el('to'),el('to2')].forEach(x=>{if(!x)return;const c=x.value;x.innerHTML=opn;if(c&&[...x.options].some(o=>o.value===c))x.value=c;});}
   HIST=hist&&hist.ok?hist.history.slice():[];
   if(!sel&&histSig()!==LAST.hi){LAST.hi=histSig();ovGo(OV.page);chGo(CH.page);}
   let qt='';

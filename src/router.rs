@@ -157,6 +157,11 @@ pub struct HistoryEntry {
     pub to_agent: Option<String>,
     pub kind: String,
     pub action: String,
+    /// Reply chain link: msg_id of the message this one answers (if any).
+    /// Used by the console star-map to group messages into topics. Absent in
+    /// history lines written before v0.4.16 (serde default = None).
+    #[serde(default)]
+    pub reply_to: Option<String>,
     #[serde(default)]
     pub payload: serde_json::Value,
 }
@@ -410,6 +415,7 @@ impl Router {
             to_agent: env.to_agent,
             kind: env.kind,
             action: env.action,
+            reply_to: env.reply_to,
             payload: env.payload,
         })
     }
@@ -1066,6 +1072,7 @@ impl Router {
             to_agent: env.to_agent.clone(),
             kind: env.kind.clone(),
             action: env.action.clone(),
+            reply_to: env.reply_to.clone(),
             payload: env.payload.clone(),
         };
         self.push_history(entry);
@@ -1127,6 +1134,7 @@ impl Router {
             to_agent: None,
             kind: "file".to_string(),
             action: "file".to_string(),
+            reply_to: None,
             payload: serde_json::json!({
                 "file_name": file_name,
                 "size": size,

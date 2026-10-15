@@ -19,6 +19,10 @@
 > `AgentLink.vbs` 隐藏窗口启动脚本（无需管理员），`启动.bat` 双击时自动静默注册；
 > `run --no-open` 后台拉起不弹浏览器。Linux 侧仍用 `deploy/install-systemd.sh`。
 >
+> v0.4.16：总览页重构——快捷发送面板移除，替换为「消息星图」全屏面板（`/v1/starmap` iframe）；
+> 对话消息按话题链可视化，悬停/点选节点、agent、消息卡片只显示相关连线与目的地；
+> 历史记录条目新增 `reply_to` 透传，`/v1/history/search` 返回回复链元数据。
+>
 > v0.4.10：数据目录默认外置（Windows `%LOCALAPPDATA%\AgentLink\data`、Linux `~/.local/share/agentlink`），
 > 不再放软件目录里以免升级覆盖；`agentlink.json` 的 `data_dir` 可按机器各自改为绝对路径，
 > 相对路径以配置文件目录为基准。发布包新增 `SKILL-agent-registration.md`（Agent 上线注册技能，
@@ -85,6 +89,7 @@ curl -H 'X-Auth-Token: <local token>' http://127.0.0.1:8765/v1/peers
 | GET | `/v1/fleet/agents` | `X-Auth-Token` | 全网 Agent 目录（节点间自动同步） |
 | GET/PUT | `/v1/config` | `X-Auth-Token` | 查看/修改配置（掩码显示；名称/标签即时生效） |
 | GET | `/v1/history` | `X-Auth-Token` | 最近对话记录（环形缓冲） |
+| GET | `/v1/starmap` | 无需令牌（HTML 页） | 消息星图全屏页：总览内嵌 iframe 同源展示，数据源 /v1/history/search + 拓扑接口（v0.4.16+） |
 | GET | `/v1/history/stats` | `X-Auth-Token` | 对话记录体积统计（活动/归档/合计、滚动阈值，v0.4.15+） |
 | GET | `/v1/history/export?format=json\|text&scope=all\|active\|archive:<名>` | `X-Auth-Token` | 导出对话记录（带下载名；只读，不动源文件，v0.4.15+） |
 | GET | `/v1/history/search?from=&to=&who=&direction=&kind=&q=&since=&until=&limit=&max_mb=&scope=` | `X-Auth-Token` | 对话记录检索：按收发方/方向/类型/关键词/时间过滤（v0.4.15+） |

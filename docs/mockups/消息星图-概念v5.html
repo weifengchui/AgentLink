@@ -348,9 +348,10 @@ function lightLink(key){const p=map.querySelector(`[data-k="${CSS.escape(key)}"]
  p.classList.add("lit");setTimeout(()=>p.classList.remove("lit"),1200);}
 let hovAgt=null,hovSta=null,gTopic=null,pinC=null;
 function applyLanes(){const agts=new Set(),stas=new Set(),tps=new Set();
- if(hovAgt)agts.add(hovAgt);if(hovSta)stas.add(hovSta);
- if(pinC){if(pinC.t==="agt")agts.add(pinC.k);else stas.add(pinC.k);}
- if(gTopic)tps.add(gTopic);if(VT)tps.add(VT.tp.id);
+ if(gTopic||VT){/* card/viewer focus: ONLY the relevant topic lanes + endpoints */
+  if(gTopic)tps.add(gTopic);if(VT)tps.add(VT.tp.id);}
+ else{if(hovAgt)agts.add(hovAgt);if(hovSta)stas.add(hovSta);
+  if(pinC){if(pinC.t==="agt")agts.add(pinC.k);else stas.add(pinC.k);}}
  const glow=new Set();
  for(const l of map.querySelectorAll(".lk:not(.temp)")){
   const pk=l.getAttribute("data-k").split("#"),ends=pk[0].split("=>"),tpId=pk[1];
@@ -463,10 +464,10 @@ function posDwrap(k){const dw=dwraps[k];const p=agPos(k);
   sol={x,t}}
  dw.style.left=sol.x+"px";dw.style.top=sol.t+"px";}
 function setDeckOpen(k,open){if(!dwraps[k]||dwraps[k].style.display==="none")return;
- deckOpen[k]=open;hlLinks(k,open);layoutDeck(k);}
+ deckOpen[k]=open;layoutDeck(k);}
 function reveal(k){const dw=dwraps[k];cancelTomb(k);
  buildDeck(k);if(dw.style.display!=="block"){if(!dw.querySelector(".gcard"))return;}
- dw.dataset.vis="1";dw.style.display="block";deckOpen[k]=false;hlLinks(k,true);layoutDeck(k);}
+ dw.dataset.vis="1";dw.style.display="block";deckOpen[k]=false;layoutDeck(k);}
 function renderAllDecks(){for(const k in dwraps)buildDeck(k);}
 /* ---------- viewer (big card) ---------- */
 const mask=document.getElementById("mask"),viewer=document.getElementById("viewer");
