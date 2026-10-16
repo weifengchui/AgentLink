@@ -178,6 +178,34 @@ def main():
         check("S4c 视图无 ctrl/heartbeat",
               all(e["frame"]["kind"] not in ("ctrl", "event") for e in evT["events"]))
 
+        # S8 能力查询（§3）：requires 过滤 + node_addr
+        api("/v1/agents", {"agent_id": "capholder", "name": "capholder",
+                           "capabilities": ["cap:node:*", "cap:edit:py"]})
+        api("/v1/agents", {"agent_id": "plainjoe", "name": "plainjoe",
+                           "capabilities": ["cap:edit:js"]})
+        # online 标志来自 WS 订阅（client=agent_id），保持连接才算在线
+        holders = []
+        for cid in ("capholder", "plainjoe", "recv"):
+            w = websocket.WebSocket()
+            w.connect(BASE.replace("http://", "ws://") + f"/v1/ws?token={TOKEN}&client={cid}")
+            holders.append(w)
+        time.sleep(0.3)
+        s2, fa = api("/v1/fleet/agents?requires=cap:node:reboot,cap:edit:py")
+        ids = [a["agent_id"] for a in fa.get("agents", []) if a.get("online")]
+        check("S8a requires 命中通配+精确",
+              s2 == 200 and "capholder" in ids and "plainjoe" not in ids,
+              json.dumps(fa)[:200])
+        s2, fa2 = api("/v1/fleet/agents?requires=cap:db:dump")
+        ids2 = [a["agent_id"] for a in fa2.get("agents", []) if a.get("online")]
+        check("S8b 无能力则空", "capholder" not in ids2 and "plainjoe" not in ids2, json.dumps(fa2)[:200])
+        s2, fa3 = api("/v1/fleet/agents")
+        holder = [a for a in fa3.get("agents", []) if a["agent_id"] == "capholder"]
+        check("S8c 无 requires 保留全量视图 + node_addr",
+              holder and holder[0].get("node_addr", "").startswith("127.0.0.1:18766"),
+              json.dumps(holder)[:200])
+        for w in holders:
+            w.close()
+
         # S5 环满 → 409
         for i in range(6):
             send_text(f"rotation flood {i}")

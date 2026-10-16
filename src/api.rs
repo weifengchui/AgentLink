@@ -593,23 +593,58 @@ async fn agents_get(State(state): State<SharedState>, headers: HeaderMap) -> imp
 }
 
 /// List agents across the whole LAN fleet (local + synced from peers).
-async fn fleet_agents(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+#[derive(serde::Deserialize)]
+struct FleetAgentsQuery {
+    #[serde(default)]
+    requires: Option<String>,
+}
+
+async fn fleet_agents(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(q): Query<FleetAgentsQuery>,
+) -> impl IntoResponse {
     if !authorized(&state, &headers) {
         return unauthorized();
     }
     let mut names: HashMap<String, String> = HashMap::new();
+    let mut addrs: HashMap<String, String> = HashMap::new();
     for p in state.peers.snapshot() {
         names.insert(p.node_id.clone(), p.name.clone());
+        addrs.insert(p.node_id.clone(), p.addr.clone());
     }
     names.insert(state.config.node_id.clone(), state.display_name());
+    addrs.insert(
+        state.config.node_id.clone(),
+        format!("127.0.0.1:{}", state.config.listen_port),
+    );
     // Ghost guard: an agent can only be online if its NODE is online. Remote
     // agent caches used to keep `online:true` forever after the owner node
     // went away (new identity/reboot), confusing the fleet view.
     let node_online = |nid: &str| nid == state.config.node_id || state.peers.is_online(nid);
+    // v0.5 kernel list §3: optional capability query (open-source = query only,
+    // no scheduling). `?requires=cap:node:reboot,cap:edit:py` keeps only ONLINE
+    // agents whose capabilities satisfy every requirement (hierarchical,
+    // trailing `*` wildcard — see router::cap_matches).
+    let requires: Vec<String> = q
+        .requires
+        .as_deref()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_default();
     let agents: Vec<serde_json::Value> = state
         .router
         .fleet_agents()
         .iter()
+        .filter(|a| {
+            requires.is_empty()
+                || (a.online
+                    && node_online(&a.node_id)
+                    && requires.iter().all(|need| {
+                        a.capabilities
+                            .iter()
+                            .any(|have| crate::router::cap_matches(have, need))
+                    }))
+        })
         .map(|a| {
             let mut v = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
             if let serde_json::Value::Object(m) = &mut v {
@@ -624,13 +659,17 @@ async fn fleet_agents(State(state): State<SharedState>, headers: HeaderMap) -> i
                         .cloned()
                         .unwrap_or_else(|| a.node_id.clone())),
                 );
+                m.insert(
+                    "node_addr".to_string(),
+                    serde_json::json!(addrs.get(&a.node_id).cloned().unwrap_or_default()),
+                );
             }
             v
         })
         .collect();
     (
         StatusCode::OK,
-        Json(json!({ "ok": true, "agents": agents })),
+        Json(json!({ "ok": true, "agents": agents, "requires": requires })),
     )
 }
 

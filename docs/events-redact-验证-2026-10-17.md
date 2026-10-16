@@ -24,6 +24,11 @@
 | S5 环满（len=4）后 `since` 落后 → **409** + `oldest_seq` + 重建提示 | PASS | §1 降级路径 |
 | S6 重启后 seq 从磁盘 history 恢复续传（水位不回退、环内 seq 单调） | PASS | §1 重启不丢序 |
 | S7 `redact.enabled=false` 观察者拿原文（配置回退） | PASS | §2 可配置 |
+| S8a `?requires=cap:node:reboot,cap:edit:py` 只留在满足全部能力的在线 agent（`cap:node:*` 分层通配命中） | PASS | §3 能力查询 |
+| S8b 无人满足 `cap:db:dump` → 空列表 | PASS | §3 全满足语义 |
+| S8c 无 `requires` 保留原全量视图；带 `node_addr` 供跨机执行寻址 | PASS | §3 兼容性 |
+
+（S8 注：`online` 以 WS 订阅为准，测试用真实 WS 连接验证；实现见 `router::cap_matches` + `api::fleet_agents` requires 过滤，含 1 组能力匹配单测。）
 
 复跑方法：`cargo build --bin agentlink && python3 scripts/events-smoke.py <target>/debug/agentlink`（自带隔离节点起停与清理，端口 18766）。
 

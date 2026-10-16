@@ -140,6 +140,41 @@ pub struct AgentRecord {
     pub last_seen: i64,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::cap_matches;
+
+    #[test]
+    fn cap_exact_and_wildcard() {
+        assert!(cap_matches("cap:node:reboot", "cap:node:reboot"));
+        assert!(cap_matches("cap:node:*", "cap:node:reboot"));
+        assert!(!cap_matches("cap:node:reboot", "cap:node:*"));
+        assert!(cap_matches("cap:node:*", "cap:node:admin:deep"));
+        assert!(!cap_matches("cap:edit:py", "cap:edit:js"));
+        assert!(!cap_matches("cap:node", "cap:node:reboot"));
+        assert!(cap_matches("*", "cap:whatever:x"));
+    }
+}
+
+/// Capability string matching (v0.5 kernel list §3). Capability grammar:
+/// `cap:<domain>:<action>[:...]`, colon-hierarchical. A held capability may
+/// end with a `*` segment that wildcards everything below it
+/// (`cap:node:*` satisfies `cap:node:reboot`). A bare `*` satisfies anything.
+/// Scheduling/matching policy itself is the AgentMesh paid layer; the core
+/// only answers "which online agents satisfy the requirement".
+pub fn cap_matches(have: &str, need: &str) -> bool {
+    if have == need || have == "*" {
+        return true;
+    }
+    let mut seg_h: Vec<&str> = have.split(':').collect();
+    if seg_h.last().copied() != Some("*") {
+        return false;
+    }
+    seg_h.pop();
+    let seg_n: Vec<&str> = need.split(':').collect();
+    seg_h.len() <= seg_n.len() && seg_n.starts_with(&seg_h)
+}
+
 /// One history entry for the human view (`/web`, `/v1/history`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
