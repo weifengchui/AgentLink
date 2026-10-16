@@ -1314,17 +1314,33 @@ fn web_html(history_len: usize) -> String {
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;background:#0b0e14;color:#dbe2ea;font-size:13px}
 a{color:#4f8cff;text-decoration:none}
 .hidden{display:none!important}
-#app{display:grid;grid-template-columns:220px 1fr;min-height:100vh}
+#app{display:grid;grid-template-columns:var(--sw,220px) 8px 1fr;min-height:100vh}
 #sidebar{background:#0e1219;border-right:1px solid #1c2330;padding:16px 12px;position:sticky;top:0;height:100vh;overflow:auto}
 #logo{display:flex;align-items:center;gap:8px;padding:4px 8px 14px;font-weight:700;font-size:15px;letter-spacing:.2px}
 #logo .dot{width:10px;height:10px;border-radius:50%;background:#4f8cff;box-shadow:0 0 10px #4f8cff}
 #sidebar .nav{margin:2px 0;padding:8px 10px;border-radius:8px;cursor:pointer;color:#9aa7b8;display:flex;align-items:center;gap:8px}
 #sidebar .nav:hover{background:#141b26;color:#e6edf5}
 #sidebar .nav.active{background:#16233b;color:#7fb0ff}
+/* R5（10-16 第四轮）：侧栏拖拽把手（拖动调宽 · 单击折叠/展开）与折叠态 */
+#side-resize{cursor:col-resize;display:flex;align-items:center;justify-content:center;position:relative;z-index:6}
+#side-resize::before{content:"";position:absolute;top:0;bottom:0;left:3px;width:1px;background:transparent;transition:background .18s,box-shadow .18s}
+#side-resize:hover::before{background:#4f8cff;box-shadow:0 0 8px rgba(79,140,255,.9)}
+.rz-ic{width:5px;height:30px;border-radius:3px;background:#2a3547;transition:height .22s,background .22s,box-shadow .22s}
+#side-resize:hover .rz-ic{height:52px;background:#4f8cff;box-shadow:0 0 12px rgba(79,140,255,.85);animation:rzp 1.1s ease-in-out infinite alternate}
+@keyframes rzp{from{transform:scaleY(1)}to{transform:scaleY(1.16)}}
+#sidebar .ful{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+#sidebar .sho{display:none}
+#sidebar.coll .ful,#sidebar.coll #logo .lgn,#sidebar.coll .ver-badge{display:none}
+#sidebar.coll .sho{display:inline}
+#sidebar.coll .nav{justify-content:center;font-size:14px;padding:8px 0;gap:0}
+#sidebar.coll #logo{justify-content:center;padding-left:0;padding-right:0;gap:0}
 #main{display:flex;flex-direction:column;min-width:0}
 #topbar{display:flex;align-items:center;gap:14px;padding:12px 20px;border-bottom:1px solid #1c2330;position:sticky;top:0;background:rgba(11,14,20,.92);backdrop-filter:blur(6px);z-index:5}
 #topbar .t{font-weight:600}
 #topbar .sub{color:#7d8aa0;font-size:12px}
+/* R6（10-16 第四轮）：顶栏合并为一条全局状态栏，统计胶囊紧凑化 */
+#topbar .stat{display:inline-flex;align-items:baseline;gap:7px;background:#10151d;border:1px solid #1c2330;border-radius:10px;padding:3px 12px;font-size:11px;color:#7d8aa0;white-space:nowrap}
+#topbar .stat b{font-size:14px;color:#dbe2ea;font-weight:700;font-family:ui-monospace,Consolas,monospace}
 .spacer{flex:1}
 .badge{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:20px;font-size:11px;line-height:1.4}
 .dot{width:7px;height:7px;border-radius:50%;display:inline-block}
@@ -1343,10 +1359,6 @@ tr:hover td{background:#131a24}
 #agents-body tr.local td:first-child{box-shadow:inset 3px 0 0 #4f8cff}
 #agents-body tr.local:hover td{background:#182a4c}
 .self-chip{display:inline-block;padding:1px 7px;border-radius:10px;font-size:10px;background:#234a86;color:#a8cbff;margin-right:6px}
-.metric{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
-.metric .m{background:#10151d;border:1px solid #1c2330;border-radius:12px;padding:14px}
-.metric .v{font-size:24px;font-weight:700;margin-top:4px}
-.metric .k{font-size:11px;color:#7d8aa0}
 .msg{border-left:3px solid #263041;padding:8px 12px;margin:8px 0;background:#0d1219;border-radius:0 8px 8px 0}
 .msg .meta{color:#7d8aa0;font-size:11px;margin-bottom:2px}
 .msg .pay{color:#9cc5ff;word-break:break-all;white-space:pre-wrap}
@@ -1431,28 +1443,26 @@ th.srt:hover{color:#dbe2ea}
 </div>
 <div id="app" class="hidden">
 <aside id="sidebar">
-  <div id="logo"><span class="dot"></span>AgentLink <span class="ver-badge" title="当前节点版本">v__VER__</span></div>
-  <div class="nav active" data-p="overview" onclick="show('overview')">总览</div>
-  <div class="nav" data-p="nodes" onclick="show('nodes')">节点</div>
-  <div class="nav" data-p="agents" onclick="show('agents')">Agent</div>
-  <div class="nav" data-p="chat" onclick="show('chat')">对话 / 发送</div>
-  <div class="nav" data-p="config" onclick="show('config')">配置</div>
+  <div id="logo"><span class="dot"></span><span class="lgn">AgentLink</span> <span class="ver-badge" title="当前节点版本">v__VER__</span></div>
+  <div class="nav active" data-p="overview" onclick="show('overview')"><span class="sho">总</span><span class="ful">总览</span></div>
+  <div class="nav" data-p="nodes" onclick="show('nodes')"><span class="sho">节</span><span class="ful">节点</span></div>
+  <div class="nav" data-p="agents" onclick="show('agents')"><span class="sho">智</span><span class="ful">Agent</span></div>
+  <div class="nav" data-p="chat" onclick="show('chat')"><span class="sho">话</span><span class="ful">对话 / 发送</span></div>
+  <div class="nav" data-p="config" onclick="show('config')"><span class="sho">配</span><span class="ful">配置</span></div>
 </aside>
+<div id="side-resize" title="拖动调宽 · 单击折叠/展开"><span class="rz-ic"></span></div>
 <div id="main">
   <div id="topbar">
     <div style="display:flex;align-items:baseline;gap:10px"><div class="t" id="tb-self">—</div><div class="sub" id="tb-meta">—</div></div>
+    <span class="stat" title="在线节点 / 已知节点"><span>在线节点</span><b id="m-nodes">0</b></span>
+    <span class="stat" title="内存中最近对话条数"><span>历史消息</span><b id="m-history">0</b></span>
+    <span class="stat" title="进行中的文件传输"><span>传输中</span><b id="m-transfer">0</b></span>
     <div class="spacer"></div>
     <span class="sub">自动刷新 <label class="switch"><input type="checkbox" id="auto-refresh" checked><span class="slider"></span></label></span>
     <button onclick="refresh()">刷新</button>
   </div>
   <div class="content">
     <section id="p-overview">
-      <div class="metric">
-        <div class="m"><div class="k">在线节点</div><div class="v" id="m-nodes">0</div></div>
-        <div class="m"><div class="k">历史消息</div><div class="v" id="m-history">0</div></div>
-        <div class="m"><div class="k">传输中</div><div class="v" id="m-transfer">0</div></div>
-        <div class="m"><div class="k">版本</div><div class="v" id="m-version">—</div></div>
-      </div>
       <div class="card"><iframe id="sm-fr" src="/v1/starmap" title="消息星图" style="width:100%;height:72vh;min-height:540px;border:1px solid #1c2b40;border-radius:12px;background:#04070d" allow="fullscreen"></iframe></div>
       <div class="card"><h2>最近对话（总览 · 分页与查询）</h2>
         <div class="row"><input id="ov-kw" placeholder="搜索：内容 / 节点 / agent…" style="flex:2" oninput="ovGo(1)">
@@ -1531,7 +1541,7 @@ const HDR=()=>({'X-Auth-Token':TOKEN});
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(ts){try{return new Date(ts).toLocaleString();}catch{return ts;}}
 let HIST=[],CHQ=null,COLORS={},OV={page:1},CH={page:1},NAMES={},AN={},AGENTS=[],SELF='';
-let PEERS=[],ST={},ASORT={k:'node',d:1},PSORT={k:'name',d:1},EXP=new Set(),LAST={ag:'',pe:'',op:'',hi:'',qt:''};
+let PEERS=[],ST={},ASORT={k:'node',d:1},PSORT={k:'name',d:1},EXP=new Set(),LAST={ag:'',pe:'',op:'',hi:'',qt:'',cf:'',dl:''};
 // 用户正在选择文本时跳过所有 DOM 重写：选择/复制不再被 2 秒自动刷新打断
 function selecting(){const s=window.getSelection();return s&&s.rangeCount>0&&!s.isCollapsed;}
 // 用户正在操作控件（下拉展开、输入中、颜色选择器打开）：冻结本轮所有 DOM 重写，防止刷新冲掉控件状态
@@ -1654,6 +1664,9 @@ function targetOf(sel){
   return {to:sel,to_agent:undefined};
 }
 function saveToken(){TOKEN=$('token-input').value.trim();sessionStorage.setItem(LS_KEY,TOKEN);enter();}
+/* R7（10-16 第四轮）：401 不再整页 reload——就地弹回 token 层并停轮询 */
+function needToken(){TOKEN='';$('modal').classList.remove('hidden');$('app').classList.add('hidden');
+ const ti=$('token-input');if(ti){ti.value='';ti.focus();}toast('token 无效，请重新输入');}
 function enter(){$('modal').classList.add('hidden');$('app').classList.remove('hidden');refresh();loadConfig();}
 async function boot(){
  // 自动取本机 token（仅 127.0.0.1 可成功）；失败则退回手动输入
@@ -1666,7 +1679,7 @@ async function boot(){
  $('modal').classList.remove('hidden');
 }
 boot();
-async function j(p,opt){const o=opt||{};const h={...HDR(),...(o.headers||{})};if(o.body&&typeof o.body==='string'&&!h['Content-Type']&&!h['content-type'])h['Content-Type']='application/json';const r=await fetch(p,{...o,headers:h});const txt=await r.text();let d={};try{d=txt?JSON.parse(txt):{};}catch{d={error:txt.slice(0,300)};}if(r.status===401){alert('token 无效，请重新输入');sessionStorage.removeItem(LS_KEY);location.reload();throw new Error('401');}if(!r.ok)throw new Error('HTTP '+r.status+' '+((d&&(d.error||d.err))||txt.slice(0,200)||r.statusText));return d;}
+async function j(p,opt){const o=opt||{};const h={...HDR(),...(o.headers||{})};if(o.body&&typeof o.body==='string'&&!h['Content-Type']&&!h['content-type'])h['Content-Type']='application/json';const r=await fetch(p,{...o,headers:h});const txt=await r.text();let d={};try{d=txt?JSON.parse(txt):{};}catch{d={error:txt.slice(0,300)};}if(r.status===401){sessionStorage.removeItem(LS_KEY);needToken();throw new Error('401');}if(!r.ok)throw new Error('HTTP '+r.status+' '+((d&&(d.error||d.err))||txt.slice(0,200)||r.statusText));return d;}
 function show(panel){document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.p===panel));document.querySelectorAll('.content>section').forEach(s=>s.classList.add('hidden'));$('p-'+panel).classList.remove('hidden');if(panel==='config')renderColorCfg();}
 function input(id){return ($(id)&&$(id).value||'').trim();}
 function el(id){return document.getElementById(id);}
@@ -1821,14 +1834,18 @@ async function histSearch(){
 function histReset(){CHQ=null;for(const i of ['ch-from','ch-to','ch-since','ch-until','ch-kw'])if(el(i))el(i).value='';if(el('ch-all'))el('ch-all').checked=false;el('ch-qmeta').textContent='';chGo(1);}
 function fillAgDl(){const d=el('ch-agents');if(!d)return;const s=new Set();
  for(const a of AGENTS){if(a.agent_id)s.add(a.agent_id);if(a.name)s.add(a.name);if(a.node_id)s.add(a.node_id);if(a.node_name)s.add(a.node_name);}
- d.innerHTML=[...s].map(x=>`<option value="${esc(x)}"></option>`).join('');}
+ const html=[...s].map(x=>`<option value="${esc(x)}"></option>`).join('');
+ if(html!==LAST.dl){d.innerHTML=html;LAST.dl=html;}}/* R7：签名相同不重写 */
 function renderColorCfg(){const box=el('cf-colors');if(!box||box.contains(document.activeElement))return;
  const ids=new Map();
  for(const a of AGENTS){ids.set('agent:'+a.node_id+'|'+a.agent_id,(a.node_name||who(a.node_id))+' · '+(a.name||a.agent_id));}
  for(const n of Object.keys(NAMES)){ids.set('node:'+n,'节点：'+NAMES[n]);}
  const rows=[...ids.entries()].sort((x,y)=>x[1].localeCompare(y[1]));
- if(!rows.length){box.innerHTML='<span class="hint">暂无节点/agent，等 fleet 同步后自动出现。</span>';return;}
- box.innerHTML=rows.map(([k,lbl])=>cfgRow(k,lbl)).join('');}
+ const empty='<span class="hint">暂无节点/agent，等 fleet 同步后自动出现。</span>';
+ if(!rows.length){if(LAST.cf!==empty){box.innerHTML=empty;LAST.cf=empty;}return;}
+ const html=rows.map(([k,lbl])=>cfgRow(k,lbl)).join('');
+ /* R7（10-16 第四轮）：内容不变不重写——配色区不再每 2s 整块闪重建，颜色选择器/勾选状态不再被刷掉 */
+ if(html!==LAST.cf){box.innerHTML=html;LAST.cf=html;}}
 function cfgPrev(k,n,a,lbl){const outer=nodeCol(n);const inner=a?agCol(n,a):nodeHi(n);
  return `<span class="idc" style="--nc:${esc(outer)}"><span class="idci" style="background:${esc(inner)};color:${onCol(inner)}">${esc(lbl)}</span></span>`;}
 function cfgRow(k,lbl){const sep=k.indexOf('|');
@@ -1845,6 +1862,7 @@ async function setColor(k,v){COLORS[k]=v;paintColorRow(k);await putColors();}
 async function tgAutoCol(k,on){if(on)delete COLORS[k];else if(!COLORS[k])COLORS[k]='#5b8def';paintColorRow(k);await putColors();}
 async function putColors(){try{await j('/v1/colors',{method:'PUT',body:JSON.stringify({colors:COLORS})});}catch(e){alert('保存颜色失败：'+(e.message||e));}}
 async function refresh(){
+ const md=$('modal');if(md&&!md.classList.contains('hidden'))return; // token 层打开时停轮询
  histStats();
  try{
   if(el('ed-input')||el('rn-input'))return; // 行内改名编辑中：跳过本轮刷新，防止重绘冲掉编辑框
@@ -1854,11 +1872,10 @@ async function refresh(){
   if(!sel)COLORS=(cols&&cols.colors)||{};
   ST=st||{}; PEERS=(peers&&peers.ok)?peers.peers:[]; AGENTS=(agents&&agents.ok)?agents.agents:[]; SELF=ST.node_id||'';
   $('tb-self').textContent=st.name;
-  $('tb-meta').textContent=`${st.node_id} · 在线 ${st.peers_online}/${st.peers_known} · ${new Date().toLocaleTimeString()}`;
+  $('tb-meta').textContent=`${st.node_id} · ${new Date().toLocaleTimeString()}`;
   $('m-nodes').textContent=`${st.peers_online}/${st.peers_known}`;
   $('m-history').textContent=hist.history.length;
   $('m-transfer').textContent=st.active_transfers;
-  $('m-version').textContent=st.version;
   // 节点名 / agent 名映射（给人看）
   NAMES={}; AN={};
   if(st&&st.node_id){NAMES[st.node_id]=st.name||st.node_id;}
@@ -1900,6 +1917,24 @@ async function saveConfig(){
   max_file_size:(parseInt($('cf-fmax').value)||100)*1048576,static_peers:peers,auto_open_web:$('cf-open').checked};
  try{const d=await j('/v1/config',{method:'PUT',body:JSON.stringify(body)});$('cf-res').textContent=JSON.stringify(d);refresh();}catch(e){}
 }
+/* ---------- R5（10-16 第四轮）：侧栏折叠/展开 + 拖拽调宽（localStorage 持久化） ---------- */
+function sideSet(px){document.documentElement.style.setProperty('--sw',px+'px');}
+function sideCur(){const s=$('sidebar');return s?Math.round(s.getBoundingClientRect().width):220;}
+function applySide(){const w=Math.max(150,Math.min(460,parseInt(localStorage.getItem('al_sbw')||'220',10)||220));
+ const coll=localStorage.getItem('al_sbc')==='1';
+ sideSet(coll?56:w);$('sidebar').classList.toggle('coll',coll);}
+function initSideResize(){const rz=el('side-resize');if(!rz)return;let dr=null;
+ rz.addEventListener('pointerdown',e=>{e.preventDefault();dr={x:e.clientX,base:sideCur(),moved:false};
+  try{rz.setPointerCapture(e.pointerId)}catch(_){}});
+ rz.addEventListener('pointermove',e=>{if(!dr)return;const dx=e.clientX-dr.x;
+  if(Math.abs(dx)>3)dr.moved=true;
+  if(dr.moved){const w=Math.max(150,Math.min(460,dr.base+dx));sideSet(w);
+   if($('sidebar').classList.contains('coll')){$('sidebar').classList.remove('coll');localStorage.setItem('al_sbc','0');}}});
+ rz.addEventListener('pointerup',()=>{if(!dr)return;const moved=dr.moved;dr=null;
+  if(moved)localStorage.setItem('al_sbw',String(sideCur()));
+  else{localStorage.setItem('al_sbc',($('sidebar').classList.contains('coll')?'0':'1'));applySide();}});
+ rz.addEventListener('pointercancel',()=>{dr=null;});}
+applySide();initSideResize();
 setInterval(()=>{if($('auto-refresh').checked)refresh();},2000);
 </script></body></html>"#;
     HTML.replace("__LEN__", &history_len.to_string())
