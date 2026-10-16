@@ -9,7 +9,7 @@
 //! `delivery.agent_stale_ttl_seconds`) are cleaned automatically.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -140,6 +140,41 @@ pub struct AgentRecord {
     pub last_seen: i64,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::cap_matches;
+
+    #[test]
+    fn cap_exact_and_wildcard() {
+        assert!(cap_matches("cap:node:reboot", "cap:node:reboot"));
+        assert!(cap_matches("cap:node:*", "cap:node:reboot"));
+        assert!(!cap_matches("cap:node:reboot", "cap:node:*"));
+        assert!(cap_matches("cap:node:*", "cap:node:admin:deep"));
+        assert!(!cap_matches("cap:edit:py", "cap:edit:js"));
+        assert!(!cap_matches("cap:node", "cap:node:reboot"));
+        assert!(cap_matches("*", "cap:whatever:x"));
+    }
+}
+
+/// Capability string matching (v0.5 kernel list §3). Capability grammar:
+/// `cap:<domain>:<action>[:...]`, colon-hierarchical. A held capability may
+/// end with a `*` segment that wildcards everything below it
+/// (`cap:node:*` satisfies `cap:node:reboot`). A bare `*` satisfies anything.
+/// Scheduling/matching policy itself is the AgentMesh paid layer; the core
+/// only answers "which online agents satisfy the requirement".
+pub fn cap_matches(have: &str, need: &str) -> bool {
+    if have == need || have == "*" {
+        return true;
+    }
+    let mut seg_h: Vec<&str> = have.split(':').collect();
+    if seg_h.last().copied() != Some("*") {
+        return false;
+    }
+    seg_h.pop();
+    let seg_n: Vec<&str> = need.split(':').collect();
+    seg_h.len() <= seg_n.len() && seg_n.starts_with(&seg_h)
+}
+
 /// One history entry for the human view (`/web`, `/v1/history`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -157,6 +192,11 @@ pub struct HistoryEntry {
     pub to_agent: Option<String>,
     pub kind: String,
     pub action: String,
+    /// Append-only ring sequence (v0.5 §1). Monotonic per node, seeded at
+    /// boot from the restored history so it survives restarts. Legacy lines
+    /// written before v0.5 carry 0.
+    #[serde(default)]
+    pub seq: u64,
     /// Reply chain link: msg_id of the message this one answers (if any).
     /// Used by the console star-map to group messages into topics. Absent in
     /// history lines written before v0.4.16 (serde default = None).
@@ -164,6 +204,19 @@ pub struct HistoryEntry {
     pub reply_to: Option<String>,
     #[serde(default)]
     pub payload: serde_json::Value,
+}
+
+/// Incremental event-stream read result for `/v1/events` (v0.5 §1).
+#[derive(Debug)]
+pub struct EventsView {
+    pub events: Vec<HistoryEntry>,
+    /// Watermark: the seq the next appended event will carry.
+    pub next_seq: u64,
+    /// Oldest seq still in the ring (None when the ring is empty).
+    pub oldest_seq: Option<u64>,
+    /// True when `since` points below the ring after a rotation: events were
+    /// lost, caller must rebuild from full `/v1/history` (HTTP 409).
+    pub gap: bool,
 }
 
 pub struct Router {
@@ -185,6 +238,14 @@ pub struct Router {
     clients: Mutex<HashMap<String, usize>>,
     /// Ring buffer of recent traffic for the human view.
     history: Mutex<VecDeque<HistoryEntry>>,
+    /// Next sequence number for history/event entries (v0.5 §1).
+    next_seq: AtomicU64,
+    /// Count of ring evictions this process has performed; > 0 means events
+    /// below the current ring head are no longer streamable (v0.5 §1, 409).
+    evicted: AtomicU64,
+    /// Observer-side payload sanitizer (v0.5 §2). Applied when history
+    /// entries are built — never on the delivery path.
+    redactor: crate::redact::Redactor,
     /// Append-only journal backing inbox/offline/pending/local/seen.
     journal: store::Journal,
     journal_ops: AtomicUsize,
@@ -265,6 +326,10 @@ impl Router {
             dedup.record(id);
         }
 
+        // v0.5 §1: resume the append-only sequence above whatever the
+        // restored ring already carries, so seq survives restarts.
+        let seed_seq = history.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
+
         Router {
             cfg: cfg.clone(),
             registry: PeerRegistry::default(),
@@ -278,6 +343,9 @@ impl Router {
             fleet_agents: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             history: Mutex::new(history),
+            next_seq: AtomicU64::new(seed_seq),
+            evicted: AtomicU64::new(0),
+            redactor: crate::redact::Redactor::from_config(&cfg.redact),
             journal,
             journal_ops: AtomicUsize::new(0),
             // Rewrite the journal from live state on the first maintenance
@@ -415,6 +483,7 @@ impl Router {
             to_agent: env.to_agent,
             kind: env.kind,
             action: env.action,
+            seq: 0,
             reply_to: env.reply_to,
             payload: env.payload,
         })
@@ -1072,18 +1141,23 @@ impl Router {
             to_agent: env.to_agent.clone(),
             kind: env.kind.clone(),
             action: env.action.clone(),
+            seq: 0,
             reply_to: env.reply_to.clone(),
-            payload: env.payload.clone(),
+            // v0.5 §2: observer copy is sanitized; the delivered frame above
+            // (routed from `env` directly) still carries the original payload.
+            payload: self.redactor.redact_value(&env.payload),
         };
         self.push_history(entry);
     }
 
     /// Push into the ring buffer and (when configured) the durable JSONL file.
-    fn push_history(&self, entry: HistoryEntry) {
+    fn push_history(&self, mut entry: HistoryEntry) {
+        entry.seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         {
             let mut h = self.history.lock().unwrap();
             if h.len() >= self.cfg.history.len.max(1) {
                 h.pop_front();
+                self.evicted.fetch_add(1, Ordering::Relaxed);
             }
             h.push_back(entry.clone());
         }
@@ -1107,6 +1181,51 @@ impl Router {
     pub fn history(&self) -> Vec<HistoryEntry> {
         let h = self.history.lock().unwrap();
         h.iter().cloned().collect()
+    }
+
+    /// Result of an incremental event-stream read (v0.5 §1, `/v1/events`).
+    pub fn events_view(
+        &self,
+        since: u64,
+        agent: Option<&str>,
+        types: Option<&[String]>,
+        limit: usize,
+    ) -> EventsView {
+        let h = self.history.lock().unwrap();
+        let next_seq = self.next_seq.load(Ordering::Relaxed);
+        let oldest_seq = h.front().map(|e| e.seq);
+        let evicted = self.evicted.load(Ordering::Relaxed) > 0;
+        // A requested `since` below the ring head after a rotation means the
+        // caller missed events; they must rebuild from full history (409).
+        let gap = since > 0 && evicted && oldest_seq.is_none_or(|o| since < o);
+        let mut events: Vec<HistoryEntry> = Vec::new();
+        if !gap {
+            for e in h.iter() {
+                if e.seq < since {
+                    continue;
+                }
+                if let Some(a) = agent {
+                    if e.from_agent.as_deref() != Some(a) && e.to_agent.as_deref() != Some(a) {
+                        continue;
+                    }
+                }
+                if let Some(ts) = types {
+                    if !ts.is_empty() && !ts.contains(&e.kind) {
+                        continue;
+                    }
+                }
+                events.push(e.clone());
+                if events.len() >= limit {
+                    break;
+                }
+            }
+        }
+        EventsView {
+            events,
+            next_seq,
+            oldest_seq,
+            gap,
+        }
     }
 
     /// Record a file transfer event into the human-visible history.
@@ -1134,12 +1253,13 @@ impl Router {
             to_agent: None,
             kind: "file".to_string(),
             action: "file".to_string(),
+            seq: 0,
             reply_to: None,
-            payload: serde_json::json!({
+            payload: self.redactor.redact_value(&serde_json::json!({
                 "file_name": file_name,
                 "size": size,
                 "saved_path": saved_path,
-            }),
+            })),
         };
         self.push_history(entry);
     }

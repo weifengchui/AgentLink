@@ -159,6 +159,7 @@ pub fn router(state: SharedState) -> AxRouter {
         )
         .route("/v1/fleet/agents", get(fleet_agents))
         .route("/v1/history", get(history_get))
+        .route("/v1/events", get(events_get))
         .route("/v1/history/search", get(history_search_get))
         .route("/v1/colors", get(colors_get).put(colors_put))
         .route("/v1/history/stats", get(history_stats_get))
@@ -186,6 +187,9 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
         "name": state.display_name(),
         "tags": state.tags(),
         "uptime_seconds": state.uptime_seconds(),
+        // v0.5 §5: capability probe for orchestrators — endpoints listed
+        // here exist on this node; absence means "degrade to legacy polling".
+        "features": ["events", "redact"],
     }))
 }
 
@@ -592,23 +596,58 @@ async fn agents_get(State(state): State<SharedState>, headers: HeaderMap) -> imp
 }
 
 /// List agents across the whole LAN fleet (local + synced from peers).
-async fn fleet_agents(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+#[derive(serde::Deserialize)]
+struct FleetAgentsQuery {
+    #[serde(default)]
+    requires: Option<String>,
+}
+
+async fn fleet_agents(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(q): Query<FleetAgentsQuery>,
+) -> impl IntoResponse {
     if !authorized(&state, &headers) {
         return unauthorized();
     }
     let mut names: HashMap<String, String> = HashMap::new();
+    let mut addrs: HashMap<String, String> = HashMap::new();
     for p in state.peers.snapshot() {
         names.insert(p.node_id.clone(), p.name.clone());
+        addrs.insert(p.node_id.clone(), p.addr.clone());
     }
     names.insert(state.config.node_id.clone(), state.display_name());
+    addrs.insert(
+        state.config.node_id.clone(),
+        format!("127.0.0.1:{}", state.config.listen_port),
+    );
     // Ghost guard: an agent can only be online if its NODE is online. Remote
     // agent caches used to keep `online:true` forever after the owner node
     // went away (new identity/reboot), confusing the fleet view.
     let node_online = |nid: &str| nid == state.config.node_id || state.peers.is_online(nid);
+    // v0.5 kernel list §3: optional capability query (open-source = query only,
+    // no scheduling). `?requires=cap:node:reboot,cap:edit:py` keeps only ONLINE
+    // agents whose capabilities satisfy every requirement (hierarchical,
+    // trailing `*` wildcard — see router::cap_matches).
+    let requires: Vec<String> = q
+        .requires
+        .as_deref()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_default();
     let agents: Vec<serde_json::Value> = state
         .router
         .fleet_agents()
         .iter()
+        .filter(|a| {
+            requires.is_empty()
+                || (a.online
+                    && node_online(&a.node_id)
+                    && requires.iter().all(|need| {
+                        a.capabilities
+                            .iter()
+                            .any(|have| crate::router::cap_matches(have, need))
+                    }))
+        })
         .map(|a| {
             let mut v = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
             if let serde_json::Value::Object(m) = &mut v {
@@ -623,13 +662,17 @@ async fn fleet_agents(State(state): State<SharedState>, headers: HeaderMap) -> i
                         .cloned()
                         .unwrap_or_else(|| a.node_id.clone())),
                 );
+                m.insert(
+                    "node_addr".to_string(),
+                    serde_json::json!(addrs.get(&a.node_id).cloned().unwrap_or_default()),
+                );
             }
             v
         })
         .collect();
     (
         StatusCode::OK,
-        Json(json!({ "ok": true, "agents": agents })),
+        Json(json!({ "ok": true, "agents": agents, "requires": requires })),
     )
 }
 
@@ -641,6 +684,82 @@ async fn history_get(State(state): State<SharedState>, headers: HeaderMap) -> im
     (
         StatusCode::OK,
         Json(json!({ "ok": true, "history": state.router.history() })),
+    )
+}
+
+/// `/v1/events` query params (v0.5 §1).
+#[derive(Debug, Deserialize)]
+struct EventsQuery {
+    /// Return events with `seq >= since`; pass the `next_seq` from the
+    /// previous response to continue without loss on reconnect. Omitted or 0
+    /// returns whatever the ring still holds.
+    #[serde(default)]
+    since: Option<u64>,
+    /// Only events involving this agent id (as `from_agent` or `to_agent`).
+    #[serde(default)]
+    agent: Option<String>,
+    /// Comma-separated frame types, matched against the envelope `type`
+    /// (e.g. `text,file`). ctrl/heartbeat frames are never in this view.
+    #[serde(default)]
+    types: Option<String>,
+    /// Max events per response (default 500, clamped to 5000).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Control-plane event stream for orchestrators (v0.5 §1): incremental,
+/// append-only pull over business frames with per-node `seq`. Payloads are
+/// sanitized through the redaction pipeline (§2) before output. When `since`
+/// falls below the ring after a rotation the response is 409 with the oldest
+/// available seq, and the caller rebuilds from full `/v1/history`.
+async fn events_get(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(q): Query<EventsQuery>,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let since = q.since.unwrap_or(0);
+    let limit = q.limit.unwrap_or(500).clamp(1, 5000);
+    let agent = q
+        .agent
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty());
+    let types: Option<Vec<String>> = q.types.map(|s| {
+        s.split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    });
+    let view = state
+        .router
+        .events_view(since, agent.as_deref(), types.as_deref(), limit);
+    if view.gap {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": "since_before_history",
+                "oldest_seq": view.oldest_seq,
+                "next_seq": view.next_seq,
+                "hint": "events below the ring were rotated out; rebuild from /v1/history",
+            })),
+        );
+    }
+    let events: Vec<serde_json::Value> = view
+        .events
+        .iter()
+        .map(|e| json!({ "seq": e.seq, "ts": e.ts, "frame": e }))
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "events": events,
+            "next_seq": view.next_seq,
+            "oldest_seq": view.oldest_seq,
+        })),
     )
 }
 
