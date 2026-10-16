@@ -1549,12 +1549,18 @@ function copyMsg(id){const m=HIST.find(x=>x.msg_id===id);if(!m)return;const p=m.
 function copyText(t){if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(()=>toast('已复制到剪贴板'),()=>fbCopy(t));}else{fbCopy(t);}}
 function fbCopy(t){const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.focus();ta.select();try{document.execCommand('copy');toast('已复制到剪贴板');}catch(e){toast('复制失败');}ta.remove();}
 function fnv(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)>>>0;}return h;}
+function fm32(x){x^=x>>>16;x=Math.imul(x,0x85ebca6b);x^=x>>>13;x=Math.imul(x,0xc2b2ae35);x^=x>>>16;return x>>>0;}
 // 双层胶囊配色（用户 10-16 规格）：外层=节点深色容器（左侧留粗弧），内嵌小胶囊=agent 亮色。
-// 层级铁律：节点比 agent 深一档。节点色按 node_id 哈希固定（改名/刷新不漂移）；agent 色相以节点为基准偏移，避免同色混淆。
+// 层级铁律：节点比 agent 深一档。节点色按 node_id 哈希固定（改名/刷新不漂移）。
+// agent 配色（10-16 第三轮 R1）：色相/饱和/亮度全部只由 agent_id 哈希派生——同 id 全网同色；
+// S/L 扰动位让不同 id 撞同色相时仍可肉眼区分。与 web/starmap.html 必须逐字一致。
 function nodeHue(n){return fnv('N|'+String(n))%360;}
 function nodeCol(n){return COLORS['node:'+n]||('hsl('+nodeHue(n)+',46%,30%)');}
 function nodeHi(n){return COLORS['node:'+n]||('hsl('+nodeHue(n)+',58%,66%)');}
-function agCol(n,a){return COLORS['agent:'+n+'|'+a]||('hsl('+((nodeHue(n)+140+(fnv(String(a))%100))%360)+',58%,72%)');}
+function agHue(a){return fm32(fnv('|uo'+String(a)))%360;}
+function agSat(a){return 46+(fm32(fnv('S|'+String(a)))%28);}
+function agLit(a){return 56+(fm32(fnv('L|'+String(a)))%24);}
+function agCol(n,a){return COLORS['agent:'+n+'|'+a]||('hsl('+agHue(a)+','+agSat(a)+'%,'+agLit(a)+'%)');}
 // 手选色可能是深 hex——按亮度给胶囊内文字配可读前景
 function onCol(c){if(typeof c==='string'&&c[0]==='#'&&c.length===7){const r=parseInt(c.substr(1,2),16),g=parseInt(c.substr(3,2),16),b=parseInt(c.substr(5,2),16);return (0.299*r+0.587*g+0.114*b)>150?'#0b1420':'#eef4fb';}return '#0b1420';}
 function colFor(n,a){return a?agCol(n,a):nodeHi(n);}

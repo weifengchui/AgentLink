@@ -95,8 +95,17 @@ background:currentColor;opacity:.55;box-shadow:0 0 8px 2px currentColor}
 .dkhit{position:absolute;z-index:0;pointer-events:auto}
 .gcard.hot{z-index:99}
 .dmore{position:absolute;width:auto;padding:2px 10px;border-radius:10px;font-size:calc(10.5px*var(--fs));color:#9fb4cc;background:rgba(13,20,32,.92);border:1px solid rgba(108,168,255,.35);font-family:ui-monospace,Consolas,monospace;letter-spacing:.05em}
-#legend{position:fixed;left:26px;bottom:92px;color:var(--mut);font-size:calc(11px*var(--fs));pointer-events:none;z-index:6;
-letter-spacing:.06em}.dotl{display:inline-block;width:9px;height:9px;border-radius:50%;margin:0 5px 0 14px;vertical-align:-1px}
+#legend{position:fixed;left:26px;bottom:92px;color:var(--mut);font-size:calc(11px*var(--fs));z-index:6;
+letter-spacing:.06em;display:flex;flex-direction:column;gap:5px;max-width:56vw}
+.lgrow{display:flex;flex-wrap:wrap;align-items:center;gap:5px}
+.lgsec{font-size:calc(10px*var(--fs));color:#4f6377;letter-spacing:.16em;margin-right:3px;flex:none}
+.lgi{display:inline-flex;align-items:center;gap:6px;cursor:pointer;padding:2px 9px;border-radius:11px;
+border:1px solid rgba(108,168,255,.22);background:rgba(9,14,23,.66);color:#a9bcd2;
+font-size:calc(10.5px*var(--fs));user-select:none;transition:all .15s}
+.lgi:hover{border-color:rgba(56,214,230,.7);color:#fff}
+.lgi.off{opacity:.4;text-decoration:line-through}
+.dotl{display:inline-block;width:8px;height:8px;border-radius:50%;flex:none}
+.station.hid,.agt.hid{display:none!important}
 .gcard{position:absolute;left:0;backdrop-filter:blur(8px);width:236px;height:70px;border-radius:10px;padding:7px 9px;cursor:pointer;
 background:rgba(11,17,28,.98);
 border:1px solid color-mix(in srgb,var(--gc) 50%,rgba(108,168,255,.2));border-left:3px solid var(--gc);
@@ -172,14 +181,15 @@ background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
   <span class="lbl">时间区间</span><input id="back" type="range" min="0" max="3600" step="60" value="0"><span id="rng"></span>
   <span class="lbl">字体</span><input id="fsr" class="mini" type="range" min="0.85" max="1.6" step="0.05" value="1"><span id="fsv">100%</span>
   <div class="btns">
-    <div class="btn" id="bPause">暂停流入</div>
+    <div class="btn" id="bReset">复位布局</div>
+    <div class="btn" id="bPause">流入</div>
     <div class="btn" id="bSnap">截图</div>
     <div class="btn" id="bRec">录屏</div>
     <div class="btn" id="bFs">全屏</div>
   </div>
 </div>
 <div id="mask"></div>
-<div id="legend"><span class="dotl" style="background:#8fa8c8"></span>node<span class="dotl" style="background:#43d97b"></span>study<span class="dotl" style="background:#ff5c7a"></span>agentlink<span class="dotl" style="background:#7fb0ff"></span>hermes<span class="dotl" style="background:#ffb347"></span>liteguard</div>
+<div id="legend"></div>
 <div id="viewer">
   <div id="vlist"></div>
   <div id="vmain">
@@ -203,17 +213,28 @@ function barH(){const b=document.getElementById("bar");return b?b.offsetHeight:5
 function orbR(){return Math.max(48,Math.min(112,(H-barH()-84)/3.4))}
 function staClamp(){const top=90,bot=Math.max(top+60,H-barH()-orbR()-30);return{top,bot}}
 const MACH={};let SELF=null,NODES=[],NAMES={},COLORS={},ST_ON=0,ST_ALL=0,AG_ALL=0;
+/* R6（10-16 第三轮）：图例点选显隐。hideNodes 按 node_id、hideAgt 按 agent_id 全局（与 R1 全局同色语义一致）；
+   统一在 activeMsgs 出口过滤 → 站台、卫星、卡组、徽章、HUD 一个口径，隐藏即整体从画面消失。localStorage 持久化。 */
+const hideNodes=new Set(),hideAgt=new Set();
+try{const _sh=JSON.parse(localStorage.getItem("starhide")||"{}");for(const x of(_sh.n||[]))hideNodes.add(x);for(const x of(_sh.a||[]))hideAgt.add(x);}catch(e){}
+function saveHide(){try{localStorage.setItem("starhide",JSON.stringify({n:[...hideNodes],a:[...hideAgt]}))}catch(e){}}
+function epHid(k){if(!k)return false;const i=k.indexOf("|");const m=k.slice(0,i),a=k.slice(i+1);
+ return hideNodes.has(m)||(a!=="@node"&&hideAgt.has(a));}
 function esc(s){return String(s==null?"":s).replace(/[&<"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
 function fnv(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)>>>0;}return h;}
+function fm32(x){x^=x>>>16;x=Math.imul(x,0x85ebca6b);x^=x>>>13;x=Math.imul(x,0xc2b2ae35);x^=x>>>16;return x>>>0}
 // 节点配色：按 node_id 哈希固定（改名/刷新不漂移）；深档 nodeCol=胶囊包边，亮档 staCol=站台展示
 function nodeHue(n){return fnv("N|"+String(n))%360}
 function nodeCol(n){return COLORS["node:"+n]||("hsl("+nodeHue(n)+",46%,30%)")}
 function staCol(n){return COLORS["node:"+n]||("hsl("+nodeHue(n)+",58%,66%)")}
 function staGlow(n){return COLORS["node:"+n]?COLORS["node:"+n]+"88":("hsla("+nodeHue(n)+",58%,64%,.5)")}
-// agent 内胶囊色：以所在节点色相为基准偏移 +140..239°；比节点亮一档（层级铁律与控制台一致）
-function agHue(n,a){return (nodeHue(String(n))+140+(fnv(String(a))%100))%360}
-function agCol(n,a){return COLORS["agent:"+n+"|"+a]||("hsl("+agHue(n,a)+",58%,72%)")}
-function agGlow(n,a){return COLORS["agent:"+n+"|"+a]?COLORS["agent:"+n+"|"+a]+"99":("hsla("+agHue(n,a)+",66%,58%,.6)")}
+// agent 卫星/胶囊色（10-16 第三轮 R1）：全部通道只由 agent_id 哈希派生——同 id 全网同色；
+// S/L 扰动位让不同 id 撞同色相时仍可区分。与 src/api.rs 必须逐字一致。
+function agHue(a){return fm32(fnv("|uo"+String(a)))%360}
+function agSat(a){return 46+(fm32(fnv("S|"+String(a)))%28)}
+function agLit(a){return 56+(fm32(fnv("L|"+String(a)))%24)}
+function agCol(n,a){return COLORS["agent:"+n+"|"+a]||("hsl("+agHue(a)+","+agSat(a)+"%,"+agLit(a)+"%)")}
+function agGlow(n,a){return COLORS["agent:"+n+"|"+a]?COLORS["agent:"+n+"|"+a]+"99":("hsla("+agHue(a)+","+(agSat(a)+8)+"%,"+(agLit(a)-14)+"%,.6)")}
 function colFor(nid,a){return a?agCol(nid,a):staCol(nid)}
 function who(nid){return NAMES[nid]||nid;}
 function nmOf(nid){return (MACH[nid]&&MACH[nid].lab)||who(nid)}
@@ -232,7 +253,7 @@ function initPos(){const cl=staClamp(),r=orbR();for(const m in MACH){const c=MAC
 function agPos(k){const[m]=k.split("|");const s=STA[m],o=AGTP[k];return{x:s.x+o.dx,y:s.y+o.dy};}
 /* ---------- time window ---------- */
 let winS=600,backS=0;const T0=Date.now();
-function activeMsgs(){const out=[],now=Date.now();for(const tp of TOPICS)for(const msg of tp.msgs){msg.t=-Math.round((now-msg.abs)/1000);if(msg.t>=-(winS+backS)&&msg.t<=-backS)out.push({...msg,tp});}return out;}
+function activeMsgs(){const out=[],now=Date.now();for(const tp of TOPICS)for(const msg of tp.msgs){msg.t=-Math.round((now-msg.abs)/1000);if(msg.t>=-(winS+backS)&&msg.t<=-backS&&!epHid(msg.f)&&!epHid(msg.to))out.push({...msg,tp});}return out;}
 function hashK(s){let h=17;for(const c of s)h=Math.imul(h^c.charCodeAt(0),2654435761);return Math.abs(h);}
 function qp(p1,p2,bow,u){const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2,dx=p2.x-p1.x,dy=p2.y-p1.y,L=Math.hypot(dx,dy)||1;
  const qx=mx+(-dy/L)*bow,qy=my+(dx/L)*bow,it=1-u;
@@ -337,7 +358,7 @@ function renderHud(){const ms=activeMsgs();
  const recent=ms.filter(m=>m.t>=-30).length;
  hud.innerHTML=`<span>窗口内 <b>${ms.length}</b></span><span>近30s <b>${recent}</b></span><span>节点 <b>${ST_ON}/${ST_ALL}</b></span><span>agents <b>${AG_ALL}</b></span>`;}
 /* ---------- per-agent topic decks ---------- */
-const dwraps={},deckOpen={},hideTimers={},opentomb={};
+const dwraps={},deckOpen={},hideTimers={},opentomb={},dwAnchor={};
 function clearOpenTomb(k){if(opentomb[k]){clearTimeout(opentomb[k]);opentomb[k]=null;}}
 function cancelTomb(k){if(hideTimers[k]){clearTimeout(hideTimers[k]);hideTimers[k]=null;}}
 function scheduleHide(k){cancelTomb(k);hideTimers[k]=setTimeout(()=>{const dw=dwraps[k];
@@ -349,14 +370,17 @@ function hlLinks(k,on){for(const l of map.querySelectorAll(".lk")){
  l.classList.toggle("hl",!!on&&kf===k);}}
 function groupsFor(k){const g=new Map();
  for(const m of activeMsgs()){if(m.to!==k&&m.f!==k)continue;
-  const r=g.get(m.tp.id)||{tp:m.tp,n:0,last:m,first:m};r.n++;r.last=m;if(m.t<r.first.t)r.first=m;g.set(m.tp.id,r);}
- return[...g.values()].sort((a,b)=>b.last.t-a.last.t);}
+  const r=g.get(m.tp.id)||{tp:m.tp,n:0,last:m,first:m,recv:0,lastRecv:null};
+  r.n++;r.last=m;if(m.t<r.first.t)r.first=m;
+  if(m.to===k){r.recv++;if(!r.lastRecv||m.t>r.lastRecv.t)r.lastRecv=m;}
+  g.set(m.tp.id,r);}
+ return[...g.values()].filter(r=>r.recv>0).sort((a,b)=>b.lastRecv.t-a.lastRecv.t);}
 function buildDeck(k){const dw=dwraps[k];const g=groupsFor(k);
- dw.innerHTML=g.length?g.map((r,i)=>{const mins=Math.round(-r.last.t/60);
+ dw.innerHTML=g.length?g.map((r,i)=>{const mins=Math.round(-r.lastRecv.t/60);
   return`<div class="gcard" data-tp="${r.tp.id}" style="--gc:${r.tp.color};z-index:${i+1}">
    <div class="r1"><span class="cdot"></span><span class="cname">${esc(r.tp.name)}</span><span class="cnum">${r.n} 条</span></div>
-   <div class="r2">${esc(r.last.body)}</div>
-   <div class="r3"><span>${r.first.f.split("|")[1].replace("@node","node")} → ${r.first.to.split("|")[1].replace("@node","node")}</span><span>${mins}min 前</span></div></div>`;}).join(""):"";
+   <div class="r2">${esc(r.lastRecv.body)}</div>
+   <div class="r3"><span>${r.lastRecv.f.split("|")[1].replace("@node","node")} → ${r.lastRecv.to.split("|")[1].replace("@node","node")}</span><span>${mins}min 前</span></div></div>`;}).join(""):"";
  dw.style.display=(g.length&&dw.dataset.vis==="1")?"block":"none";
  dw.querySelectorAll(".gcard").forEach(c=>{
   c.addEventListener("pointerenter",()=>{c.classList.add("hot");c.style.zIndex=99;gTopic=c.dataset.tp;applyLanes();});
@@ -364,7 +388,7 @@ function buildDeck(k){const dw=dwraps[k];const g=groupsFor(k);
    c.style.zIndex=[...dw.querySelectorAll(".gcard")].indexOf(c)+1;
    if(gTopic===c.dataset.tp)gTopic=null;applyLanes();});
   const openG=()=>{const tp=TOPICS.find(t=>t.id===c.dataset.tp);const now=Date.now();
-   const chain=tp.msgs.filter(m=>{m.t=-Math.round((now-m.abs)/1000);return (m.to===k||m.f===k)&&m.t>=-(winS+backS)&&m.t<=-backS}).sort((a,b)=>a.t-b.t);
+   const chain=tp.msgs.filter(m=>{m.t=-Math.round((now-m.abs)/1000);return (m.to===k||m.f===k)&&m.t>=-(winS+backS)&&m.t<=-backS&&!epHid(m.f)&&!epHid(m.to)}).sort((a,b)=>a.t-b.t);
    if(!chain.length)return;openViewer(tp,chain,chain.length-1,k);};
   c.addEventListener("click",openG);});
  layoutDeck(k);}
@@ -384,52 +408,28 @@ function layoutDeck(k){const dw=dwraps[k];const cards=[...dw.querySelectorAll(".
  if(!ch&&cards.length>4){ch=document.createElement("div");ch.className="dmore";dw.appendChild(ch);}
  if(ch){ch.textContent=`+${cards.length-4} 个话题`;ch.style.display=open?"none":"block";ch.style.top=(-(4*24)-10)+"px";ch.style.left="12px";}
  posDwrap(k);}
-function rectPad(r,p){return{l:r.left-p,t:r.top-p,r:r.right+p,b:r.bottom+p}}
-function ovq(a,b){return!(a.r<b.l||a.l>b.r||a.b<b.t||a.t>b.b)}
-function deckObs(exk,isNode,m0){const O=[];
- for(const m in staEl){const st=staEl[m];
-  if(!(isNode&&m===m0))O.push(rectPad(st.querySelector(".orb").getBoundingClientRect(),6));
-  const lb=st.querySelector(".lab").getBoundingClientRect();
-  if(lb.width)O.push(rectPad(lb,4));}
- for(const k in agtEl){if(k===exk)continue;const e=agtEl[k].querySelector(".dot");
-  if(e)O.push(rectPad(e.getBoundingClientRect(),7));}
- return O}
-function posDwrap(k){const dw=dwraps[k];const p=agPos(k);
+// R2/R3（10-16 第三轮）：卡组锚定在 reveal() 时快照的光标位置，后续一切重排只读快照；
+// 水平=光标右侧 20px（右侧放不下才翻左，判定由快照坐标决定、重算结果恒定）；
+// 纵向=整叠卡组摆在光标右下方（露出的顶层边距光标 14px，不遮锚点胶囊），下方放不下才整体翻上方；
+// 两侧都放不下时钳进视口。光标移动/轮询重建均不重算锚点 → 零抖动。
+function posDwrap(k){const dw=dwraps[k];
  const cards=[...dw.querySelectorAll(".gcard")].filter(c=>c.style.display!=="none");
  const n=Math.max(cards.length,1),cardH=cards[0]?cards[0].offsetHeight:72,step=deckOpen[k]?cardH+6:24;
- const span=(n-1)*step,PW=236,PAD=14;
- const isNode=k.endsWith("|@node"),m0=k.split("|")[0];
- let halfw=44;if(isNode)halfw=50;else if(agtEl[k]){const d=agtEl[k].querySelector(".dot");if(d)halfw=d.offsetWidth/2}
- const minT=100+span,maxT=Math.max(minT,H-barH()-16-cardH);
- const fits=v=>v>=10&&v+PW<=W-10;
- let cr0=-Infinity,cl0=Infinity;
- {const st=staEl[m0];const rs=[st.querySelector(".orb").getBoundingClientRect(),st.querySelector(".lab").getBoundingClientRect()];
-  st.querySelectorAll(".agt").forEach(g=>rs.push(g.getBoundingClientRect()));
-  for(const r of rs){if(!r.width)continue;cl0=Math.min(cl0,r.left);cr0=Math.max(cr0,r.right);}}
- let raw;
- if(isNode)raw=[p.x-halfw-PAD-PW,p.x+halfw+PAD];
- else{const sx=STA[m0].x;const L=p.x-halfw-PAD-PW,R=p.x+halfw+PAD;
-  raw=(p.x<sx)?[L,R]:[R,L];}
- if(!fits(raw[0])&&fits(raw[1]))raw=[raw[1],raw[0]];
- let cands=raw.concat([cr0+PAD,cl0-PAD-PW]).map(v=>Math.max(10,Math.min(W-10-PW,v)));
- cands=[...new Set(cands)];
- // 展开态：水平位置锁定在原地，只允许纵向避让（展开只上下拉伸，不横向漂移）
- if(deckOpen[k]&&dw.style.left)cands=[Math.max(10,Math.min(W-10-PW,parseFloat(dw.style.left)))];
- const obs=deckObs(isNode?null:k,isNode,m0);
- const hit=(x,t)=>{const q={l:x+4,t:t-span,r:x+PW-4,b:t+cardH};
-  for(const o of obs)if(ovq(q,o))return o;return null};
- const t0=Math.max(minT,Math.min(maxT,CUR.y-40));
- let sol=null;
- for(const x of cands){for(let d=0;d<=190;d+=18){for(const s2 of (d===0?[0]:[d,-d])){
-   const t=Math.max(minT,Math.min(maxT,t0+s2));
-   if(!hit(x,t)){sol={x,t};break}}if(sol)break}if(sol)break}
- if(!sol){let t=Math.max(minT,Math.min(maxT,t0+210)),x=cands[0];
-  for(let g=0;g<12&&hit(x,t);g++)t=Math.max(minT,Math.min(maxT,t+24));
-  sol={x,t}}
- dw.style.left=sol.x+"px";dw.style.top=sol.t+"px";}
+ const span=(n-1)*step,PW=236;
+ let an=dwAnchor[k];if(!an)an=dwAnchor[k]={x:CUR.x,y:CUR.y};
+ let x=an.x+20;
+ if(x+PW>W-10&&an.x-20-PW>=10)x=an.x-20-PW;
+ x=Math.max(10,Math.min(W-10-PW,x));
+ const lo=10+span,hi=Math.max(lo,H-barH()-16-cardH);
+ let t=an.y+14+span;
+ if(t+cardH>H-barH()-16)t=an.y-14-cardH;
+ t=Math.max(lo,Math.min(hi,t));
+ dw.style.left=x+"px";dw.style.top=t+"px";}
 function setDeckOpen(k,open){if(!dwraps[k]||dwraps[k].style.display==="none")return;
  deckOpen[k]=open;layoutDeck(k);}
 function reveal(k){const dw=dwraps[k];cancelTomb(k);
+ // R3：锚点只在悬停开始的这一刻快照，之后光标移动/轮询重排都不再读实时 CUR
+ dwAnchor[k]={x:CUR.x,y:CUR.y};
  // 悬停某实体时其它无关卡片立即收起
  for(const o in dwraps){if(o!==k&&dwraps[o].style.display!=="none"){cancelTomb(o);clearOpenTomb(o);dwraps[o].dataset.vis="0";deckOpen[o]=false;dwraps[o].style.display="none";}}
  buildDeck(k);if(dw.style.display!=="block"){if(!dw.querySelector(".gcard"))return;}
@@ -525,23 +525,34 @@ const KNOWN=new Set();let WSIG="";
 async function poll(){
  try{await loadTopo();
   const d=await J("/v1/history/search?limit=1500&max_mb=192&scope=all");
-  if(!d||d.ok!==true){await syncWorld();renderLegend();setErr((d&&d.error==="history disabled")?"总线未启用历史记录（config history.enabled=false）":"查询失败："+((d&&d.error)||"未知"));renderLinks();renderAllDecks();return;}
+  if(!d||d.ok!==true){await syncWorld();applyHide();setErr((d&&d.error==="history disabled")?"总线未启用历史记录（config history.enabled=false）":"查询失败："+((d&&d.error)||"未知"));renderLinks();renderAllDecks();return;}
   setErr("");
   buildTopics((d.matches||[]).slice().sort((x,y)=>String(x.ts).localeCompare(String(y.ts))));
-  await syncWorld();renderLegend(); /* world built AFTER msgs registered: agents from history+fleet in one shot */
+  await syncWorld();applyHide(); /* world built AFTER msgs registered: agents from history+fleet in one shot */
   const edge=backS===0&&!paused;
-  for(const tp of TOPICS)for(const m of tp.msgs)if(!KNOWN.has(m.id)){KNOWN.add(m.id);if(edge&&m.abs>=Date.now()-90000)flyIn(tp,m);}
+  for(const tp of TOPICS)for(const m of tp.msgs)if(!KNOWN.has(m.id)){KNOWN.add(m.id);if(edge&&m.abs>=Date.now()-90000&&!epHid(m.f)&&!epHid(m.to))flyIn(tp,m);}
   renderLinks();renderAllDecks();
  }catch(e){setErr(String(e.message||e));}}
 function worldSig(){let s="";for(const m in MACH)s+=m+"|"+MACH[m].lab+"|"+MACH[m].ip+"|"+MACH[m].agents.join(",")+";";return s;}
 async function syncWorld(){const sg=worldSig();if(sg===WSIG)return;WSIG=sg;
  if(Object.keys(STA).length){stageEl.innerHTML="";
-  for(const o of[dwraps,deckOpen,hideTimers,opentomb,agtEl,staEl])for(const k in o)delete o[k];
+  for(const o of[dwraps,deckOpen,hideTimers,opentomb,dwAnchor,agtEl,staEl])for(const k in o)delete o[k];
   hovAgt=hovSta=gTopic=pinC=null;cancelLiveAnims();if(VT)closeViewer();}
  initPos();buildWorld();placeWorld();}
 function renderLegend(){const el=document.getElementById("legend");if(!el)return;const seen={};
  for(const m in MACH)for(const a of MACH[m].agents)if(!(a in seen))seen[a]=agCol(m,a);
- el.innerHTML=Object.entries(seen).slice(0,12).map(([a,c])=>`<span class="dotl" style="background:${c}"></span>${esc(a)}`).join("");}
+ const nrow=Object.keys(MACH).filter(m=>m!=="*").map(m=>`<span class="lgi${hideNodes.has(m)?" off":""}" data-t="n" data-k="${esc(m)}"><span class="dotl" style="background:${staCol(m)}"></span>${esc(nmOf(m))}</span>`).join("");
+ const arow=Object.entries(seen).slice(0,16).map(([a,c])=>`<span class="lgi${hideAgt.has(a)?" off":""}" data-t="a" data-k="${esc(a)}"><span class="dotl" style="background:${c}"></span>${esc(a)}</span>`).join("");
+ el.innerHTML=`<div class="lgrow"><span class="lgsec">节点</span>${nrow}</div><div class="lgrow"><span class="lgsec">Agent</span>${arow}</div>`;
+ el.querySelectorAll(".lgi").forEach(s=>{s.onclick=()=>{const set=s.dataset.t==="n"?hideNodes:hideAgt,k=s.dataset.k;
+  if(set.has(k))set.delete(k);else set.add(k);saveHide();applyHide();};});}
+function applyHide(){renderLegend();cancelLiveAnims();
+ for(const m in staEl){const h=hideNodes.has(m);staEl[m].classList.toggle("hid",h);
+  const w=dwraps[a2k([m,"@node"])];if(h&&w){w.style.display="none";w.dataset.vis="0";deckOpen[a2k([m,"@node"])]=false;}}
+ for(const k in agtEl){const h=epHid(k);agtEl[k].classList.toggle("hid",h);
+  const w=dwraps[k];if(h&&w){w.style.display="none";w.dataset.vis="0";deckOpen[k]=false;}}
+ if(hovAgt&&epHid(hovAgt))hovAgt=null;if(hovSta&&hideNodes.has(hovSta))hovSta=null;
+ renderLinks();}
 /* ---------- live flight: only real new messages animate ---------- */
 let paused=false;
 const liveAnims=[];
@@ -590,7 +601,10 @@ function applyFs(){const v=+fsEl.value;document.documentElement.style.setPropert
  try{localStorage.setItem("starfs",v);}catch(e){}renderAllDecks();}
 fsEl.oninput=applyFs;applyFs();
 document.getElementById("bPause").onclick=e=>{paused=!paused;if(paused)cancelLiveAnims();
- e.target.classList.toggle("on",paused);e.target.textContent=paused?"恢复流入":"暂停流入";};
+ e.target.classList.toggle("on",paused);e.target.textContent=paused?"⏸︎流入":"流入";};
+document.getElementById("bReset").onclick=()=>{cancelLiveAnims();clearPin();
+ for(const o of[STA,AGTP])for(const k in o)delete o[k];
+ initPos();placeWorld();renderLinks();renderAllDecks();};
 document.getElementById("bFs").onclick=()=>{
  // 本页可能被总览 iframe 嵌入：全屏请求要打在宿主 iframe 元素上（iframe 内部对 body 发请求会被拒），
  // 再点一次 = 退出当前全屏（无论全屏是本页还是外层按钮触发的）。
