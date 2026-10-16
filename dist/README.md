@@ -25,6 +25,8 @@
 >
 > v0.4.19：Web 控制台第四轮修订（星图弹窗滚轮分区与换组按钮、节点圈收缩、侧栏拖拽/折叠、全局状态栏、全面局部刷新）。
 >
+> v0.5.0：AgentMesh v0.5 内核首版——新增 `/v1/events` 控制面事件流（append-only seq 续传、环满 409 降级、agent/types 过滤，编排方告别轮询）；payload 脱敏管线（history/events/web 观察者统一净化，收件人拿原文，`redact.patterns` 可配 + 内置默认集）；`/v1/fleet/agents?requires=` 能力查询（cap: 分层通配，仅在线）；`/v1/tasks` 任务资源视图（history 派生投影，correlation/state 过滤，任务协议 v1 见 docs/task-protocol.md）；`/v1/health` 增 `features` 数组供编排方探测降级；Web 控制台第五/六轮收口（history 节点+agent 四维过滤、status 暴露 listen_addr、星图端点下拉与自检面板）。全部加性接口，老节点混跑不破。
+>
 > v0.4.10：数据目录默认外置（Windows `%LOCALAPPDATA%\AgentLink\data`、Linux `~/.local/share/agentlink`），
 > 不再放软件目录里以免升级覆盖；`agentlink.json` 的 `data_dir` 可按机器各自改为绝对路径，
 > 相对路径以配置文件目录为基准。发布包新增 `SKILL-agent-registration.md`（Agent 上线注册技能，
