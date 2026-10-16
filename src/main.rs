@@ -16,6 +16,7 @@ mod proto;
 mod redact;
 mod router;
 mod store;
+mod trace;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +40,11 @@ struct Cli {
     /// Path to the configuration file.
     #[arg(long, global = true, default_value = DEFAULT_CONFIG_FILE)]
     config: PathBuf,
+
+    /// Override `log.format` from the config for this run (v0.5 §7.1).
+    /// Without it the default stays the human-readable fmt output.
+    #[arg(long, global = true, value_parser = ["text", "json"])]
+    log_format: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -261,7 +267,10 @@ async fn main() -> Result<()> {
             create_if_missing,
             no_open,
         }) => {
-            let cfg = load_config(&cli.config, create_if_missing)?;
+            let mut cfg = load_config(&cli.config, create_if_missing)?;
+            if let Some(fmt) = cli.log_format.clone() {
+                cfg.log.format = fmt;
+            }
             logging::init(&cfg.log);
             ensure_dirs(&cfg)?;
             let cfg_path = cli.config.clone();
@@ -269,7 +278,10 @@ async fn main() -> Result<()> {
         }
         Some(Command::Autostart { remove, force }) => autostart(&cli.config, remove, force),
         None => {
-            let cfg = load_config(&cli.config, false)?;
+            let mut cfg = load_config(&cli.config, false)?;
+            if let Some(fmt) = cli.log_format.clone() {
+                cfg.log.format = fmt;
+            }
             logging::init(&cfg.log);
             ensure_dirs(&cfg)?;
             let cfg_path = cli.config.clone();
