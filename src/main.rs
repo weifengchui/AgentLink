@@ -13,6 +13,7 @@ mod logging;
 mod mdns;
 mod peer;
 mod proto;
+mod redact;
 mod router;
 mod store;
 

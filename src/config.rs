@@ -26,6 +26,10 @@ pub struct Config {
     pub tags: Vec<String>,
     #[serde(default)]
     pub history: HistoryConfig,
+    /// Observer-side payload redaction for history/events/web views.
+    /// Delivery frames to the target agent are never redacted.
+    #[serde(default)]
+    pub redact: RedactConfig,
     #[serde(default)]
     pub web: WebConfig,
 
@@ -151,6 +155,28 @@ pub struct HistoryConfig {
     /// Set > 0 only if you deliberately want the node to discard oldest records.
     #[serde(default)]
     pub archive_keep: usize,
+}
+
+/// Observer-side payload redaction (v0.5 kernel list §2). Applied to the
+/// human/audit views — history ring, `/v1/history*`, `/v1/events` and the
+/// web console — never to frames delivered to the target agent. Recipients
+/// see originals; observers see `<REDACTED:...>` placeholders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Extra user regexes; every match is replaced with `<REDACTED:custom>`.
+    #[serde(default)]
+    pub patterns: Vec<String>,
+}
+
+impl Default for RedactConfig {
+    fn default() -> Self {
+        RedactConfig {
+            enabled: true,
+            patterns: Vec::new(),
+        }
+    }
 }
 
 /// Web UI / browser behaviour.
@@ -382,6 +408,7 @@ impl Config {
             data_dir: default_data_dir(),
             tags: Vec::new(),
             history: HistoryConfig::default(),
+            redact: RedactConfig::default(),
             web: WebConfig::default(),
             discovery: DiscoveryConfig {
                 enabled: true,
