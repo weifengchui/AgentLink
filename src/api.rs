@@ -161,6 +161,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/history", get(history_get))
         .route("/v1/events", get(events_get))
         .route("/v1/tasks", get(tasks_get))
+        .route("/v1/lockdown", get(lockdown_get).post(lockdown_post))
         .route("/v1/history/search", get(history_search_get))
         .route("/v1/colors", get(colors_get).put(colors_put))
         .route("/v1/history/stats", get(history_stats_get))
@@ -190,7 +191,7 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
         "uptime_seconds": state.uptime_seconds(),
         // v0.5 §5: capability probe for orchestrators — endpoints listed
         // here exist on this node; absence means "degrade to legacy polling".
-        "features": ["events", "redact", "tasks"],
+        "features": ["events", "redact", "tasks", "lockdown"],
     }))
 }
 
@@ -827,6 +828,60 @@ async fn tasks_get(
         StatusCode::OK,
         Json(json!({ "ok": true, "tasks": tasks, "total": total })),
     )
+}
+
+// ---- v0.5 §4.5 薄档：一键熔断 lockdown --------------------------------------
+
+/// `POST /v1/lockdown` body. `on` is required: this is a deliberate
+/// management switch, no implicit defaults.
+#[derive(Debug, Deserialize)]
+struct LockdownRequest {
+    on: bool,
+}
+
+fn lockdown_json(on: bool, out: u64, inn: u64) -> Json<serde_json::Value> {
+    Json(json!({
+        "ok": true,
+        "on": on,
+        // 总被拦帧数（发出侧 + 入站侧），/web 顶栏与冒烟断言都用它。
+        "blocked_count": out + inn,
+        "blocked_out": out,
+        "blocked_in": inn,
+        "replay_on_resume": false,
+    }))
+}
+
+/// `GET /v1/lockdown` — current fuse state + cumulative blocked counts.
+/// Requires the local API (management) token, like every admin surface here.
+async fn lockdown_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, lockdown_json(false, 0, 0));
+    }
+    let (on, out, inn) = state.router.lockdown_stats();
+    (StatusCode::OK, lockdown_json(on, out, inn))
+}
+
+/// `POST /v1/lockdown {on:true|false}` — flip the bus fuse.
+///
+/// v0.5 薄档语义（务必读 docs/task-protocol.md 与验证文档）：
+/// - on：总线暂停投递/转发**业务帧**（agent→agent 消息、任务帧）；
+///   **控制面帧**（status/heartbeat/注册/ack、lockdown 本身、history/
+///   events/tasks 查询）不受影响。
+/// - 被拦帧只留审计标记（history `/v1/events` 的 `blocked: true`、
+///   `/v1/tasks` trail 的 `blocked`），并计入 `blocked_count`。
+/// - off 恢复后**不补投**被拦帧（`replay_on_resume: false`）。
+/// - 状态不落盘：节点重启默认恢复放行（人工应急闸）。
+async fn lockdown_post(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    JsonAny(req): JsonAny<LockdownRequest>,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, lockdown_json(false, 0, 0));
+    }
+    state.router.set_lockdown(req.on);
+    let (on, out, inn) = state.router.lockdown_stats();
+    (StatusCode::OK, lockdown_json(on, out, inn))
 }
 
 /// Conversation-history footprint for the web console. Metadata only, and it
@@ -1621,6 +1676,27 @@ th.srt:hover{color:#dbe2ea}
 .msg .pay{user-select:text}
 .msg .det{color:#67748a;font-size:11px;margin-top:6px;line-height:1.6;word-break:break-all;background:#0b1017;border:1px solid #1c2330;border-radius:8px;padding:6px 8px}
 #toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#1c2a44;color:#cfe3ff;border:1px solid #2f6fe4;padding:8px 18px;border-radius:20px;font-size:13px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:90}
+/* ---------- v0.5 §3.2 任务 Timeline · §4.5 一键熔断 ---------- */
+#p-tasks .tk{border:1px solid #1c2330;border-radius:10px;background:#0b0f16;padding:9px 11px;margin:8px 0}
+#p-tasks .tk:hover{border-color:#2f81f7aa}
+#p-tasks .hd{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px}
+#p-tasks .tid{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#9cc5ff;word-break:break-all}
+#p-tasks .tl{display:flex;align-items:flex-start;margin-top:9px;overflow-x:auto;padding-bottom:2px}
+#p-tasks .tn{display:flex;flex-direction:column;align-items:center;min-width:58px}
+#p-tasks .pt{width:12px;height:12px;border-radius:50%;background:#263041;border:2px solid #3a4a63;flex:none}
+#p-tasks .ln{width:26px;height:2px;background:#263041;margin:5px 0 0;flex:none}
+#p-tasks .tn.ok .pt{background:#3fb950;border-color:#3fb950}
+#p-tasks .tn.bad .pt{background:#f85149;border-color:#f85149}
+#p-tasks .tn.wn .pt{background:#d29922;border-color:#d29922}
+#p-tasks .tn.info .pt{background:#38bdf8;border-color:#38bdf8}
+#p-tasks .tn.blk .pt{background:#2a1010;border-color:#f85149;border-style:dashed}
+#p-tasks .lb{font-size:11px;color:#9aa7b8;margin-top:4px;white-space:nowrap}
+#p-tasks .lb2{font-size:10px;color:#66707f;margin-top:1px;white-space:nowrap}
+.blkchip{background:#3d1212;color:#ffb4b4;border:1px solid #f85149;font-family:inherit;font-size:11px;padding:2px 7px;border-radius:6px;display:inline-block}
+.lkd-btn{background:#121722;color:#cdd6e4;border:1px solid #2f81f7;border-radius:8px;padding:4px 10px;font-size:12px;font-family:inherit;cursor:pointer}
+.lkd-btn:hover{background:#182135}
+.lkd-btn.on{background:#5c1a1a;border-color:#f85149;color:#ffd7d7}
+.msg.blk{border-left-color:#f85149;background:#160e0e}
 </style></head>
 <body>
 <div id="modal"><div class="box">
@@ -1648,6 +1724,7 @@ th.srt:hover{color:#dbe2ea}
   <div class="nav" data-p="nodes" onclick="show('nodes')"><span class="sho">节</span><span class="ful">节点</span></div>
   <div class="nav" data-p="agents" onclick="show('agents')"><span class="sho">智</span><span class="ful">Agent</span></div>
   <div class="nav" data-p="chat" onclick="show('chat')"><span class="sho">话</span><span class="ful">对话 / 发送</span></div>
+  <div class="nav" data-p="tasks" onclick="show('tasks')"><span class="sho">任</span><span class="ful">任务</span></div>
   <div class="nav" data-p="config" onclick="show('config')"><span class="sho">配</span><span class="ful">配置</span></div>
 </aside>
 <div id="side-resize" title="拖动调宽 · 单击折叠/展开"><span class="rz-ic"></span></div>
@@ -1657,6 +1734,8 @@ th.srt:hover{color:#dbe2ea}
     <span class="stat" title="在线节点 / 已知节点"><span>在线节点</span><b id="m-nodes">0</b></span>
     <span class="stat" title="内存中最近对话条数"><span>历史消息</span><b id="m-history">0</b></span>
     <span class="stat" title="进行中的文件传输"><span>传输中</span><b id="m-transfer">0</b></span>
+    <span class="stat" title="v0.5 §4.5 总线熔断：拦业务帧（agent 消息/任务帧）；控制面帧与 history/events/tasks 查询不受影响；恢复后不补投被拦帧"><span>熔断</span><b id="lkd-state">—</b><span class="badge off" id="lkd-badge">拦0</span></span>
+    <button class="lkd-btn" id="lkd-btn" title="一键熔断 / 解除熔断（均需二次确认）" onclick="toggleLockdown()">🔒 熔断</button>
     <div class="spacer"></div>
     <span class="sub">自动刷新 <label class="switch"><input type="checkbox" id="auto-refresh" checked><span class="slider"></span></label></span>
     <button onclick="refresh()">刷新</button>
@@ -1706,6 +1785,18 @@ th.srt:hover{color:#dbe2ea}
         <div class="row"><button onclick="chGo(CH.page-1)">上一页</button><span class="hint" id="ch-info"></span><button onclick="chGo(CH.page+1)">下一页</button></div>
       </div>
     </section>
+    <section id="p-tasks" class="hidden">
+      <div class="card"><h2>任务 · 帧轨迹 Timeline（v0.5 §3.2 · 由 /v1/tasks 从 history 派生）</h2>
+        <div class="row"><input id="tk-corr" placeholder="correlation 批次过滤（回车查询）" style="flex:1" onkeydown="if(event.key==='Enter')loadTasks(true)">
+        <select id="tk-state" title="任务状态" onchange="loadTasks(true)"><option value="">全部状态</option><option value="pending">待接</option><option value="running">运行中</option><option value="succeeded">已成功</option><option value="failed">已失败</option><option value="declined">已拒绝</option><option value="cancelled">已取消</option><option value="cancelling">取消中</option><option value="rolled_back">已回滚</option></select>
+        <select id="tk-from" title="发起方（节点 / agent）" onchange="tkRender()" style="flex:1;min-width:220px"></select>
+        <select id="tk-to" title="承接方（节点 / agent）" onchange="tkRender()" style="flex:1;min-width:220px"></select>
+        <input id="tk-kw" placeholder="关键词：task_id / type / intent / 进度" style="flex:1" oninput="tkRender()"></div>
+        <div class="row"><button class="primary" onclick="loadTasks(true)">查询</button><button onclick="tkReset()">重置</button><span class="hint" id="tk-meta" style="flex:1"></span></div>
+        <div class="hint">时间线：发起(task_spec) → 接受 → 进度/状态 → 终态；红虚线点 🚫 = 熔断期间被拦帧（计入 blocked，不推进状态机、恢复后不补投）。点「发起/承接」即按对应节点/agent 过滤。</div>
+        <div id="tk-list"><span class="hint">加载中…</span></div>
+      </div>
+    </section>
     <section id="p-config" class="hidden">
       <div class="card"><h2>对话记录颜色标识</h2>
         <div class="hint" style="margin-bottom:8px">配色体系：外层深色胶囊＝节点（按 node_id 哈希固定，改名不漂移），内嵌亮色小胶囊＝agent（色相以所在节点为基准偏移，一眼看出归属）。手动选色保存到本节点 colors.json，全网查看者共享；勾回「自动色」即恢复算法色。</div>
@@ -1738,6 +1829,59 @@ const LS_KEY='al_token';
 let TOKEN=sessionStorage.getItem(LS_KEY)||'';
 const HDR=()=>({'X-Auth-Token':TOKEN});
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+/* ---------- v0.5 §3.2 任务 Timeline · §4.5 一键熔断（声明须早于 boot） ---------- */
+const TK_ST={'pending':'待接','running':'运行中','succeeded':'已成功','failed':'已失败','declined':'已拒绝','cancelled':'已取消','cancelling':'取消中','rolled_back':'已回滚'};
+const TK_TP={'task_spec':['发起','wn'],'task_ack':['确认',''],'task_go':['放行','ok'],'task_accepted':['接受','ok'],'task_progress':['进度','info'],'task_succeeded':['成功','ok'],'task_failed':['失败','bad'],'task_declined':['拒绝','bad'],'task_cancel':['取消令','bad'],'task_cancelled':['已取消','bad'],'task_rollback':['回滚','bad'],'task_rolled_back':['已回滚','bad']};
+let TASKS=[],AGID={},LKD={on:false,blocked_count:0,blocked_out:0,blocked_in:0};
+function renderLkd(){const b=el('lkd-state'),bg=el('lkd-badge'),btn=el('lkd-btn');if(!b||!bg||!btn)return;
+ if(LKD.on){b.textContent='开';b.style.color='#f85149';btn.classList.add('on');btn.textContent='🔒 熔断中 · 点击解除';bg.className='badge off';}
+ else{b.textContent='关';b.style.color='#3fb950';btn.classList.remove('on');btn.textContent='🔒 熔断';bg.className='badge on';}
+ bg.textContent='拦'+LKD.blocked_count;
+ bg.title='熔断累计被拦帧：本机发出 '+LKD.blocked_out+' · 入站 '+LKD.blocked_in+'（恢复后不补投）';}
+async function toggleLockdown(){
+ const msg=LKD.on?'解除熔断？\n恢复业务帧投递与转发；此前被拦的帧不会补投（v0.5 §4.5 薄档）。'
+  :'开启熔断？\n总线立即暂停投递/转发业务帧（agent→agent 消息、任务帧）；\n控制面帧（状态/心跳/注册）与 history / events / tasks 查询不受影响；\n恢复后不补投被拦帧。';
+ if(!confirm(msg))return;
+ try{const d=await j('/v1/lockdown',{method:'POST',body:JSON.stringify({on:!LKD.on})});
+  LKD={on:!!d.on,blocked_count:d.blocked_count||0,blocked_out:d.blocked_out||0,blocked_in:d.blocked_in||0};
+  renderLkd();toast(LKD.on?'熔断已开启：业务帧停投/停转发（控制面不受影响）':'熔断已解除：恢复投递，被拦帧不补投');refresh();
+ }catch(e){alert('熔断操作失败：'+(e.message||e));}}
+async function loadTasks(force){
+ if(!force&&(!el('p-tasks')||el('p-tasks').classList.contains('hidden')))return; // 面板隐藏不轮询（省 token）
+ const c=val('tk-corr'),s=val('tk-state');
+ let q='/v1/tasks?limit=200';if(c)q+='&correlation='+encodeURIComponent(c);if(s)q+='&state='+encodeURIComponent(s);
+ let d;try{d=await j(q);}catch(e){const m=el('tk-meta');if(m)m.textContent='任务加载失败：'+(e.message||e);return}
+ TASKS=d.tasks||[];
+ const bc=TASKS.reduce((a,t)=>a+(t.blocked_count||0),0);
+ el('tk-meta').textContent='共 '+d.total+' 个任务（本页 '+TASKS.length+'）· 被拦任务帧 '+bc+' · 数据由 history 投影派生';
+ tkRender();}
+function tkReset(){for(const i of ['tk-corr','tk-from','tk-to','tk-kw'])if(el(i))el(i).value='';el('tk-state').value='';loadTasks(true);}
+function tkEpMatch(v,t){if(!v)return true;
+ if(v.startsWith('agent:')){const rest=v.slice(6);const i=rest.indexOf(':');const id=rest.slice(i+1);return t.from_agent===id||t.to_agent===id;}
+ return AGID[t.from_agent]===v||AGID[t.to_agent]===v;}
+function tkCorr(c){el('tk-corr').value=c;loadTasks(true);}
+function tkEp(id,node,agent){const x=el(id);const v='agent:'+node+':'+agent;
+ if([...x.options].some(o=>o.value===v))x.value=v;tkRender();}
+function tkRender(){const box=el('tk-list');if(!box)return;
+ const f=val('tk-from'),t=val('tk-to'),kw=val('tk-kw').toLowerCase();
+ const list=TASKS.filter(x=>tkEpMatch(f,x)&&tkEpMatch(t,x)&&(!kw||JSON.stringify([x.task_id,x.type,x.intent,x.correlation,(x.progress||[]).map(p=>p.detail)]).toLowerCase().includes(kw)));
+ if(!list.length){box.innerHTML='<span class="hint">暂无匹配任务（任务帧：task_spec / task_accepted / task_progress / task_result 等，由 history 投影派生）</span>';return}
+ box.innerHTML=list.map(x=>{
+  const bcls=x.state==='succeeded'?'on':(x.state==='failed'||x.state==='declined'||x.state==='rolled_back')?'off':'';
+  const corr=x.correlation?`<button class="tbtn" title="按此 correlation 过滤整批任务" onclick="tkCorr('${esc(x.correlation)}')">批次 ${esc(String(x.correlation).slice(0,10))}</button>`:'';
+  const bc=x.blocked_count?`<span class="blkchip" title="熔断期间被拦的任务帧（trail 带 blocked 标记，不推进状态机、恢复后不补投）">🚫 拦${x.blocked_count}</span>`:'';
+  const fn=AGID[x.from_agent]||'',tn=AGID[x.to_agent]||'';
+  const fromChip=fn?`<button class="tbtn" title="按发起方节点/agent过滤" onclick="tkEp('tk-from','${esc(fn)}','${esc(x.from_agent)}')">发起 ${esc(whoa(fn,x.from_agent)||x.from_agent)} @${esc(who(fn))}</button>`:(x.from_agent?`<span class="sub">发起 ${esc(x.from_agent)}</span>`:'<span class="sub">发起 ?</span>');
+  const toChip=tn?`<button class="tbtn" title="按承接方节点/agent过滤" onclick="tkEp('tk-to','${esc(tn)}','${esc(x.to_agent)}')">承接 ${esc(whoa(tn,x.to_agent)||x.to_agent)} @${esc(who(tn))}</button>`:(x.to_agent?`<span class="sub">承接 ${esc(x.to_agent)}</span>`:'');
+  const tl=(x.trail||[]).map((tr,i)=>{
+   const tp=TK_TP[tr.topic]||[tr.topic,''];
+   const c=tr.blocked?'blk':tp[1];
+   const lb2=esc(String(tr.ts||'').slice(11,19))+(tr.blocked?' 🚫':'');
+   const title=esc(String(tr.ts||''))+' · '+(tr.blocked?'熔断已拦（未投递/转发，不补投）':esc(tr.topic+' / '+tr.direction))+' · '+esc(tr.from_agent||'?')+' → '+esc(tr.to_agent||'*')+' · '+esc(tr.msg_id);
+   return (i?'<div class="ln"></div>':'')+`<div class="tn ${c}" title="${title}"><div class="pt"></div><div class="lb">${esc(tp[0])}</div><div class="lb2">${lb2}</div></div>`;
+  }).join('');
+  return `<div class="tk"><div class="hd"><span class="badge ${bcls}">${esc(TK_ST[x.state]||x.state)}${x.total>1?' '+x.done+'/'+x.total:''}</span><span class="tid">${esc(x.type||'?')} · ${esc(x.task_id)}</span>${corr}${fromChip}${toChip}${bc}<span class="sub">${x.message_count} 帧</span></div>${x.intent?`<div class="sub" style="margin:6px 0 0">${esc(x.intent)}</div>`:''}<div class="tl">${tl}</div></div>`;
+ }).join('');}
 function fmt(ts){try{return new Date(ts).toLocaleString();}catch{return ts;}}
 let HIST=[],CHQ=null,COLORS={},OV={page:1},CH={page:1},NAMES={},AN={},AGENTS=[],SELF='';
 let PEERS=[],ST={},ASORT={k:'node',d:1},PSORT={k:'name',d:1},EXP=new Set(),LAST={ag:'',pe:'',op:'',hi:'',qt:'',cf:'',ch2:''};
@@ -1799,7 +1943,8 @@ function histRow(m){
   const showTxt=open?full:(long?full.slice(0,260)+'…':full);
   const tg=long?`<button class="tbtn" onclick="tgExp('${esc(m.msg_id)}')">${open?'收起':'展开'}</button>`:'';
   const det=open?`<div class="det">msg_id: ${esc(m.msg_id)} · ${esc(m.direction)} · from ${esc(m.from)}${m.from_agent?' / '+esc(m.from_agent):''} → to ${esc(m.to)}${m.to_agent?' / '+esc(m.to_agent):''} · 类型: ${esc(m.kind)}/${esc(m.action)} · ts: ${esc(m.ts)}</div>`:'';
-  return `<div class="msg ${dir}"><div class="meta">${fmt(m.ts)} · ${dirLab(m)} · ${chip(m.from,m.from_agent)} → ${chip(m.to,m.to_agent)} · <span class="k">${esc(m.kind)}/${esc(m.action)}</span> · ${cpy}${tg}</div><div class="pay">${esc(showTxt)}</div>${det}</div>`;
+  const blk=m.blocked?`<span class="blkchip" title="v0.5 §4.5：熔断期间被拦，未投递/转发，恢复后不补投">🚫 熔断已拦</span> · `:'';
+  return `<div class="msg ${dir}${m.blocked?' blk':''}"><div class="meta">${fmt(m.ts)} · ${dirLab(m)} · ${blk}${chip(m.from,m.from_agent)} → ${chip(m.to,m.to_agent)} · <span class="k">${esc(m.kind)}/${esc(m.action)}</span> · ${cpy}${tg}</div><div class="pay">${esc(showTxt)}</div>${det}</div>`;
 }
 function humanSize(n){if(!n)return '';if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(1)+' MB';}
 function filterHist(kw,arr){if(!kw)return arr.slice();return arr.filter(m=>JSON.stringify({f:m.from,a:m.from_agent,t:m.to,ta:m.to_agent,k:m.kind,p:m.payload}).toLowerCase().includes(kw.toLowerCase()));}
@@ -1879,7 +2024,7 @@ async function boot(){
 }
 boot();
 async function j(p,opt){const o=opt||{};const h={...HDR(),...(o.headers||{})};if(o.body&&typeof o.body==='string'&&!h['Content-Type']&&!h['content-type'])h['Content-Type']='application/json';const r=await fetch(p,{...o,headers:h});const txt=await r.text();let d={};try{d=txt?JSON.parse(txt):{};}catch{d={error:txt.slice(0,300)};}if(r.status===401){sessionStorage.removeItem(LS_KEY);needToken();throw new Error('401');}if(!r.ok)throw new Error('HTTP '+r.status+' '+((d&&(d.error||d.err))||txt.slice(0,200)||r.statusText));return d;}
-function show(panel){document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.p===panel));document.querySelectorAll('.content>section').forEach(s=>s.classList.add('hidden'));$('p-'+panel).classList.remove('hidden');if(panel==='config')renderColorCfg();}
+function show(panel){document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.p===panel));document.querySelectorAll('.content>section').forEach(s=>s.classList.add('hidden'));$('p-'+panel).classList.remove('hidden');if(panel==='config')renderColorCfg();if(panel==='tasks')loadTasks(true);}
 function input(id){return ($(id)&&$(id).value||'').trim();}
 function el(id){return document.getElementById(id);}
 function val(id){const e=el(id);return e?(e.value||'').trim():'';}
@@ -2045,7 +2190,7 @@ function fillChEps(){
  for(const a of AGENTS)cqn+=`<option value="agent:${esc(a.node_id)}:${esc(a.agent_id)}">${esc(a.node_name||who(a.node_id))} · ${esc(a.agent_id)}${a.online?'':'（离线）'}</option>`;
  cqn+='</optgroup>';
  if(!selecting()&&cqn!==LAST.ch2){LAST.ch2=cqn;
-  [el('ch-from'),el('ch-to')].forEach(x=>{if(!x)return;const c=x.value;x.innerHTML=cqn;if(c&&[...x.options].some(o=>o.value===c))x.value=c;});}}
+  [el('ch-from'),el('ch-to'),el('tk-from'),el('tk-to')].forEach(x=>{if(!x)return;const c=x.value;x.innerHTML=cqn;if(c&&[...x.options].some(o=>o.value===c))x.value=c;});}}
 function renderColorCfg(){const box=el('cf-colors');if(!box||box.contains(document.activeElement))return;
  const ids=new Map();
  for(const a of AGENTS){ids.set('agent:'+a.node_id+'|'+a.agent_id,(a.node_name||who(a.node_id))+' · '+(a.name||a.agent_id));}
@@ -2076,7 +2221,7 @@ async function refresh(){
  histStats();
  try{
   if(el('ed-input')||el('rn-input'))return; // 行内改名编辑中：跳过本轮刷新，防止重绘冲掉编辑框
-  const [st,peers,agents,hist,cols]=await Promise.all([j('/v1/status'),j('/v1/peers'),j('/v1/fleet/agents'),j('/v1/history'),j('/v1/colors')]);
+  const [st,peers,agents,hist,cols,lk]=await Promise.all([j('/v1/status'),j('/v1/peers'),j('/v1/fleet/agents'),j('/v1/history'),j('/v1/colors'),j('/v1/lockdown').catch(e=>null)]);
   // 用户正在选择/复制文本或操作控件：只更新内存数据，不重写 DOM、不覆盖未保存完的配色（下一轮自动恢复渲染）
   const sel=selecting()||ctlBusy();
   if(!sel)COLORS=(cols&&cols.colors)||{};
@@ -2086,11 +2231,13 @@ async function refresh(){
   $('m-nodes').textContent=`${st.peers_online}/${st.peers_known}`;
   $('m-history').textContent=hist.history.length;
   $('m-transfer').textContent=st.active_transfers;
+  if(lk&&typeof lk.on==='boolean'){LKD={on:!!lk.on,blocked_count:lk.blocked_count||0,blocked_out:lk.blocked_out||0,blocked_in:lk.blocked_in||0};renderLkd();}
   // 节点名 / agent 名映射（给人看）
   NAMES={}; AN={};
   if(st&&st.node_id){NAMES[st.node_id]=st.name||st.node_id;}
   for(const p of PEERS)NAMES[p.node_id]=p.name;
   for(const a of AGENTS){AN[a.node_id+'|'+a.agent_id]=(a.name||a.agent_id); NAMES[a.node_id]=a.node_name||NAMES[a.node_id]||a.node_id;}
+  AGID={};for(const a of AGENTS)AGID[a.agent_id]=a.node_id;
   if(!sel){renderPeers();renderAgents();fillChEps();renderColorCfg();}
   // 目标下拉（纯选择）——签名相同不重写，保住控件状态
   let opn='<optgroup label="节点（发给整机）"><option value="*">* 广播（全部节点）</option>';
@@ -2145,7 +2292,7 @@ function initSideResize(){const rz=el('side-resize');if(!rz)return;let dr=null;
   else{localStorage.setItem('al_sbc',($('sidebar').classList.contains('coll')?'0':'1'));applySide();}});
  rz.addEventListener('pointercancel',()=>{dr=null;});}
 applySide();initSideResize();
-setInterval(()=>{if($('auto-refresh').checked)refresh();},2000);
+setInterval(()=>{if($('auto-refresh').checked){refresh();loadTasks(false);}},2000);
 </script></body></html>"#;
     HTML.replace("__LEN__", &history_len.to_string())
         .replace("__VER__", VERSION)

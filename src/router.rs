@@ -142,7 +142,10 @@ pub struct AgentRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{cap_matches, tasks_projection, HistoryEntry, TaskFilter};
+    use super::{
+        cap_matches, lockdown_blocks_frame, tasks_projection, Config, Envelope, HistoryEntry,
+        Router, TaskFilter,
+    };
     use serde_json::json;
 
     fn task_entry(seq: u64, payload: serde_json::Value, from: &str, to: &str) -> HistoryEntry {
@@ -160,6 +163,7 @@ mod tests {
             seq,
             reply_to: None,
             payload,
+            blocked: None,
         }
     }
 
@@ -172,6 +176,138 @@ mod tests {
         assert!(!cap_matches("cap:edit:py", "cap:edit:js"));
         assert!(!cap_matches("cap:node", "cap:node:reboot"));
         assert!(cap_matches("*", "cap:whatever:x"));
+    }
+
+    #[test]
+    fn lockdown_blocks_frame_rules() {
+        // v0.5 §4.5 薄档：业务帧拦截，控制面帧放行；HTTP 查询面不经此判定，天然畅通。
+        assert!(lockdown_blocks_frame("msg"));
+        assert!(lockdown_blocks_frame("file"));
+        assert!(lockdown_blocks_frame("task"));
+        assert!(!lockdown_blocks_frame("ctrl"));
+        assert!(!lockdown_blocks_frame("event"));
+    }
+
+    #[test]
+    fn tasks_projection_blocked_frames_marked_not_replayed() {
+        let mk = |seq: u64, topic: &str, blocked: bool| {
+            let mut e = task_entry(
+                seq,
+                json!({"topic": topic, "task_id": "t9", "type": "deploy.demo",
+                        "intent": "i", "correlation": "c9"}),
+                "worker",
+                "orch",
+            );
+            e.blocked = if blocked { Some(true) } else { None };
+            e
+        };
+        let spec = mk(1, "task_spec", false);
+        let blocked_acc = mk(2, "task_accepted", true);
+        // 被拦的 accept 不推进状态机：任务保持 pending，但 trail 里有它（带 blocked 标记）。
+        let out = tasks_projection(&[spec.clone(), blocked_acc.clone()], &TaskFilter::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].state, "pending");
+        assert_eq!(out[0].blocked_count, 1);
+        assert_eq!(out[0].trail.len(), 2);
+        assert!(out[0].trail[1].blocked);
+        assert_eq!(out[0].message_count, 2);
+        // 熔断解除后重发的 accept + succeeded 正常推进到终态，trail 完整保留被拦那一帧。
+        let acc = mk(3, "task_accepted", false);
+        let done = mk(4, "task_succeeded", false);
+        let out2 = tasks_projection(&[spec, blocked_acc, acc, done], &TaskFilter::default());
+        assert_eq!(out2[0].state, "succeeded");
+        assert!(out2[0].terminal);
+        assert_eq!(out2[0].blocked_count, 1);
+        assert_eq!(out2[0].trail.len(), 4);
+        assert_eq!(out2[0].trail[0].topic, "task_spec");
+        assert_eq!(out2[0].trail[3].topic, "task_succeeded");
+        assert!(!out2[0].trail[3].blocked);
+    }
+
+    #[tokio::test]
+    async fn router_lockdown_gates_send_and_incoming() {
+        let mut cfg = Config::generate(
+            Some("router-lockdown-test".to_string()),
+            Some("tok".to_string()),
+            Some("trust".to_string()),
+        );
+        cfg.data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("router-lockdown-test");
+        cfg.history.enabled = true;
+        cfg.history.file = String::new();
+        cfg.delivery.persist = false;
+        let node = cfg.node_id.clone();
+        let r = Router::new(&cfg);
+        assert!(!r.lockdown_on());
+
+        let biz = || {
+            Envelope::business(
+                &node,
+                &node,
+                "msg",
+                "send",
+                json!({ "content": "hello" }),
+                None,
+                None,
+                Some("a1".to_string()),
+                Some("b1".to_string()),
+            )
+        };
+        // 未熔断：业务帧畅通。
+        r.send(biz()).await.unwrap();
+        assert_eq!(r.blocked_count(), 0);
+
+        // 熔断开启：本机发出侧业务帧被拦，带审计标记并计数。
+        r.set_lockdown(true);
+        let blocked = biz();
+        let err = r.send(blocked.clone()).await.unwrap_err().to_string();
+        assert!(err.contains("lockdown"), "err={err}");
+        let (on, out, _) = r.lockdown_stats();
+        assert!(on);
+        assert_eq!(out, 1);
+        assert_eq!(r.blocked_count(), 1);
+        let h = r.history();
+        assert!(h
+            .iter()
+            .any(|e| e.blocked == Some(true) && e.msg_id == blocked.msg_id));
+
+        // 控制面帧照常放行，不计数。
+        let ctrl = Envelope::business(
+            &node,
+            &node,
+            "ctrl",
+            "status",
+            json!({ "ok": true }),
+            None,
+            None,
+            None,
+            None,
+        );
+        r.send(ctrl).await.unwrap();
+        assert_eq!(r.lockdown_stats().1, 1);
+
+        // 入站业务帧同样被拦：handle_incoming 返回 false，不进投递链。
+        let peer = Envelope::business(
+            "peer-node",
+            &node,
+            "msg",
+            "send",
+            json!({ "content": "x" }),
+            None,
+            None,
+            None,
+            Some("b1".to_string()),
+        );
+        assert!(!r.handle_incoming(&peer).await);
+        assert_eq!(r.lockdown_stats().2, 1);
+
+        // 恢复后新业务帧放行；被拦帧不补投（此后不再新增 blocked 记录）。
+        r.set_lockdown(false);
+        r.send(biz()).await.unwrap();
+        let h2 = r.history();
+        assert_eq!(h2.iter().filter(|e| e.blocked == Some(true)).count(), 2);
+        assert!(h2.iter().any(|e| e.blocked.is_none() && e.action == "send"));
     }
 
     #[test]
@@ -393,6 +529,10 @@ pub struct HistoryEntry {
     pub reply_to: Option<String>,
     #[serde(default)]
     pub payload: serde_json::Value,
+    /// v0.5 §4.5 薄档：该帧被 lockdown 熔断拦截、**未投递/转发**。缺省
+    /// （None）＝正常帧。审计可见性标记：history / `/v1/events` / /web 均透出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<bool>,
 }
 
 /// Incremental event-stream read result for `/v1/events` (v0.5 §1).
@@ -447,7 +587,32 @@ pub struct TaskView {
     pub last_ts: String,
     pub progress_count: u64,
     pub message_count: u64,
+    /// 轨迹中被 lockdown 拦截（未投递/转发）的帧数（v0.5 §4.5 薄档）。
+    pub blocked_count: u64,
+    /// 帧轨迹（timeline 数据源）：按环序（seq 升序）的 task_* 消息清单，
+    /// 供 /web『任务』页画 发起→确认→进度→终态 横向时间线（路线图 §3.2）。
+    /// 被拦帧也在 trail 里、带 `blocked: true`，但不参与状态机回放。
+    pub trail: Vec<TaskTrailItem>,
     pub terminal: bool,
+}
+
+/// One message on a task's trail (a timeline node). Deliberately thin:
+/// topic + ts + direction, not full payloads — the history view has those.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskTrailItem {
+    pub seq: u64,
+    pub ts: String,
+    pub topic: String,
+    pub msg_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_agent: Option<String>,
+    /// "in"/"out" relative to this node (the observing bus).
+    pub direction: String,
+    /// true = 该帧被 lockdown 拦截、未投递（v0.5 §4.5）。常显序列化，
+    /// 便于 /web timeline 与冒烟断言无需区分缺省。
+    pub blocked: bool,
 }
 
 /// Task-protocol topics (docs/task-protocol.md §1). Anything else in a
@@ -479,6 +644,16 @@ fn is_hard_terminal(state: &str) -> bool {
     )
 }
 
+/// v0.5 §4.5 薄档 lockdown 的**转发判定**（纯函数，单测覆盖）：
+/// lockdown 熔断只拦**业务帧**——agent→agent 消息与任务协议帧（kind 为
+/// `msg`/`text`/`file` 等业务种类）；**控制面帧**（`ctrl`：heartbeat/ack/
+/// agents_update/注册/agent_status 等，以及 `event`：presence 广播）放行。
+/// HTTP 查询面（`/v1/lockdown` 本身、`/v1/history*`、`/v1/events`、
+/// `/v1/tasks`、`/web`）不经此判定，天然不受影响。
+pub fn lockdown_blocks_frame(kind: &str) -> bool {
+    kind != "ctrl" && kind != "event"
+}
+
 /// Project task messages from the history ring into task objects, replaying
 /// the protocol §3 state machine per `task_id` in ring (seq) order.
 ///
@@ -507,6 +682,8 @@ pub fn tasks_projection(entries: &[HistoryEntry], f: &TaskFilter) -> Vec<TaskVie
         last_ts: String,
         progress_count: u64,
         message_count: u64,
+        blocked_count: u64,
+        trail: Vec<TaskTrailItem>,
     }
 
     let mut order: Vec<String> = Vec::new();
@@ -534,9 +711,23 @@ pub fn tasks_projection(entries: &[HistoryEntry], f: &TaskFilter) -> Vec<TaskVie
                 ..Default::default()
             }
         });
+        let blocked = e.blocked.unwrap_or(false);
         acc.message_count += 1;
+        if blocked {
+            acc.blocked_count += 1;
+        }
         acc.seq = acc.seq.max(e.seq);
         acc.last_ts = e.ts.clone();
+        acc.trail.push(TaskTrailItem {
+            seq: e.seq,
+            ts: e.ts.clone(),
+            topic: topic.to_string(),
+            msg_id: e.msg_id.clone(),
+            from_agent: e.from_agent.clone(),
+            to_agent: e.to_agent.clone(),
+            direction: e.direction.clone(),
+            blocked,
+        });
         match topic {
             "task_spec" => {
                 if acc.spec.is_none() {
@@ -569,7 +760,9 @@ pub fn tasks_projection(entries: &[HistoryEntry], f: &TaskFilter) -> Vec<TaskVie
                 }
             }
         }
-        if topic == "task_progress" {
+        if blocked {
+            // 被拦帧只留 trail 标记：不推进状态机、不计进度（v0.5 §4.5）。
+        } else if topic == "task_progress" {
             acc.progress_count += 1;
         } else if !is_hard_terminal(&acc.state) {
             let next = match topic {
@@ -607,6 +800,8 @@ pub fn tasks_projection(entries: &[HistoryEntry], f: &TaskFilter) -> Vec<TaskVie
                 last_ts: a.last_ts,
                 progress_count: a.progress_count,
                 message_count: a.message_count,
+                blocked_count: a.blocked_count,
+                trail: a.trail,
             })
         })
         .collect();
@@ -667,6 +862,16 @@ pub struct Router {
     /// Seconds a non-online local agent may stay un-refreshed before it is
     /// auto-removed. 0 disables the cleanup.
     agent_ttl: i64,
+    /// v0.5 §4.5 薄档一键熔断：true 时总线暂停投递/转发**业务帧**
+    /// （agent→agent 消息、任务帧，即 kind ∉ {ctrl, event}）；控制面帧
+    /// （status/heartbeat/注册/lockdown 本身/history/events 查询）不受影响。
+    /// 运行时状态，**不落盘**——节点重启默认恢复放行（人工应急闸语义）。
+    /// 恢复后**不补投**被拦帧（v0.5 薄档；被拦帧只留审计标记）。
+    lockdown: AtomicBool,
+    /// 本机发出侧（`/v1/send` → 网络/本地投递前）被拦业务帧计数。
+    blocked_out: AtomicU64,
+    /// 本机入站侧（WS 帧到达本节点后被拦）计数。
+    blocked_in: AtomicU64,
 }
 
 impl Router {
@@ -766,6 +971,9 @@ impl Router {
             // tick so replayed duplicates/expired entries do not accumulate.
             compact_due: AtomicBool::new(persist),
             agent_ttl,
+            lockdown: AtomicBool::new(false),
+            blocked_out: AtomicU64::new(0),
+            blocked_in: AtomicU64::new(0),
         }
     }
 
@@ -900,6 +1108,7 @@ impl Router {
             seq: 0,
             reply_to: env.reply_to,
             payload: env.payload,
+            blocked: None,
         })
     }
 
@@ -1006,12 +1215,64 @@ impl Router {
 
     // ---- outbound (local agent -> network) ---------------------------------
 
+    /// v0.5 §4.5 薄档：一键熔断开关（管理面调用；运行时状态，不落盘）。
+    /// 返回切换后的新状态。切换本身写日志，供审计定位熔断窗口。
+    pub fn set_lockdown(&self, on: bool) -> bool {
+        let prev = self.lockdown.swap(on, Ordering::Relaxed);
+        if prev != on {
+            tracing::warn!(
+                on,
+                blocked_total = self.blocked_count(),
+                "router: lockdown {}",
+                if on {
+                    "ON — business frames blocked"
+                } else {
+                    "OFF — bus resumed (blocked frames are NOT replayed)"
+                }
+            );
+        }
+        on
+    }
+
+    pub fn lockdown_on(&self) -> bool {
+        self.lockdown.load(Ordering::Relaxed)
+    }
+
+    /// (on, blocked_out, blocked_in)
+    pub fn lockdown_stats(&self) -> (bool, u64, u64) {
+        (
+            self.lockdown_on(),
+            self.blocked_out.load(Ordering::Relaxed),
+            self.blocked_in.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn blocked_count(&self) -> u64 {
+        self.blocked_out.load(Ordering::Relaxed) + self.blocked_in.load(Ordering::Relaxed)
+    }
+
     /// Send an envelope addressed to a specific peer or `"*"`.
     pub async fn send(&self, mut env: Envelope) -> anyhow::Result<String> {
         env.v = PROTOCOL_VERSION;
         env.from = self.cfg.node_id.clone();
         if env.msg_id.is_empty() {
             return Err(anyhow::anyhow!("envelope needs a msg_id"));
+        }
+        // v0.5 §4.5 薄档熔断：lockdown 期间业务帧在本机出口直接拦截——
+        // 不投递、不入离线队列、恢复后不补投。只留一条 blocked 审计标记。
+        // 控制面帧（ctrl/event）照常，HTTP 查询面不经此路径、天然畅通。
+        if self.lockdown_on() && lockdown_blocks_frame(&env.kind) {
+            let n = self.blocked_out.fetch_add(1, Ordering::Relaxed) + 1;
+            let node = if env.to == "*" || env.to.is_empty() {
+                "*"
+            } else {
+                &env.to
+            };
+            self.record_history_marked(&env, "out", node, true);
+            tracing::info!(msg_id = %env.msg_id, kind = %env.kind, to = %env.to, "router: lockdown blocked outbound business frame");
+            return Err(anyhow::anyhow!(
+                "lockdown: 总线熔断开启，业务帧已拦截（累计 {n}，恢复后不补投）"
+            ));
         }
         if self.cfg.security.mode == "strict" {
             let sig = envelope_sign(
@@ -1118,6 +1379,15 @@ impl Router {
     pub async fn handle_incoming(&self, env: &Envelope) -> bool {
         if !self.verify_incoming(env) {
             tracing::warn!(msg_id = %env.msg_id, from = %env.from, "router: incoming rejected (signature or timestamp)");
+            return false;
+        }
+        // v0.5 §4.5 薄档熔断：入站业务帧同样拦截（不投递给本地 agent、
+        // 不记录为已送达）；返回 false 但连接层的 ack 照常——发送方据此
+        // 停止重发，被拦帧恢复后不补投。控制面帧照常。
+        if self.lockdown_on() && lockdown_blocks_frame(&env.kind) {
+            self.blocked_in.fetch_add(1, Ordering::Relaxed);
+            self.record_history_marked(env, "in", &env.from, true);
+            tracing::info!(msg_id = %env.msg_id, kind = %env.kind, from = %env.from, "router: lockdown blocked inbound business frame");
             return false;
         }
         let is_new = {
@@ -1538,6 +1808,11 @@ impl Router {
     // ---- conversation history (M7) -------------------------------------------
 
     pub fn record_history(&self, env: &Envelope, direction: &str, node: &str) {
+        self.record_history_marked(env, direction, node, false);
+    }
+
+    /// History write with the v0.5 §4.5 lockdown audit marker (`blocked`).
+    fn record_history_marked(&self, env: &Envelope, direction: &str, node: &str, blocked: bool) {
         if !self.cfg.history.enabled {
             return;
         }
@@ -1560,6 +1835,7 @@ impl Router {
             // v0.5 §2: observer copy is sanitized; the delivered frame above
             // (routed from `env` directly) still carries the original payload.
             payload: self.redactor.redact_value(&env.payload),
+            blocked: if blocked { Some(true) } else { None },
         };
         self.push_history(entry);
     }
@@ -1688,6 +1964,7 @@ impl Router {
                 "size": size,
                 "saved_path": saved_path,
             })),
+            blocked: None,
         };
         self.push_history(entry);
     }
