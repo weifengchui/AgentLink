@@ -100,6 +100,16 @@
 
 多 region/geo-failover、千节点集群、HSM/FIPS、SAP/Salesforce 手写连接器——客群（个人/OPC/中小团队）不存在这些场景，不进路线图；企业数据平台对接以"导出接口"（Kafka/webhook）替代。
 
-## 7. 版本增量惯例延续
+## 7. 商业模式（草案，待拍板）
+
+**AgentLink 免费 / AgentMesh 收费**，一个代码库两种构建（feature gate，单二进制形态不变，license=本地文件）：
+
+- **AgentLink（OSS，Apache-2.0，永远免费）**：总线/文件/发现/注册表/事件流/**任务协议 spec 公开**/基础 web/CLI 薄壳。免费层必须传输完整、单独可用——协议公开即生态护城河，他人在总线上写编排器=替我们做标准。
+- **AgentMesh（收费）**：内置 reconcile 引擎+调度、断点续传/迁移、RBAC/ABAC、mTLS+内置 CA、不可变审计、消息护栏、GitOps、配额隔离、chaos、HA(Raft)、WASM 插件市场、OIDC。卖的是"敢放进团队生产"的治理与省心，不是第二条总线。
+- **定价**：按*被 Mesh 调度的节点数*计费，控制节点一律免费。Starter ≤15 机（OPC）/ Pro ≤50 机（治理件）/ Enterprise（HA/SSO/多租户，年框）。自托管 + 离线 license、绝不 phone-home（与"数据不出 LAN"宣言一致，本地验签+本地点数）。
+- **与版本对应**：v0.5 全进 OSS；v0.6 引擎内核化=Mesh 收费起点；v0.7=Pro；v1.0=Enterprise。
+- **红线**：support/hosting 不做主营收（OPC 扛不动 SLA），营收只靠 license。
+
+## 8. 版本增量惯例延续
 
 每个 minor 升版照旧滚动升级协议先升自家舰队再放包（08:00–22:00 窗、先远端后本机）；v0.5 起 task 协议自身就是升级编排的新底座——吃自己的狗粮。
