@@ -23,6 +23,8 @@
 > 对话消息按话题链可视化，悬停/点选节点、agent、消息卡片只显示相关连线与目的地；
 > 历史记录条目新增 `reply_to` 透传，`/v1/history/search` 返回回复链元数据。
 >
+> v0.4.19：Web 控制台第四轮修订（星图弹窗滚轮分区与换组按钮、节点圈收缩、侧栏拖拽/折叠、全局状态栏、全面局部刷新）。
+>
 > v0.4.10：数据目录默认外置（Windows `%LOCALAPPDATA%\AgentLink\data`、Linux `~/.local/share/agentlink`），
 > 不再放软件目录里以免升级覆盖；`agentlink.json` 的 `data_dir` 可按机器各自改为绝对路径，
 > 相对路径以配置文件目录为基准。发布包新增 `SKILL-agent-registration.md`（Agent 上线注册技能，
