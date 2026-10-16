@@ -3,9 +3,9 @@
 
 ## 一、身份与拓扑（记忆条目全文镜像）
 - 我 = Hermes profile `agentlink`，agent_id/name=agentlink（逐字符小写）。
-- 网格机 .7/.50/.10/.14 间 agent 同名合法——寻址必须 `node_id+agent_id` 成对；按名字找 agent=bug。
-- 本机节点：127.0.0.1:8765，node_id=e5827032190c，v0.4.14。Windows 侧 `E:\软件工具\AgentLink-v0.4.11-bundle\启动.bat` 运行；活配置=同目录 `agentlink.json`（local_api.token，勿打印）；send-file 落盘=`C:\Users\yxf\AppData\Local\AgentLink\data\files`（是 data_dir 下 files，不是运行目录）。
-- 对端：.50=4f793d7cd6fc · .10=f013cdcb7c91 · .14(新)=f5424c2f0a76 待注册。发前必查 /v1/peers。
+- 网格机 .7/.50/.10/.60 间 agent 同名合法——寻址必须 `node_id+agent_id` 成对；按名字找 agent=bug。
+- 本机节点：127.0.0.1:8765，node_id=e5827032190c，v0.4.16。Windows 侧 `E:\软件工具\AgentLink-v0.4.11-bundle\启动.bat` 运行；活配置=同目录 `agentlink.json`（local_api.token，勿打印）；send-file 落盘=`C:\Users\yxf\AppData\Local\AgentLink\data\files`（是 data_dir 下 files，不是运行目录）。
+- 对端：.50=4f793d7cd6fc · .10=f013cdcb7c91 · .60(新)=f5424c2f0a76 待上线自报（旧误记 .14，10-16 .7/.10 双端观测一致已勘正）。发前必查 /v1/peers。
 - 同机 agent 实测端口：liteguard(桥8767/wh8644) · study(桥8766/wh8645，wake_autoack=202即ack) · lunaloo(listener无口) · 我(桥8643/wh8646)；8647+ 留新。
 - 名册：/home/yxf/.agentlink/roster.md（v1.1，.50/.10 已自报回填）。
 
@@ -25,9 +25,9 @@
 - 验收法：`from_agent=selftest-peer` 发总线件→90s 内看 gateway.log 唤醒会话 terminal 执行 /ack(200)+handled.jsonl 追加+inbox 清零（本机实测 25s）
 
 ## 四、升级规程（.50 协调协议 v1）
-- 执行器=E:\软件工具\AgentLink-v0.4.11-bundle\upgrade_runner.py（md5 7113133cec86de2a32fad25f1845c39a，须含 errors="replace"×2）
+- 执行器=E:\软件工具\AgentLink-v0.4.11-bundle\upgrade_runner.py——执行前必 grep 三道防线 `errors="replace"`(新版×3)/`failed_after_kill`/`pick_base`；包内 runner 可能比 bundle 现装的新（10-16 0.4.16 实测：旧 bundle runner 仅 errors×2、无 pick_base/failed_after_kill），以包内版为准，先备份旧 runner（.old-no-pickbase）再替换执行
 - 流程：核 sha 全串→（runner 自动）备份 backups/v<旧>_<ts>→taskkill→换件→bat 拉起→health 轮询→失败自动回滚；台账=节点目录 upgrade-ledger.jsonl，**勿带 --git-ledger**（那是 .50 路径）
-- 实例：10-15 11:13 升 0.4.13（trigger msg:4eee140b）；11:31 升 0.4.14（msg:0414-a7），均 4.0s done，身份未漂移
+- 实例：10-15 11:13 升 0.4.13（trigger msg:4eee140b）；11:31 升 0.4.14（msg:0414-a7）；10-16 08:26 升 0.4.16（msg:e74a2f98，exit 0，4006ms，backup backups/v0.4.14_20261016-082644，autostart --force 重注册），均身份未漂移
 - 安全阀：崩溃/health 60s 不可达→backups 装回旧 exe+启动.bat 拉起，回报 failed_after_kill
 
 ## 五、发送纪律
