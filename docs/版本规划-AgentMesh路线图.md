@@ -100,7 +100,7 @@
 
 多 region/geo-failover、千节点集群、HSM/FIPS、SAP/Salesforce 手写连接器——客群（个人/OPC/中小团队）不存在这些场景，不进路线图；企业数据平台对接以"导出接口"（Kafka/webhook）替代。
 
-## 7. 商业模式（草案，待拍板）
+## 7. 商业模式（2026-10-16 拍板，正本）
 
 **AgentLink 免费 / AgentMesh 收费**，一个代码库两种构建（feature gate，单二进制形态不变，license=本地文件）：
 
