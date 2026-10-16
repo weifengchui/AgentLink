@@ -45,7 +45,7 @@ echo 配对成功（strict 模式）.
 
 :run
 rem -- ensure per-user autostart (Startup folder, silent) --
-"%~dp0agentlink.exe" autostart >nul 2>&1
+"%~dp0agentlink.exe" autostart --force >nul 2>&1
 echo 启动 AgentLink... （关闭本窗口即停止）
 "%~dp0agentlink.exe" run
 echo.
