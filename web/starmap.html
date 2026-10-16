@@ -36,21 +36,23 @@ background:linear-gradient(180deg,rgba(4,7,13,.82),transparent)}
 #hud{display:flex;gap:22px;font-size:calc(12px*var(--fs));color:var(--mut)}
 #hud b{color:var(--txt);font-size:calc(15px*var(--fs));font-family:ui-monospace,Consolas,monospace}
 /* ---------- stations (v1 minimal) ---------- */
-.station{position:absolute;width:150px;height:150px;transform:translate(-50%,-50%);cursor:grab;z-index:3}
+/* R5（10-16 第五轮）：节点圆整体再缩一档——orb 直径 46→38；感应盒 150→76（比 orb 大一圈即可，
+   配合 R3：鼠标从胶囊走向卡片时不再横穿节点感应区，误收卡组的机会随之大减） */
+.station{position:absolute;width:76px;height:76px;transform:translate(-50%,-50%);cursor:grab;z-index:3}
 .station.drag{cursor:grabbing}
 .station:hover{z-index:4}
-.station .orb{position:absolute;inset:52px;border-radius:50%;pointer-events:none;
+.station .orb{position:absolute;inset:19px;border-radius:50%;pointer-events:none;
 background:radial-gradient(circle at 35% 28%,rgba(255,255,255,.30),transparent 60%),
 radial-gradient(circle at 50% 60%,rgba(12,24,40,.55),rgba(7,13,24,.94) 74%);
 border:1.5px solid var(--sc,#7fb0ff);
 box-shadow:0 0 24px var(--scg,rgba(127,176,255,.35)),inset 0 0 18px rgba(127,176,255,.12)}
-.station .ring{position:absolute;inset:40px;border:1px solid var(--sc,#7fb0ff);border-radius:50%;opacity:.22;pointer-events:none}
-.station .pulse{position:absolute;inset:40px;border-radius:50%;border:1px solid var(--sc,#7fb0ff);
+.station .ring{position:absolute;inset:12px;border:1px solid var(--sc,#7fb0ff);border-radius:50%;opacity:.22;pointer-events:none}
+.station .pulse{position:absolute;inset:12px;border-radius:50%;border:1px solid var(--sc,#7fb0ff);
 opacity:0;animation:stpulse 3.6s ease-in-out infinite;pointer-events:none}
 @keyframes stpulse{0%,100%{transform:scale(.8);opacity:0}50%{transform:scale(1.14);opacity:.4}}
 .station .glyph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
-.station .glyph span{font-size:calc(12px*var(--fs));font-family:ui-monospace,Consolas,monospace;letter-spacing:.06em;color:#eaf4ff;opacity:.92;text-shadow:0 0 10px var(--scg,rgba(120,190,255,.9))}
-.station .lab{position:absolute;top:100%;left:-60px;right:-60px;margin-top:-32px;text-align:center;pointer-events:none}
+.station .glyph span{font-size:calc(10px*var(--fs));font-family:ui-monospace,Consolas,monospace;letter-spacing:.04em;color:#eaf4ff;opacity:.92;text-shadow:0 0 10px var(--scg,rgba(120,190,255,.9))}
+.station .lab{position:absolute;top:100%;left:-60px;right:-60px;margin-top:-14px;text-align:center;pointer-events:none}
 .station .lab b{font-size:calc(13px*var(--fs));letter-spacing:.12em;color:#d8e6f4;font-weight:600;text-shadow:0 1px 4px #000}
 .station .lab i{display:block;font-style:normal;font-size:calc(10.5px*var(--fs));color:#8ea6bd;
 font-family:ui-monospace,Consolas,monospace;letter-spacing:.05em}
@@ -141,15 +143,24 @@ transition:transform .28s cubic-bezier(.2,1.3,.4,1)}
 #vlist .row .t{font-size:calc(10px*var(--fs));color:var(--mut);flex:none;font-family:ui-monospace,Consolas,monospace}
 #vlist .row .s{font-size:calc(11px*var(--fs));color:#b7c6d9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:6px}
 #vmain{flex:1;padding:22px 26px 34px;overflow-y:auto;position:relative}
-/* R2（10-16 第四轮）：弹窗左右边缘的上一组/下一组悬浮按钮（组数>1 时 .show 显示） */
-.gn{position:absolute;top:50%;transform:translateY(-50%);z-index:3;width:34px;height:56px;border-radius:10px;
+/* R2（10-16 第五轮）：弹窗内滚动条深色定制——细窄圆角，thumb 随话题主题色 */
+#vlist,#vmain{scrollbar-width:thin;scrollbar-color:rgba(127,176,255,.32) rgba(255,255,255,.04)}
+#vlist::-webkit-scrollbar,#vmain::-webkit-scrollbar{width:9px;height:9px}
+#vlist::-webkit-scrollbar-track,#vmain::-webkit-scrollbar-track{background:rgba(255,255,255,.04);border-radius:8px}
+#vlist::-webkit-scrollbar-thumb,#vmain::-webkit-scrollbar-thumb{border-radius:8px;
+background:linear-gradient(180deg,color-mix(in srgb,var(--vc,#38d6e6) 42%,#16233a),color-mix(in srgb,var(--vc,#38d6e6) 22%,#16233a));
+border:2px solid transparent;background-clip:content-box}
+#vlist::-webkit-scrollbar-thumb:hover,#vmain::-webkit-scrollbar-thumb:hover{
+background:linear-gradient(180deg,color-mix(in srgb,var(--vc,#38d6e6) 65%,#1c2b40),color-mix(in srgb,var(--vc,#38d6e6) 40%,#1c2b40));
+background-clip:content-box}
+/* R2（10-16 第五轮）：上一组/下一组按钮移到弹窗外两侧（fixed，坐标由 posGNav 按窗体矩形贴外缘 12px；
+   空间不足才回退内侧贴边）。此前是 #viewer 内部悬浮、遮挡正文被否。 */
+.gn{position:fixed;top:50%;z-index:51;width:34px;height:56px;border-radius:10px;
 background:rgba(6,10,17,.8);border:1px solid color-mix(in srgb,var(--vc,#38d6e6) 50%,transparent);
 color:var(--vc,#38d6e6);font-size:26px;line-height:1;cursor:pointer;padding:0;display:none;
 align-items:center;justify-content:center;opacity:.82;transition:opacity .18s,box-shadow .18s,background .18s}
 .gn.show{display:flex}
 .gn:hover{opacity:1;background:rgba(13,20,32,.94);box-shadow:0 0 16px color-mix(in srgb,var(--vc,#38d6e6) 45%,transparent)}
-#gPrev{left:8px}
-#gNext{right:8px}
 #v-tp{font-size:calc(17px*var(--fs));font-weight:700;color:var(--vc);padding-right:30px;letter-spacing:.04em}
 #v-seq{font-size:calc(11px*var(--fs));color:var(--mut);margin:4px 0 14px;font-family:ui-monospace,Consolas,monospace}
 #v-hd{font-size:calc(12.5px*var(--fs));color:#9fb4cc;background:rgba(108,168,255,.06);border:1px dashed var(--edge);
@@ -169,8 +180,6 @@ background:linear-gradient(0deg,rgba(4,7,13,.85),transparent)}
 box-shadow:0 0 12px var(--cyan);cursor:pointer}
 #winv{font-size:calc(12px*var(--fs));color:var(--cyan);font-family:ui-monospace,Consolas,monospace;width:52px}
 #rng{font-size:calc(12.5px*var(--fs));color:#cfe4ff;font-family:ui-monospace,Consolas,monospace;width:118px;white-space:nowrap}
-#fsr{width:110px}
-#fsv{font-size:calc(12px*var(--fs));color:var(--cyan);font-family:ui-monospace,Consolas,monospace;width:44px}
 #bar .btns{margin-left:auto;display:flex;gap:10px}
 .btn{font-size:calc(12px*var(--fs));color:#a9bcd2;border:1px solid var(--edge);border-radius:8px;padding:6px 14px;cursor:pointer;
 background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
@@ -192,7 +201,6 @@ background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
 <div id="bar">
   <span class="lbl">窗口长度</span><input id="win" type="range" min="60" max="1800" step="60" value="600"><span id="winv">10min</span>
   <span class="lbl">时间区间</span><input id="back" type="range" min="0" max="3600" step="60" value="0"><span id="rng"></span>
-  <span class="lbl">字体</span><input id="fsr" class="mini" type="range" min="0.85" max="1.6" step="0.05" value="1"><span id="fsv">100%</span>
   <div class="btns">
     <div class="btn" id="bReset">复位</div>
     <div class="btn" id="bPause">流入</div>
@@ -213,10 +221,10 @@ background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
    <div id="v-body"></div>
    <div id="v-meta"><span id="v-time"></span><span id="v-kind"></span><span id="v-route"></span></div>
   </div>
-  <button type="button" class="gn" id="gPrev" title="上一组话题（Shift+←）">‹</button>
-  <button type="button" class="gn" id="gNext" title="下一组话题（Shift+→）">›</button>
   <div class="hint">点条目 / 滚轮 / ← → 翻页 · Shift+← → 换组 · ESC 关闭</div>
 </div>
+<button type="button" class="gn" id="gPrev" title="上一组话题（Shift+←）">‹</button>
+<button type="button" class="gn" id="gNext" title="下一组话题（Shift+→）">›</button>
 <script>
 
 const stageEl=document.getElementById("stage"),map=document.getElementById("map"),
@@ -225,7 +233,8 @@ let W=innerWidth,H=innerHeight;
 const CUR={x:innerWidth/2,y:innerHeight/2};
 addEventListener("pointermove",e=>{CUR.x=e.clientX;CUR.y=e.clientY},{passive:true});
 function barH(){const b=document.getElementById("bar");return b?b.offsetHeight:56}
-function orbR(){return Math.max(46,Math.min(66,(H-barH()-84)/6.6))}
+// R5（10-16 第五轮）：节点圆缩小后，胶囊轨道同步收档（46–66 → 40–56）
+function orbR(){return Math.max(40,Math.min(56,(H-barH()-84)/7.2))}
 function staClamp(){const top=90,bot=Math.max(top+60,H-barH()-orbR()-30);return{top,bot}}
 const MACH={};let SELF=null,NODES=[],NAMES={},COLORS={},ST_ON=0,ST_ALL=0,AG_ALL=0;
 /* R6（10-16 第三轮）：图例点选显隐。hideNodes 按 node_id、hideAgt 按 agent_id 全局（与 R1 全局同色语义一致）；
@@ -235,6 +244,12 @@ try{const _sh=JSON.parse(localStorage.getItem("starhide")||"{}");for(const x of(
 function saveHide(){try{localStorage.setItem("starhide",JSON.stringify({n:[...hideNodes],a:[...hideAgt]}))}catch(e){}}
 function epHid(k){if(!k)return false;const i=k.indexOf("|");const m=k.slice(0,i),a=k.slice(i+1);
  return hideNodes.has(m)||(a!=="@node"&&hideAgt.has(a));}
+/* R1（10-16 第五轮）：幽灵白名单——节点=本机∪/v1/peers，agent=/v1/fleet/agents 注册表。
+   历史里出现过的已消失 id 不再建站；指向幽灵端点的消息与 epHid 同口径在出口统一过滤
+   （HUD/徽章/卡组/弹窗/粒子一个口径，满足"宁可少显示不能显示错"）。 */
+const LIVE_N=new Set(),LIVE_A=new Map();
+function ghost(k){if(!k)return true;const i=k.indexOf("|");const n=k.slice(0,i),a=k.slice(i+1);
+ return !LIVE_N.has(n)||(a!=="@node"&&!(LIVE_A.get(n)||new Set()).has(a));}
 function esc(s){return String(s==null?"":s).replace(/[&<"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
 function fnv(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)>>>0;}return h;}
 function fm32(x){x^=x>>>16;x=Math.imul(x,0x85ebca6b);x^=x>>>13;x=Math.imul(x,0xc2b2ae35);x^=x>>>16;return x>>>0}
@@ -261,14 +276,16 @@ function hdOf(f,to){const nm=a=>a==="@node"?"node":a;return "【"+nm(f[1])+"@"+n
 let TOPICS=[];
 /* ---------- positions (draggable) ---------- */
 const STA={},AGTP={}; /* AGTP[key]={dx,dy} offset from station center */
-function initPos(){const cl=staClamp(),r=orbR();for(const m in MACH){const c=MACH[m];if(!STA[m])STA[m]={x:c.x*W,y:Math.max(cl.top,Math.min(cl.bot,c.y*H))};
- c.agents.forEach((a,i)=>{const ang=Math.PI/2+i*(2*Math.PI/Math.max(c.agents.length,3));
- if(!AGTP[a2k([m,a])])AGTP[a2k([m,a])]={dx:Math.cos(ang)*r,dy:Math.sin(ang)*r};});
+const AGP={};         /* 用户手动拖过的胶囊：initPos 重排时保留其位 */
+function initPos(){const cl=staClamp(),r=orbR()+44;for(const m in MACH){const c=MACH[m];if(!STA[m])STA[m]={x:c.x*W,y:Math.max(cl.top,Math.min(cl.bot,c.y*H))};
+ c.agents.forEach((a,i)=>{const k=a2k([m,a]);if(AGP[k])return;
+  const ang=Math.PI/2+i*(2*Math.PI/Math.max(c.agents.length,3));
+  AGTP[k]={dx:Math.cos(ang)*r,dy:Math.sin(ang)*r};});
  if(!AGTP[a2k([m,"@node"])])AGTP[a2k([m,"@node"])]={dx:0,dy:0};}}
 function agPos(k){const[m]=k.split("|");const s=STA[m],o=AGTP[k];return{x:s.x+o.dx,y:s.y+o.dy};}
 /* ---------- time window ---------- */
 let winS=600,backS=0;const T0=Date.now();
-function activeMsgs(){const out=[],now=Date.now();for(const tp of TOPICS)for(const msg of tp.msgs){msg.t=-Math.round((now-msg.abs)/1000);if(msg.t>=-(winS+backS)&&msg.t<=-backS&&!epHid(msg.f)&&!epHid(msg.to))out.push({...msg,tp});}return out;}
+function activeMsgs(){const out=[],now=Date.now();for(const tp of TOPICS)for(const msg of tp.msgs){msg.t=-Math.round((now-msg.abs)/1000);if(msg.t>=-(winS+backS)&&msg.t<=-backS&&!epHid(msg.f)&&!epHid(msg.to)&&!ghost(msg.f)&&!ghost(msg.to))out.push({...msg,tp});}return out;}
 function hashK(s){let h=17;for(const c of s)h=Math.imul(h^c.charCodeAt(0),2654435761);return Math.abs(h);}
 function qp(p1,p2,bow,u){const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2,dx=p2.x-p1.x,dy=p2.y-p1.y,L=Math.hypot(dx,dy)||1;
  const qx=mx+(-dy/L)*bow,qy=my+(dx/L)*bow,it=1-u;
@@ -278,7 +295,7 @@ function chanD(p1,p2,bow){const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2,dx=p2.x-p1.x,d
 function bowOf(k){return 34+(hashK(k)%26);}
 /* ---------- stations & agents dom ---------- */
 const staEl={},agtEl={};
-function shortNm(lab,m){const s=String(lab||"").trim();if(!s)return m===SELF?"本机":"节点";if(s.length<=5)return s;if(s.length<=8)return `<span style="font-size:calc(9.5px*var(--fs))">${esc(s)}</span>`;return esc(s.slice(0,5))+"…";}
+function shortNm(lab,m){const s=String(lab||"").trim();if(!s)return m===SELF?"本机":"节点";if(s.length<=4)return s;if(s.length<=7)return `<span style="font-size:calc(6.5px*var(--fs));letter-spacing:.02em">${esc(s)}</span>`;return esc(s.slice(0,4))+"…";}
 function buildWorld(){
  for(const m in MACH){const c=MACH[m];const d=document.createElement("div");d.className="station";
  d.style.setProperty("--sc",c.col);d.style.setProperty("--scg",staGlow(m));
@@ -319,7 +336,7 @@ addEventListener("pointermove",e=>{
  if(Math.abs(dx)+Math.abs(dy)>3)drag.moved=true;
  if(!drag.moved)return;
  if(drag.kind==="station"){const s=STA[drag.id];
-  s.x=Math.max(130,Math.min(W-130,drag.sx+dx));const cl=staClamp();s.y=Math.max(cl.top,Math.min(cl.bot,drag.sy+dy));
+  s.x=Math.max(110,Math.min(W-110,drag.sx+dx));const cl=staClamp();s.y=Math.max(cl.top,Math.min(cl.bot,drag.sy+dy));
  }else{const o=AGTP[drag.id];const st=STA[drag.id.split("|")[0]];
   const ang=Math.atan2(e.clientY-st.y,e.clientX-st.x);
   o.dx=Math.cos(ang)*drag.r;o.dy=Math.sin(ang)*drag.r;}
@@ -328,6 +345,7 @@ addEventListener("pointerup",()=>{
  if(drag){const kind=drag.kind,id=drag.id,moved=drag.moved;
   if(kind==="station")staEl[id].classList.remove("drag");else agtEl[id].classList.remove("drag");
   drag=null;
+  if(moved&&kind!=="station")AGP[id]=1;
   if(!moved){const t=kind==="station"?"sta":"agt",was=pinC&&pinC.t===t&&pinC.k===id;
    clearPin();
    if(!was){pinC={t,k:id};(kind==="station"?staEl[id]:agtEl[id]).classList.add("pinned");applyLanes();}}}});
@@ -396,7 +414,7 @@ function groupsFor(k){const g=new Map();
 /* R2：某实体在某话题组里、对其可见的消息链（开窗与换组共用，口径与原 openG 一致） */
 function chainFor(tpid,k){const tp=TOPICS.find(t=>t.id===tpid);if(!tp)return[];const now=Date.now();
  return tp.msgs.filter(m=>{m.t=-Math.round((now-m.abs)/1000);
-  return (m.to===k||m.f===k)&&m.t>=-(winS+backS)&&m.t<=-backS&&!epHid(m.f)&&!epHid(m.to)}).sort((a,b)=>a.t-b.t);}
+  return (m.to===k||m.f===k)&&m.t>=-(winS+backS)&&m.t<=-backS&&!epHid(m.f)&&!epHid(m.to)&&!ghost(m.f)&&!ghost(m.to)}).sort((a,b)=>a.t-b.t);}
 function buildDeck(k){const dw=dwraps[k];const g=groupsFor(k);
  dw.innerHTML=g.length?g.map((r,i)=>{const mins=Math.round(-r.lastRecv.t/60);
   return`<div class="gcard" data-tp="${r.tp.id}" style="--gc:${r.tp.color};z-index:${i+1}">
@@ -452,16 +470,34 @@ function setDeckOpen(k,open){if(!dwraps[k]||dwraps[k].style.display==="none")ret
 function reveal(k){const dw=dwraps[k];cancelTomb(k);
  // R3：锚点只在悬停开始的这一刻快照，之后光标移动/轮询重排都不再读实时 CUR
  dwAnchor[k]={x:CUR.x,y:CUR.y};
- // 悬停某实体时其它无关卡片立即收起
- for(const o in dwraps){if(o!==k&&dwraps[o].style.display!=="none"){cancelTomb(o);clearOpenTomb(o);dwraps[o].dataset.vis="0";deckOpen[o]=false;dwraps[o].style.display="none";}}
- buildDeck(k);if(dw.style.display!=="block"){if(!dw.querySelector(".gcard"))return;}
+ buildDeck(k);
+ /* R3（10-16 第五轮）：先建自己的卡组——若该实体一个卡片都没有，直接返回、不收任何别人的卡组。
+    修复"卡组摊在节点上方，鼠标路过节点感应区就把目标卡组误收掉、点不中"的问题。 */
+ if(!dw.querySelector(".gcard"))return;
+ // 悬停有卡片的实体时，无关卡组收起（改走 600ms 墓碑宽限而非瞬时隐藏：路过误触可被
+ // 原卡组的 pointerenter 撤销，真正走开才收，保持"无关卡片立收"观感）
+ for(const o in dwraps){if(o!==k&&dwraps[o].style.display!=="none"){cancelTomb(o);clearOpenTomb(o);scheduleHide(o);}}
  dw.dataset.vis="1";dw.style.display="block";deckOpen[k]=false;layoutDeck(k);}
 function renderAllDecks(){for(const k in dwraps)buildDeck(k);}
 /* ---------- viewer (big card) ---------- */
 const mask=document.getElementById("mask"),viewer=document.getElementById("viewer");
 let VT=null;
+function setVc(c){viewer.style.setProperty("--vc",c);for(const b of document.querySelectorAll(".gn"))b.style.setProperty("--vc",c);}
+/* R2（10-16 第五轮）：‹ › 贴弹窗外侧 12px。按窗体尺寸公式计算（窗恒居中），不读动画中的
+   getBoundingClientRect；某一侧窗外空间放不下才回退贴该侧内缘。 */
+function posGNav(){if(!VT)return;
+ const w=Math.min(920,innerWidth*.92),h=Math.min(600,innerHeight*.8);
+ const l=(innerWidth-w)/2,r=(innerWidth+w)/2,tp=(innerHeight-h)/2+h/2-28;
+ const bw=34,gap=12;
+ const prev=document.getElementById("gPrev"),next=document.getElementById("gNext");
+ let pl=l-gap-bw,pr=r+gap;
+ if(pl<6)pl=l+10;
+ if(pr+bw>innerWidth-6)pr=r-10-bw;
+ prev.style.left=pl+"px";prev.style.top=tp+"px";
+ next.style.left=pr+"px";next.style.top=tp+"px";
+ prev.style.right=next.style.right="";}
 function openViewer(tp,chain,i,k){if(!chain.length)return;VT={tp,chain,i,k:k||null};applyLanes();
- viewer.style.setProperty("--vc",tp.color);drawViewer();
+ setVc(tp.color);drawViewer();
  mask.style.display="block";viewer.classList.add("show");updateGNav();}
 function drawViewer(){const m=VT.chain[VT.i];document.getElementById("vmain").scrollTop=0;
  document.getElementById("v-tp").textContent=VT.tp.name;
@@ -499,16 +535,18 @@ document.getElementById("vmain").addEventListener("wheel",e=>{if(!VT)return;cons
 /* R2：弹窗两侧上一组/下一组按钮——不关弹窗沿 groupsFor(k) 序列环绕换组 */
 function updateGNav(){const n=(VT&&VT.k)?groupsFor(VT.k).length:0;
  document.getElementById("gPrev").classList.toggle("show",n>1);
- document.getElementById("gNext").classList.toggle("show",n>1);}
+ document.getElementById("gNext").classList.toggle("show",n>1);posGNav();}
 function gotoGroup(d){if(!VT||!VT.k)return;const gs=groupsFor(VT.k);if(gs.length<2)return;
  let idx=gs.findIndex(r=>r.tp.id===VT.tp.id);if(idx<0)idx=0;
  for(let n=0;n<gs.length;n++){idx=(idx+d+gs.length)%gs.length;
   const chain=chainFor(gs[idx].tp.id,VT.k);
   if(chain.length){VT={tp:gs[idx].tp,chain,i:chain.length-1,k:VT.k};gTopic=null;
-   viewer.style.setProperty("--vc",gs[idx].tp.color);applyLanes();drawViewer();updateGNav();return;}}}
+   setVc(gs[idx].tp.color);applyLanes();drawViewer();updateGNav();return;}}}
 document.getElementById("gPrev").onclick=()=>gotoGroup(-1);
 document.getElementById("gNext").onclick=()=>gotoGroup(1);
-function closeViewer(){mask.style.display="none";viewer.classList.remove("show");VT=null;applyLanes();}
+function closeViewer(){mask.style.display="none";viewer.classList.remove("show");VT=null;
+ document.getElementById("gPrev").classList.remove("show");
+ document.getElementById("gNext").classList.remove("show");applyLanes();}
 mask.onclick=closeViewer;document.getElementById("v-x").onclick=closeViewer;
 addEventListener("keydown",e=>{if(e.key==="Escape"){closeViewer();clearPin();}
  else if(VT&&e.key==="ArrowLeft")e.shiftKey?gotoGroup(-1):mv(-1);
@@ -527,14 +565,48 @@ function payText(e){const p=e.payload;
   try{return JSON.stringify(p)}catch(err){return String(p)}}
  return String(p==null?(e.action||""):p);}
 const PAL=["#38d6e6","#43d97b","#ffb347","#c77dff","#7fb0ff","#ff5c7a","#8fd0ff","#e88fd0","#7ee7f2","#9adf8a","#f2c14e","#5ad1b4"];
-// 默认布局：本机站台居中，其余节点按环均分（整体重心在画面中央，任意节点数都不偏一侧）
-function frSelf(){return[.5,.5]}
-function frRing(j,n){if(n<=0)return frSelf();const ang=-Math.PI/2+j*(2*Math.PI/n);return[0.5+0.28*Math.cos(ang),0.52+0.30*Math.sin(ang)]}
-function frNew(nid){if(nid===SELF)return frSelf();const j=Object.keys(MACH).filter(k=>k!==SELF).length;return frRing(j,Math.max(j+1,2));}
-function ensureEnd(k){const[nid,a]=k.split("|");
+/* R4（10-16 第五轮）：默认布局=同心环贪心（外环优先；每环容量按"相邻圆心弦长≥最小间距"约束，
+   放满才进内环），保持"本机居中、众星拱之"语义且确定性可复现。
+   算法调研：①Fruchterman-Reingold 等力导向——迭代收敛依赖初值，5s 轮询重建世界会抖动，弃；
+   ②Poisson 盘/maximin 贪心——最大化最小间距但点位无规律、失去星图语义，弃；
+   ③黄金角向日葵螺旋——确定性均铺但近邻间距无硬保证，弃。 */
+function minSep(){return 2*(orbR()+44)+120;}
+function frSelf(){const cl=staClamp();return[.5,(cl.top+cl.bot)/2/H]}
+function layoutPlan(n){if(n<=0)return[];const cl=staClamp(),sep=minSep();
+ const cx=W/2,cy=(cl.top+cl.bot)/2;
+ const ax=Math.max(cx-110,150),ay=Math.max((cl.bot-cl.top)/2,110),eff=Math.min(ax,ay);
+ const pts=[];let left=n,ring=0;
+ for(const t of[1,0.62,0.40,0.25]){if(left<=0)break;
+  const rr=eff*t;let cap=3;
+  if(sep<2*rr)cap=Math.max(3,Math.floor(Math.PI/Math.asin(sep/(2*rr))));
+  const m=Math.min(cap,left);left-=m;
+  const ph=ring%2?Math.PI/m:0;
+  for(let i=0;i<m;i++){const a=-Math.PI/2+ph+i*2*Math.PI/m;
+   pts.push([(cx+ax*t*Math.cos(a))/W,(cy+ay*t*Math.sin(a))/H]);}
+  ring++;}
+ while(left-->0){const a=-Math.PI/2+left*1.7;
+  pts.push([(cx+ax*.25*Math.cos(a))/W,(cy+ay*.25*Math.sin(a))/H]);}
+ return pts;}
+function frNew(nid){if(nid===SELF)return frSelf();
+ const j=Object.keys(MACH).filter(k=>k!==SELF).length;return layoutPlan(Math.max(j+1,1))[j]||frSelf();}
+// 每轮 loadTopo 后按当前窗口重算默认位（分数坐标；用户拖拽位存 STA，不受影响）
+function applyDefaultLayout(){const others=NODES.filter(x=>x.id!==SELF);const plan=layoutPlan(others.length);
+ const fc=frSelf();
+ NODES.forEach(n=>{const m=MACH[n.id];if(!m)return;
+  if(n.id===SELF){m.x=fc[0];m.y=fc[1];}
+  else{const i=others.findIndex(x=>x.id===n.id);const p=plan[i];if(p){m.x=p[0];m.y=p[1];}}});}
+function ensureEnd(k){if(ghost(k))return;const[nid,a]=k.split("|");
  if(!MACH[nid]){const f=frNew(nid);
   MACH[nid]={lab:who(nid),ip:"?",x:f[0],y:f[1],col:colFor(nid,""),agents:[]};}
  if(a!=="@node"&&!MACH[nid].agents.includes(a))MACH[nid].agents.push(a);}
+/* R1 补充：agent 胶囊名单 = 注册表 ∪ 窗口内活跃 agent。注册表是权威来源（fleet/agents
+   本身带 ghost guard），在册但闲置的 agent 不删；窗口外且未注册的历史 id 不补——
+   幽灵 agent 的胶囊不再出现，其消息也在出口统一被滤。 */
+function growLive(k){if(!k||ghost0(k))return;const i=k.indexOf("|"),n=k.slice(0,i),a=k.slice(i+1);
+ if(a==="@node")return;const s=LIVE_A.get(n)||new Set();s.add(a);LIVE_A.set(n,s);}
+function ghost0(k){const i=k.indexOf("|");return !LIVE_N.has(k.slice(0,i));}
+function mergeAgents(){for(const n of NODES){const mm=MACH[n.id];if(!mm)continue;
+ const set=new Set(mm.agents);for(const a of LIVE_A.get(n.id)||[])set.add(a);mm.agents=[...set].sort();}}
 async function loadTopo(){
  if(!TOKEN){try{const r=await fetch("/web/setup");const d=await r.json();
    if(d&&d.ok&&d.token){TOKEN=d.token;try{sessionStorage.setItem(LS_KEY,TOKEN)}catch(e){}}}catch(e){}}
@@ -546,15 +618,19 @@ async function loadTopo(){
  COLORS=(co&&co.colors)||{};
  const byNode={};for(const a of(ag.agents||[])){(byNode[a.node_id]=byNode[a.node_id]||new Set()).add(a.agent_id);if(a.node_name)NAMES[a.node_id]=a.node_name;}
  ST_ON=NODES.filter(n=>n.online).length;ST_ALL=NODES.length;AG_ALL=[...new Set((ag.agents||[]).map(x=>x.node_id+"|"+x.agent_id))].length;
- const others=NODES.filter(x=>x.id!==SELF);
- NODES.forEach((n)=>{if(!MACH[n.id]){const j=others.findIndex(x=>x.id===n.id);const f=j<0?frSelf():frRing(j,Math.max(others.length,2));MACH[n.id]={lab:n.name,ip:n.ip||"—",x:f[0],y:f[1],col:colFor(n.id,""),agents:[]};}
+ /* R1：每轮重建节点白名单，先删掉已从 peers 表消失的幽灵站台（连同其全部胶囊）；
+    agent 基础名单取注册表，窗口内活跃 agent 稍后在 poll 里并入（见 mergeAgents）。 */
+ LIVE_N.clear();LIVE_A.clear();
+ for(const n of NODES)LIVE_N.add(n.id);
+ for(const nid in byNode)LIVE_A.set(nid,new Set(byNode[nid]));
+ for(const nid in MACH)if(!LIVE_N.has(nid))delete MACH[nid];
+ NODES.forEach((n)=>{if(!MACH[n.id])MACH[n.id]={lab:n.name,ip:n.ip||"—",x:.5,y:.5,col:colFor(n.id,""),agents:[]};
   const m=MACH[n.id];m.lab=n.name;m.online=n.online;if(n.ip&&n.ip!=="—")m.ip=n.ip;m.col=colFor(n.id,"");
-  m.agents=[...new Set([...(byNode[n.id]||[]),...m.agents])].sort();});
- for(const nid in byNode)if(!NODES.some(n=>n.id===nid)){ensureAll(nid,[...byNode[nid]]);}
+  m.agents=[...(LIVE_A.get(n.id)||[])].sort();});
+ applyDefaultLayout();
 }
-function ensureAll(nid,ags){ensureEnd(nid+"|@node");for(const a of ags)ensureEnd(nid+"|"+a);}
 function msgOf(e){const abs=Date.parse(e.ts)||0,nid=(typeof e.node==="string"&&e.node)?e.node:SELF;
- if(!MACH[nid]){const f=frNew(nid);
+ if(!MACH[nid]&&LIVE_N.has(nid)){const f=frNew(nid);
   MACH[nid]={lab:who(nid),ip:"?",x:f[0],y:f[1],col:colFor(nid,""),agents:[]};}
  const fk=String(e.from)+"|"+(e.from_agent||"@node"),tk=String(e.to)+"|"+(e.to_agent||"@node");
  ensureEnd(fk);ensureEnd(tk);
@@ -575,9 +651,13 @@ async function poll(){
   if(!d||d.ok!==true){await syncWorld();applyHide();setErr((d&&d.error==="history disabled")?"总线未启用历史记录（config history.enabled=false）":"查询失败："+((d&&d.error)||"未知"));renderLinks();renderAllDecks();return;}
   setErr("");
   buildTopics((d.matches||[]).slice().sort((x,y)=>String(x.ts).localeCompare(String(y.ts))));
+  /* R1 补充：窗口内活跃 agent 并入白名单，重算各站台胶囊名单（世界签名变化则自动重建） */
+  {const cut=Date.now()-(winS+backS)*1000;
+   for(const tp of TOPICS)for(const m of tp.msgs)if(m.abs>=cut){growLive(m.f);growLive(m.to);}
+   mergeAgents();}
   await syncWorld();applyHide(); /* world built AFTER msgs registered: agents from history+fleet in one shot */
   const edge=backS===0&&!paused;
-  for(const tp of TOPICS)for(const m of tp.msgs)if(!KNOWN.has(m.id)){KNOWN.add(m.id);if(edge&&m.abs>=Date.now()-90000&&!epHid(m.f)&&!epHid(m.to))flyIn(tp,m);}
+  for(const tp of TOPICS)for(const m of tp.msgs)if(!KNOWN.has(m.id)){KNOWN.add(m.id);if(edge&&m.abs>=Date.now()-90000&&!epHid(m.f)&&!epHid(m.to)&&!ghost(m.f)&&!ghost(m.to))flyIn(tp,m);}
   renderLinks();renderAllDecks();
  }catch(e){setErr(String(e.message||e));}}
 function worldSig(){let s="";for(const m in MACH)s+=m+"|"+MACH[m].lab+"|"+MACH[m].ip+"|"+MACH[m].agents.join(",")+";";return s;}
@@ -641,17 +721,13 @@ function fmtT(ms){const d=new Date(ms);return String(d.getHours()).padStart(2,"0
 function updateRange(){const end=Date.now()-backS*1000;
  document.getElementById("rng").textContent=fmtT(end-winS*1000)+" — "+fmtT(end);}
 updateRange();
-const fsEl=document.getElementById("fsr");
-try{const sv=localStorage.getItem("starfs");if(sv){fsEl.value=sv;}}catch(e){}
-function applyFs(){const v=+fsEl.value;document.documentElement.style.setProperty("--fs",v);
- document.getElementById("fsv").textContent=Math.round(v*100)+"%";
- try{localStorage.setItem("starfs",v);}catch(e){}renderAllDecks();}
-fsEl.oninput=applyFs;applyFs();
+// 字体滑条已移除：恒用 CSS 默认 --fs:1，并清掉历史 localStorage 残留，避免旧缩放值悄悄生效
+try{localStorage.removeItem("starfs");document.documentElement.style.removeProperty("--fs");}catch(e){}
 document.getElementById("bPause").onclick=e=>{paused=!paused;if(paused)cancelLiveAnims();
  e.target.classList.toggle("on",paused);e.target.textContent=paused?"⏸︎流入":"流入";};
 document.getElementById("bReset").onclick=()=>{cancelLiveAnims();clearPin();
  for(const o of[STA,AGTP])for(const k in o)delete o[k];
- initPos();placeWorld();renderLinks();renderAllDecks();};
+ applyDefaultLayout();initPos();placeWorld();renderLinks();renderAllDecks();};
 document.getElementById("bFs").onclick=()=>{
  // 本页可能被总览 iframe 嵌入：全屏请求要打在宿主 iframe 元素上（iframe 内部对 body 发请求会被拒），
  // 再点一次 = 退出当前全屏（无论全屏是本页还是外层按钮触发的）。
@@ -684,9 +760,9 @@ function snapshot(){const cv=document.createElement("canvas");cv.width=W;cv.heig
 function snapshotTo(g){
  g.fillStyle="#04070d";g.fillRect(0,0,W,H);
  for(const m in MACH){const c=MACH[m];const s=STA[m];
-  hexPath(g,s.x,s.y,86);g.strokeStyle=c.col;g.globalAlpha=.8;g.lineWidth=2;g.stroke();g.globalAlpha=.07;
+  hexPath(g,s.x,s.y,66);g.strokeStyle=c.col;g.globalAlpha=.8;g.lineWidth=2;g.stroke();g.globalAlpha=.07;
   g.fillStyle=c.col;g.fill();g.globalAlpha=1;
-  g.fillStyle="#cfe3ff";g.font="13px Consolas";g.textAlign="center";g.fillText(c.lab+" "+c.ip,s.x,s.y-108);}
+  g.fillStyle="#cfe3ff";g.font="13px Consolas";g.textAlign="center";g.fillText(c.lab+" "+c.ip,s.x,s.y-88);}
  for(const k in agtEl){const p=agPos(k);g.beginPath();g.arc(p.x,p.y,10,0,7);
   g.fillStyle=MACH[k.split("|")[0]].col;g.shadowColor=g.fillStyle;g.shadowBlur=14;g.fill();g.shadowBlur=0;
   g.fillStyle="#fff";g.font="10px Consolas";g.fillText(recvCount(k),p.x+16,p.y-10);}
@@ -712,6 +788,7 @@ function buildStars(){const sf=document.getElementById("starfield");
   t.style.cssText=`left:${Math.random()*100}%;top:${Math.random()*100}%;width:${sz}px;height:${sz}px;--d:${(2+Math.random()*4).toFixed(1)}s;animation-delay:${(-Math.random()*5).toFixed(1)}s`;sf.appendChild(t);}}
 async function boot(){buildStars();updateRange();await poll();}
 addEventListener("resize",sizeUp);
+addEventListener("resize",posGNav); /* R2：窗口尺寸变了，‹ › 的外贴坐标要重算（世界布局由 sizeUp 与下轮 poll 处理） */
 boot();setInterval(poll,5000);
 
 </script>

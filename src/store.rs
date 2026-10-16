@@ -364,6 +364,14 @@ pub struct HistSearch {
     pub from: String,
     /// receiver, same semantics as `from`
     pub to: String,
+    /// exact sender node id (console endpoint dropdowns)
+    pub from_node: String,
+    /// exact sender agent id (combined with `from_node`)
+    pub from_agent: String,
+    /// exact receiver node id
+    pub to_node: String,
+    /// exact receiver agent id (combined with `to_node`)
+    pub to_agent: String,
     /// matches either side
     pub who: String,
     pub direction: String,
@@ -409,6 +417,20 @@ pub fn history_search(data_dir: &Path, file: &str, f: &HistSearch) -> serde_json
         }
     }
 
+    let (q_fn, q_fag, q_tn, q_tag) = (
+        f.from_node.to_lowercase(),
+        f.from_agent.to_lowercase(),
+        f.to_node.to_lowercase(),
+        f.to_agent.to_lowercase(),
+    );
+    let mfrom_pair = |fr: &str, fa: &str| -> bool {
+        (q_fn.is_empty() || fr.to_lowercase() == q_fn)
+            && (q_fag.is_empty() || fa.to_lowercase() == q_fag)
+    };
+    let mto_pair = |tto: &str, ta: &str| -> bool {
+        (q_tn.is_empty() || tto.to_lowercase() == q_tn)
+            && (q_tag.is_empty() || ta.to_lowercase() == q_tag)
+    };
     let mut handle = |line: &str| -> bool {
         // Returns false when scanning must stop (limit reached / older than since).
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -426,8 +448,10 @@ pub fn history_search(data_dir: &Path, file: &str, f: &HistSearch) -> serde_json
         let fa = v["from_agent"].as_str().unwrap_or("");
         let tto = v["to"].as_str().unwrap_or("");
         let ta = v["to_agent"].as_str().unwrap_or("");
-        let mfrom = q_from.is_empty() || contains_ci(fr, &q_from) || contains_ci(fa, &q_from);
-        let mto = q_to.is_empty() || contains_ci(tto, &q_to) || contains_ci(ta, &q_to);
+        let mfrom = (q_from.is_empty() || contains_ci(fr, &q_from) || contains_ci(fa, &q_from))
+            && mfrom_pair(fr, fa);
+        let mto = (q_to.is_empty() || contains_ci(tto, &q_to) || contains_ci(ta, &q_to))
+            && mto_pair(tto, ta);
         let mwho = q_who.is_empty()
             || contains_ci(fr, &q_who)
             || contains_ci(fa, &q_who)

@@ -207,6 +207,9 @@ async fn status(State(state): State<SharedState>, headers: HeaderMap) -> impl In
             "node_id": state.config.node_id,
             "name": state.display_name(),
             "listen_port": state.config.listen_port,
+            "listen_addr": local_ip_address::local_ip()
+                .map(|ip| format!("{}:{}", ip, state.config.listen_port))
+                .unwrap_or_else(|_| format!("0.0.0.0:{}", state.config.listen_port)),
             "uptime_seconds": state.uptime_seconds(),
             "peers_known": peers.len(),
             "peers_online": online,
@@ -675,6 +678,14 @@ pub struct HistorySearchQuery {
     #[serde(default)]
     to: String,
     #[serde(default)]
+    from_node: String,
+    #[serde(default)]
+    from_agent: String,
+    #[serde(default)]
+    to_node: String,
+    #[serde(default)]
+    to_agent: String,
+    #[serde(default)]
     who: String,
     #[serde(default)]
     direction: String,
@@ -716,6 +727,10 @@ async fn history_search_get(
     let f = crate::store::HistSearch {
         from: qs.from,
         to: qs.to,
+        from_node: qs.from_node,
+        from_agent: qs.from_agent,
+        to_node: qs.to_node,
+        to_agent: qs.to_agent,
         who: qs.who,
         direction: qs.direction,
         kind: qs.kind,
@@ -1490,8 +1505,8 @@ th.srt:hover{color:#dbe2ea}
         <div class="row"><input id="ch-kw" placeholder="搜索：内容 / 节点 / agent…" style="flex:2" oninput="chGo(1)">
         <select id="ch-size" onchange="chGo(1)"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option></select></div>
         <div class="row">
-          <input id="ch-from" list="ch-agents" placeholder="发送方（agent/节点/IP）" style="flex:1">
-          <input id="ch-to" list="ch-agents" placeholder="接收方（agent/节点/IP）" style="flex:1">
+          <select id="ch-from" title="发送方" style="flex:1;min-width:220px"></select>
+          <select id="ch-to" title="接收方" style="flex:1;min-width:220px"></select>
         </div>
         <div class="row">
           <span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap"><input type="datetime-local" id="ch-since" title="起始时间（本机时区，服务端按 UTC 过滤）"><span class="hint">→</span><input type="datetime-local" id="ch-until" title="结束时间"></span>
@@ -1500,7 +1515,6 @@ th.srt:hover{color:#dbe2ea}
           <button class="primary" onclick="histSearch()">查磁盘</button>
           <button onclick="histReset()">重置</button>
         </div>
-        <datalist id="ch-agents"></datalist>
         <div class="hint" id="ch-qmeta"></div>
         <div class="row"><span class="hint" id="ch-stats" style="flex:1">对话记录：—</span><select id="ch-scope"><option value="all">全部（含归档）</option><option value="active">仅当前文件</option></select><button onclick="exportHist('ch','json')">导出 JSON</button><button onclick="exportHist('ch','text')">导出 文本</button></div>
         <div id="history"></div>
@@ -1541,7 +1555,7 @@ const HDR=()=>({'X-Auth-Token':TOKEN});
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(ts){try{return new Date(ts).toLocaleString();}catch{return ts;}}
 let HIST=[],CHQ=null,COLORS={},OV={page:1},CH={page:1},NAMES={},AN={},AGENTS=[],SELF='';
-let PEERS=[],ST={},ASORT={k:'node',d:1},PSORT={k:'name',d:1},EXP=new Set(),LAST={ag:'',pe:'',op:'',hi:'',qt:'',cf:'',dl:''};
+let PEERS=[],ST={},ASORT={k:'node',d:1},PSORT={k:'name',d:1},EXP=new Set(),LAST={ag:'',pe:'',op:'',hi:'',qt:'',cf:'',ch2:''};
 // 用户正在选择文本时跳过所有 DOM 重写：选择/复制不再被 2 秒自动刷新打断
 function selecting(){const s=window.getSelection();return s&&s.rangeCount>0&&!s.isCollapsed;}
 // 用户正在操作控件（下拉展开、输入中、颜色选择器打开）：冻结本轮所有 DOM 重写，防止刷新冲掉控件状态
@@ -1794,7 +1808,7 @@ function renderAgents(){
 function renderPeers(){
   ['name','node_id','online'].forEach(k=>srtIcon('ps-',PSORT,k));
   const rank=p=>(ST.node_id&&p.node_id===ST.node_id?0:1);
-  const merged=[{node_id:ST.node_id,name:ST.name||ST.node_id,addr:'本机',tags:[],online:true,last_seen_seconds_ago:0,direction:'self'},...PEERS.filter(p=>p.node_id!==ST.node_id)];
+  const merged=[{node_id:ST.node_id,name:ST.name||ST.node_id,addr:ST.listen_addr||'—',tags:[],online:true,last_seen_seconds_ago:0,direction:'self'},...PEERS.filter(p=>p.node_id!==ST.node_id)];
   const list=merged.slice().sort((a,b)=>{
     const r=rank(a)-rank(b); if(r) return r;
     let c=0;
@@ -1812,7 +1826,13 @@ function exportHist(p,fmt){const s=el(p+'-scope');const sc=s?s.value:'all';windo
 async function histSearch(){
  const p=new URLSearchParams();
  const put=(k,id)=>{const v=val(id);if(v)p.set(k,v);};
- put('from','ch-from');put('to','ch-to');put('q','ch-kw');
+ put('q','ch-kw');
+ // 端点下拉与发送目标同口径：node_id 或 agent:<node_id>:<agent_id>，拆成精确 pair 参数
+ const ep=(k,id)=>{const v=(val(id)||'').trim();if(!v)return;
+  if(v.startsWith('agent:')){const rest=v.slice(6);const i=rest.indexOf(':');
+   if(i>0){p.set(k+'_node',rest.slice(0,i));p.set(k+'_agent',rest.slice(i+1));return;}}
+  p.set(k+'_node',v);};
+ ep('from','ch-from');ep('to','ch-to');
  const sv=val('ch-since');if(sv)p.set('since',new Date(sv).toISOString());
  const uv=val('ch-until');if(uv)p.set('until',new Date(uv).toISOString());
  p.set('limit',el('ch-limit').value);
@@ -1832,10 +1852,15 @@ async function histSearch(){
  }catch(e){el('ch-qmeta').textContent='查询失败：'+(e.message||e);}
 }
 function histReset(){CHQ=null;for(const i of ['ch-from','ch-to','ch-since','ch-until','ch-kw'])if(el(i))el(i).value='';if(el('ch-all'))el('ch-all').checked=false;el('ch-qmeta').textContent='';chGo(1);}
-function fillAgDl(){const d=el('ch-agents');if(!d)return;const s=new Set();
- for(const a of AGENTS){if(a.agent_id)s.add(a.agent_id);if(a.name)s.add(a.name);if(a.node_id)s.add(a.node_id);if(a.node_name)s.add(a.node_name);}
- const html=[...s].map(x=>`<option value="${esc(x)}"></option>`).join('');
- if(html!==LAST.dl){d.innerHTML=html;LAST.dl=html;}}/* R7：签名相同不重写 */
+function fillChEps(){
+ let cqn='<optgroup label="筛选"><option value="">全部（不过滤）</option></optgroup><optgroup label="节点（整机）">';
+ if(SELF)cqn+=`<option value="${esc(SELF)}">${esc(who(SELF))}（本机）</option>`;
+ for(const p of PEERS)cqn+=`<option value="${esc(p.node_id)}">${esc(p.name)}${p.online?'':'（离线）'}</option>`;
+ cqn+='</optgroup><optgroup label="Agent（节点 · agent）">';
+ for(const a of AGENTS)cqn+=`<option value="agent:${esc(a.node_id)}:${esc(a.agent_id)}">${esc(a.node_name||who(a.node_id))} · ${esc(a.agent_id)}${a.online?'':'（离线）'}</option>`;
+ cqn+='</optgroup>';
+ if(!selecting()&&cqn!==LAST.ch2){LAST.ch2=cqn;
+  [el('ch-from'),el('ch-to')].forEach(x=>{if(!x)return;const c=x.value;x.innerHTML=cqn;if(c&&[...x.options].some(o=>o.value===c))x.value=c;});}}
 function renderColorCfg(){const box=el('cf-colors');if(!box||box.contains(document.activeElement))return;
  const ids=new Map();
  for(const a of AGENTS){ids.set('agent:'+a.node_id+'|'+a.agent_id,(a.node_name||who(a.node_id))+' · '+(a.name||a.agent_id));}
@@ -1881,7 +1906,7 @@ async function refresh(){
   if(st&&st.node_id){NAMES[st.node_id]=st.name||st.node_id;}
   for(const p of PEERS)NAMES[p.node_id]=p.name;
   for(const a of AGENTS){AN[a.node_id+'|'+a.agent_id]=(a.name||a.agent_id); NAMES[a.node_id]=a.node_name||NAMES[a.node_id]||a.node_id;}
-  if(!sel){renderPeers();renderAgents();fillAgDl();renderColorCfg();}
+  if(!sel){renderPeers();renderAgents();fillChEps();renderColorCfg();}
   // 目标下拉（纯选择）——签名相同不重写，保住控件状态
   let opn='<optgroup label="节点（发给整机）"><option value="*">* 广播（全部节点）</option>';
   for(const p of PEERS)opn+=`<option value="${esc(p.node_id)}">${esc(p.name)}${p.online?'':'（离线）'}</option>`;
