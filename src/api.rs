@@ -597,7 +597,7 @@ async fn fleet_agents(State(state): State<SharedState>, headers: HeaderMap) -> i
     for p in state.peers.snapshot() {
         names.insert(p.node_id.clone(), p.name.clone());
     }
-    names.insert(state.config.node_id.clone(), state.config.name.clone());
+    names.insert(state.config.node_id.clone(), state.display_name());
     // Ghost guard: an agent can only be online if its NODE is online. Remote
     // agent caches used to keep `online:true` forever after the owner node
     // went away (new identity/reboot), confusing the fleet view.
@@ -752,7 +752,7 @@ async fn colors_get(State(state): State<SharedState>, headers: HeaderMap) -> imp
 async fn colors_put(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    JsonAny(body): JsonAny<serde_json::Value>,
 ) -> impl IntoResponse {
     if !authorized(&state, &headers) {
         return unauthorized();
@@ -1331,7 +1331,7 @@ a{color:#4f8cff;text-decoration:none}
 .on{background:rgba(63,185,80,.12);color:#3fb950}.on .dot{background:#3fb950}
 .off{background:rgba(248,81,73,.12);color:#f85149}.off .dot{background:#f85149}
 .warn{background:rgba(210,153,34,.12);color:#d29922}
-.content{padding:20px;max-width:1200px;width:100%}
+.content{padding:20px 24px;width:100%;max-width:none}
 .card{background:#10151d;border:1px solid #1c2330;border-radius:12px;padding:16px;margin-bottom:16px}
 .card h2{margin:0 0 12px;font-size:13px;color:#9aa7b8;font-weight:600;letter-spacing:.4px;text-transform:uppercase}
 table{width:100%;border-collapse:collapse}
@@ -1359,8 +1359,15 @@ select#to,select#to2{width:340px;max-width:340px}
 .dz.drag{border-color:#4f8cff;background:#12203a;color:#a8cbff}
 .dz a{color:#7fb0ff}
 .att-chip{display:inline-flex;align-items:center;gap:7px;padding:2px 10px;border-radius:14px;background:#182238;color:#9db4dd;font-size:12px}
-.idc{color:#fff;border-radius:9px;padding:1px 8px;font-weight:600;font-size:12px;line-height:17px;white-space:nowrap;margin-right:3px}
+.idc{display:inline-flex;align-items:center;justify-content:flex-end;background:var(--nc,#22344f);border-radius:13px;padding:2px 2px 2px 14px;margin-right:4px;vertical-align:middle;max-width:100%}
+.idc .idci{display:inline-block;border-radius:999px;padding:0 9px;font-weight:600;font-size:12px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;vertical-align:middle}
 .idn{opacity:.62;font-size:11px;margin-right:2px}
+#cf-colors{display:flex;flex-direction:column;gap:7px;margin-top:6px}
+#cf-colors .cfrow{display:flex;align-items:center;gap:12px}
+#cf-colors .cfrow .idc{min-width:0}
+#cf-colors .cfrow .idci{max-width:100%}
+#cf-colors input[type=color]{width:34px;height:26px;padding:1px;background:#10151d;border:1px solid #2a3550;border-radius:6px;cursor:pointer}
+.cfauto{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#9aa7b8;white-space:nowrap;cursor:pointer}
 .lk{background:none;border:none;color:#7fb0ff;cursor:pointer;padding:0;font-size:12px;text-decoration:underline;font-family:inherit}
 .lk.red{color:#f85149;text-decoration:none;font-size:13px}
 optgroup{color:#7d8aa0;font-style:normal;font-weight:600}
@@ -1433,7 +1440,7 @@ th.srt:hover{color:#dbe2ea}
 </aside>
 <div id="main">
   <div id="topbar">
-    <div><div class="t" id="tb-self">—</div><div class="sub" id="tb-meta">—</div></div>
+    <div style="display:flex;align-items:baseline;gap:10px"><div class="t" id="tb-self">—</div><div class="sub" id="tb-meta">—</div></div>
     <div class="spacer"></div>
     <span class="sub">自动刷新 <label class="switch"><input type="checkbox" id="auto-refresh" checked><span class="slider"></span></label></span>
     <button onclick="refresh()">刷新</button>
@@ -1446,11 +1453,7 @@ th.srt:hover{color:#dbe2ea}
         <div class="m"><div class="k">传输中</div><div class="v" id="m-transfer">0</div></div>
         <div class="m"><div class="k">版本</div><div class="v" id="m-version">—</div></div>
       </div>
-      <div class="card"><h2>消息星图　<span class="hint">只画真实消息：悬停/点选节点、agent、消息卡片时，仅显示相关连线与目的地</span></h2>
-        <div class="row"><button onclick="const f=el('sm-fr');if(f&&f.requestFullscreen)f.requestFullscreen()">全屏面板</button><span class="hint">5 秒自动刷新 · 双击卡片浏览整个话题链 · Esc 退出全屏</span></div>
-        <iframe id="sm-fr" src="/v1/starmap" title="消息星图" style="width:100%;height:72vh;min-height:540px;border:1px solid #1c2b40;border-radius:12px;background:#04070d"></iframe>
-      </div>
-      </div>
+      <div class="card"><iframe id="sm-fr" src="/v1/starmap" title="消息星图" style="width:100%;height:72vh;min-height:540px;border:1px solid #1c2b40;border-radius:12px;background:#04070d" allow="fullscreen"></iframe></div>
       <div class="card"><h2>最近对话（总览 · 分页与查询）</h2>
         <div class="row"><input id="ov-kw" placeholder="搜索：内容 / 节点 / agent…" style="flex:2" oninput="ovGo(1)">
         <select id="ov-size" onchange="ovGo(1)"><option value="10">10</option><option value="20">20</option><option value="30" selected>30</option><option value="50">50</option></select></div>
@@ -1479,9 +1482,9 @@ th.srt:hover{color:#dbe2ea}
         <div class="row">
           <input id="ch-from" list="ch-agents" placeholder="发送方（agent/节点/IP）" style="flex:1">
           <input id="ch-to" list="ch-agents" placeholder="接收方（agent/节点/IP）" style="flex:1">
-          <input type="datetime-local" id="ch-since" title="起始时间（本机时区，服务端按 UTC 过滤）">
-          <span class="hint">→</span>
-          <input type="datetime-local" id="ch-until" title="结束时间">
+        </div>
+        <div class="row">
+          <span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap"><input type="datetime-local" id="ch-since" title="起始时间（本机时区，服务端按 UTC 过滤）"><span class="hint">→</span><input type="datetime-local" id="ch-until" title="结束时间"></span>
           <select id="ch-limit" title="最多返回条数"><option value="50">最多 50</option><option value="200" selected>最多 200</option><option value="1000">最多 1000</option><option value="2000">最多 2000</option></select>
           <label class="hint" style="font-size:12px"><input type="checkbox" id="ch-all">含归档</label>
           <button class="primary" onclick="histSearch()">查磁盘</button>
@@ -1496,7 +1499,7 @@ th.srt:hover{color:#dbe2ea}
     </section>
     <section id="p-config" class="hidden">
       <div class="card"><h2>对话记录颜色标识</h2>
-        <div class="hint" style="margin-bottom:8px">默认按「节点+agent」名称哈希自动配色——跨机器稳定、零配置，同名同色。这里手动选色会保存到本节点 colors.json，所有查看这个节点控制台的人共享同一套配色；勾回「自动色」即恢复算法色。</div>
+        <div class="hint" style="margin-bottom:8px">配色体系：外层深色胶囊＝节点（按 node_id 哈希固定，改名不漂移），内嵌亮色小胶囊＝agent（色相以所在节点为基准偏移，一眼看出归属）。手动选色保存到本节点 colors.json，全网查看者共享；勾回「自动色」即恢复算法色。</div>
         <div id="cf-colors"><span class="hint">加载中…</span></div>
       </div>
       <div class="card"><h2>节点配置</h2>
@@ -1531,6 +1534,8 @@ let HIST=[],CHQ=null,COLORS={},OV={page:1},CH={page:1},NAMES={},AN={},AGENTS=[],
 let PEERS=[],ST={},ASORT={k:'node',d:1},PSORT={k:'name',d:1},EXP=new Set(),LAST={ag:'',pe:'',op:'',hi:'',qt:''};
 // 用户正在选择文本时跳过所有 DOM 重写：选择/复制不再被 2 秒自动刷新打断
 function selecting(){const s=window.getSelection();return s&&s.rangeCount>0&&!s.isCollapsed;}
+// 用户正在操作控件（下拉展开、输入中、颜色选择器打开）：冻结本轮所有 DOM 重写，防止刷新冲掉控件状态
+function ctlBusy(){const a=document.activeElement;if(!a)return false;const t=a.tagName;if(t!=='SELECT'&&t!=='INPUT'&&t!=='TEXTAREA')return false;if(a.id==='auto-refresh'||a.closest('#topbar'))return false;return true;}
 function srtIcon(pfx,cur,k){const e=el(pfx+k);if(e)e.textContent=cur.k===k?(cur.d>0?' ↑':' ↓'):'';}
 function aSortBy(k){if(ASORT.k===k)ASORT.d=-ASORT.d;else ASORT={k:k,d:1};renderAgents();}
 function pSortBy(k){if(PSORT.k===k)PSORT.d=-PSORT.d;else PSORT={k:k,d:1};renderPeers();}
@@ -1543,11 +1548,19 @@ function toast(s){const t=el('toast');if(!t)return;t.textContent=s;t.style.opaci
 function copyMsg(id){const m=HIST.find(x=>x.msg_id===id);if(!m)return;const p=m.payload||{};let t;if(m.kind==='file'){t=[p.file_name,(p.size!==undefined?humanSize(p.size):''),p.saved_path].filter(Boolean).join(' | ');}else{t=(p&&typeof p==='object'&&typeof p.content==='string')?p.content:JSON.stringify(p,null,2);}copyText(t);}
 function copyText(t){if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(()=>toast('已复制到剪贴板'),()=>fbCopy(t));}else{fbCopy(t);}}
 function fbCopy(t){const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.focus();ta.select();try{document.execCommand('copy');toast('已复制到剪贴板');}catch(e){toast('复制失败');}ta.remove();}
-function autoCol(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)>>>0;}return 'hsl('+(h%360)+',50%,42%)';}
-function colFor(n,a){if(a&&COLORS['agent:'+n+'|'+a])return COLORS['agent:'+n+'|'+a];if(COLORS['node:'+n])return COLORS['node:'+n];return autoCol(a?(n+'|'+a):String(n));}
+function fnv(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)>>>0;}return h;}
+// 双层胶囊配色（用户 10-16 规格）：外层=节点深色容器（左侧留粗弧），内嵌小胶囊=agent 亮色。
+// 层级铁律：节点比 agent 深一档。节点色按 node_id 哈希固定（改名/刷新不漂移）；agent 色相以节点为基准偏移，避免同色混淆。
+function nodeHue(n){return fnv('N|'+String(n))%360;}
+function nodeCol(n){return COLORS['node:'+n]||('hsl('+nodeHue(n)+',46%,30%)');}
+function nodeHi(n){return COLORS['node:'+n]||('hsl('+nodeHue(n)+',58%,66%)');}
+function agCol(n,a){return COLORS['agent:'+n+'|'+a]||('hsl('+((nodeHue(n)+140+(fnv(String(a))%100))%360)+',58%,72%)');}
+// 手选色可能是深 hex——按亮度给胶囊内文字配可读前景
+function onCol(c){if(typeof c==='string'&&c[0]==='#'&&c.length===7){const r=parseInt(c.substr(1,2),16),g=parseInt(c.substr(3,2),16),b=parseInt(c.substr(5,2),16);return (0.299*r+0.587*g+0.114*b)>150?'#0b1420':'#eef4fb';}return '#0b1420';}
+function colFor(n,a){return a?agCol(n,a):nodeHi(n);}
 function chip(n,a){
-  if(a)return `<span class="idc" style="background:${colFor(n,a)}" title="${esc(String(n))} / ${esc(String(a))}">${esc(whoa(n,a)||a)}</span><span class="idn">${esc(who(n))}</span>`;
-  return `<span style="color:${colFor(n,'')}" title="${esc(String(n))}">●</span><span class="idn">${esc(who(n))}</span>`;}
+  if(a)return `<span class="idc" style="--nc:${nodeCol(n)}" title="${esc(String(n))} / ${esc(String(a))}"><span class="idci" style="background:${agCol(n,a)};color:${onCol(agCol(n,a))}">${esc(whoa(n,a)||a)}</span></span><span class="idn" style="color:${nodeHi(n)};opacity:.85" title="${esc(String(n))}">${esc(who(n))}</span>`;
+  return `<span style="color:${nodeHi(n)}" title="${esc(String(n))}">●</span><span class="idn">${esc(who(n))}</span>`;}
 function histRow(m){
   const dir=(m.direction==='out'?'out':m.direction==='in'?'in':'');
   const open=EXP.has(m.msg_id);
@@ -1619,6 +1632,10 @@ async function saveName(nodeId,agentId,newName){
 }
 async function delAgent(nodeId,agentId){if(nodeId!==SELF){alert('远端 Agent 只能在其所属节点删除');return;}if(!confirm('删除 Agent '+agentId+'？'))return;try{const d=await j('/v1/agents',{method:'DELETE',body:JSON.stringify({agent_id:agentId})});alert(JSON.stringify(d));refresh();}catch(e){alert('删除失败: '+(e.message||e));}}
 async function forgetPeer(id){if(!confirm('遗忘节点 '+id+' ？\n将从列表移除并忽略自动发现；它下次主动握手连上时会自动回来。'))return;try{await j('/v1/peers/'+id+'/forget',{method:'DELETE'});refresh();}catch(e){alert('失败: '+(e.message||e));}}
+function renameNode(btn){if(el('rn-input'))return;const td=btn.closest('tr').children[0];const inp=document.createElement('input');inp.id='rn-input';inp.value=(ST&&ST.name)||'';inp.style.width='150px';td.textContent='';td.appendChild(inp);inp.focus();inp.select();
+ inp.onkeydown=e=>{if(e.key==='Enter'){inp.onblur=null;const v=inp.value;inp.remove();saveNodeName(v);}else if(e.key==='Escape'){inp.onblur=null;refresh();}};
+ inp.onblur=()=>{const v=inp.value;inp.remove();saveNodeName(v);};}
+async function saveNodeName(v){const n=String(v||'').trim();if(!n){refresh();return;}try{await j('/v1/config',{method:'PUT',body:JSON.stringify({name:n})});refresh();}catch(e){alert('改名失败: '+(e.message||e));}}
 function pick(id,ag){
   const v=ag?('agent:'+id+':'+ag):id;
   const t=el('to'),t2=el('to2');
@@ -1643,8 +1660,8 @@ async function boot(){
  $('modal').classList.remove('hidden');
 }
 boot();
-async function j(p,opt){const o=opt||{};const r=await fetch(p,{...o,headers:{...HDR(),...(o.headers||{})}});const txt=await r.text();let d={};try{d=txt?JSON.parse(txt):{};}catch{d={error:txt.slice(0,300)};}if(r.status===401){alert('token 无效，请重新输入');sessionStorage.removeItem(LS_KEY);location.reload();throw new Error('401');}if(!r.ok)throw new Error('HTTP '+r.status+' '+((d&&(d.error||d.err))||txt.slice(0,200)||r.statusText));return d;}
-function show(panel){document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.p===panel));document.querySelectorAll('.content>section').forEach(s=>s.classList.add('hidden'));$('p-'+panel).classList.remove('hidden');}
+async function j(p,opt){const o=opt||{};const h={...HDR(),...(o.headers||{})};if(o.body&&typeof o.body==='string'&&!h['Content-Type']&&!h['content-type'])h['Content-Type']='application/json';const r=await fetch(p,{...o,headers:h});const txt=await r.text();let d={};try{d=txt?JSON.parse(txt):{};}catch{d={error:txt.slice(0,300)};}if(r.status===401){alert('token 无效，请重新输入');sessionStorage.removeItem(LS_KEY);location.reload();throw new Error('401');}if(!r.ok)throw new Error('HTTP '+r.status+' '+((d&&(d.error||d.err))||txt.slice(0,200)||r.statusText));return d;}
+function show(panel){document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.p===panel));document.querySelectorAll('.content>section').forEach(s=>s.classList.add('hidden'));$('p-'+panel).classList.remove('hidden');if(panel==='config')renderColorCfg();}
 function input(id){return ($(id)&&$(id).value||'').trim();}
 function el(id){return document.getElementById(id);}
 function val(id){const e=el(id);return e?(e.value||'').trim():'';}
@@ -1758,14 +1775,15 @@ function renderAgents(){
 function renderPeers(){
   ['name','node_id','online'].forEach(k=>srtIcon('ps-',PSORT,k));
   const rank=p=>(ST.node_id&&p.node_id===ST.node_id?0:1);
-  const list=PEERS.slice().sort((a,b)=>{
+  const merged=[{node_id:ST.node_id,name:ST.name||ST.node_id,addr:'本机',tags:[],online:true,last_seen_seconds_ago:0,direction:'self'},...PEERS.filter(p=>p.node_id!==ST.node_id)];
+  const list=merged.slice().sort((a,b)=>{
     const r=rank(a)-rank(b); if(r) return r;
     let c=0;
     if(PSORT.k==='name')c=(a.name||'').localeCompare(b.name||'','zh');
     else if(PSORT.k==='node_id')c=a.node_id.localeCompare(b.node_id);
     else if(PSORT.k==='online')c=(b.online?1:0)-(a.online?1:0)||(a.name||'').localeCompare(b.name||'','zh');
     return c*PSORT.d;});
-  let pe=''; for(const p of list){const loc=ST&&p.node_id===ST.node_id;pe+=`<tr${loc?' class="local"':''}><td>${loc?'<span class="self-chip">本机</span>':''}${esc(p.name)}</td><td>${esc(p.node_id)}</td><td>${esc(p.addr)}</td><td>${(p.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</td><td><span class="badge ${p.online?'on':'off'}"><span class="dot"></span>${p.online?'在线':'离线'}</span></td><td>${(!p.online&&!loc)?`<button class="tbtn" title="从列表移除且忽略自动发现，直到该节点重新握手连上" onclick="forgetPeer('${esc(p.node_id)}')">遗忘</button>`:''}</td></tr>`;}
+  let pe=''; for(const p of list){const loc=ST&&p.node_id===ST.node_id;pe+=`<tr${loc?' class="local"':''}><td>${loc?'<span class="self-chip">本机</span>':''}${esc(p.name)}</td><td>${esc(p.node_id)}</td><td>${esc(p.addr)}</td><td>${(p.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</td><td><span class="badge ${p.online?'on':'off'}"><span class="dot"></span>${p.online?'在线':'离线'}</span></td><td>${loc?`<button class="tbtn" title="改本机节点显示名（node_id 不变，改名后自动广播给全网）" onclick="renameNode(this)">✎ 改名</button>`:(!p.online?`<button class="tbtn" title="从列表移除且忽略自动发现，直到该节点重新握手连上" onclick="forgetPeer('${esc(p.node_id)}')">遗忘</button>`:`<span class="hint" title="远端节点的显示名请到该节点自身的 /web 页面修改">远端</span>`)}</td></tr>`;}
   if(pe!==LAST.pe){$('peers-body').innerHTML=pe;LAST.pe=pe;}
 }
 function histSig(){return HIST.length+'|'+(HIST.length?HIST[HIST.length-1].msg_id:'')+'|'+EXP.size;}
@@ -1798,40 +1816,49 @@ function histReset(){CHQ=null;for(const i of ['ch-from','ch-to','ch-since','ch-u
 function fillAgDl(){const d=el('ch-agents');if(!d)return;const s=new Set();
  for(const a of AGENTS){if(a.agent_id)s.add(a.agent_id);if(a.name)s.add(a.name);if(a.node_id)s.add(a.node_id);if(a.node_name)s.add(a.node_name);}
  d.innerHTML=[...s].map(x=>`<option value="${esc(x)}"></option>`).join('');}
-function renderColorCfg(){const box=el('cf-colors');if(!box)return;box._n=box._n||{};
+function renderColorCfg(){const box=el('cf-colors');if(!box||box.contains(document.activeElement))return;
  const ids=new Map();
  for(const a of AGENTS){ids.set('agent:'+a.node_id+'|'+a.agent_id,(a.node_name||who(a.node_id))+' · '+(a.name||a.agent_id));}
  for(const n of Object.keys(NAMES)){ids.set('node:'+n,'节点：'+NAMES[n]);}
  const rows=[...ids.entries()].sort((x,y)=>x[1].localeCompare(y[1]));
  if(!rows.length){box.innerHTML='<span class="hint">暂无节点/agent，等 fleet 同步后自动出现。</span>';return;}
- box.innerHTML=rows.map(([k,lbl])=>{const cur=COLORS[k]||'';const sep=k.indexOf('|');
-  const n=sep>0?k.slice(6,sep):k.slice(5);const a=sep>0?k.slice(sep+1):'';
-  const prev=`<span class="idc" style="background:${cur||colFor(n,a)}">${esc(lbl)}</span>`;
-  return `<div class="row" style="align-items:center">${prev}<input type="color" ${cur?'value="'+cur+'"':''} ${cur?'':'disabled'} onchange="setColor('${k}',this.value)"><label style="font-size:12px;margin-left:6px"><input type="checkbox" ${cur?'':'checked'} onchange="tgAutoCol('${k}',this.checked)">自动色</label></div>`;}).join('');}
-async function setColor(k,v){COLORS[k]=v;await putColors();}
-async function tgAutoCol(k,on){if(on)delete COLORS[k];else COLORS[k]='#5b8def';await putColors();}
-async function putColors(){try{await j('/v1/colors',{method:'PUT',body:JSON.stringify({colors:COLORS})});renderColorCfg();}catch(e){alert('保存颜色失败：'+(e.message||e));}}
+ box.innerHTML=rows.map(([k,lbl])=>cfgRow(k,lbl)).join('');}
+function cfgPrev(k,n,a,lbl){const outer=nodeCol(n);const inner=a?agCol(n,a):nodeHi(n);
+ return `<span class="idc" style="--nc:${esc(outer)}"><span class="idci" style="background:${esc(inner)};color:${onCol(inner)}">${esc(lbl)}</span></span>`;}
+function cfgRow(k,lbl){const sep=k.indexOf('|');
+ const n=sep>0?k.slice(6,sep):k.slice(5);const a=sep>0?k.slice(sep+1):'';const cur=COLORS[k]||'';
+ const hexv=/^#[0-9a-fA-F]{6}$/.test(cur)?cur:'#5b8def';
+ return `<div class="cfrow" data-k="${esc(k)}" data-n="${esc(n)}" data-a="${esc(a)}" data-lbl="${esc(lbl)}">${cfgPrev(k,n,a,lbl)}<input type="color" ${cur?'value="'+hexv+'"':''} ${cur?'':'disabled'} onchange="setColor('${k}',this.value)"><label class="cfauto" title="勾选＝跟随算法自动色"><input type="checkbox" ${cur?'':'checked'} onchange="tgAutoCol('${k}',this.checked)">自动色</label></div>`;}
+function paintColorRow(k){const enc=CSS.escape?CSS.escape(k):k;
+ const row=document.querySelector('#cf-colors .cfrow[data-k="'+enc+'"]');if(!row)return;const cur=COLORS[k]||'';
+ const pv=row.querySelector('.idc');if(pv)pv.outerHTML=cfgPrev(k,row.dataset.n,row.dataset.a,row.dataset.lbl);
+ const inp=row.querySelector('input[type="color"]');
+ if(inp){inp.disabled=!cur;if(cur)inp.value=/^#[0-9a-fA-F]{6}$/.test(cur)?cur:'#5b8def';}
+ const cb=row.querySelector('.cfauto input');if(cb)cb.checked=!cur;}
+async function setColor(k,v){COLORS[k]=v;paintColorRow(k);await putColors();}
+async function tgAutoCol(k,on){if(on)delete COLORS[k];else if(!COLORS[k])COLORS[k]='#5b8def';paintColorRow(k);await putColors();}
+async function putColors(){try{await j('/v1/colors',{method:'PUT',body:JSON.stringify({colors:COLORS})});}catch(e){alert('保存颜色失败：'+(e.message||e));}}
 async function refresh(){
  histStats();
  try{
-  if(el('ed-input'))return; // 行内改名编辑中：跳过本轮刷新，防止重绘冲掉编辑框
+  if(el('ed-input')||el('rn-input'))return; // 行内改名编辑中：跳过本轮刷新，防止重绘冲掉编辑框
   const [st,peers,agents,hist,cols]=await Promise.all([j('/v1/status'),j('/v1/peers'),j('/v1/fleet/agents'),j('/v1/history'),j('/v1/colors')]);
-  COLORS=(cols&&cols.colors)||{};
+  // 用户正在选择/复制文本或操作控件：只更新内存数据，不重写 DOM、不覆盖未保存完的配色（下一轮自动恢复渲染）
+  const sel=selecting()||ctlBusy();
+  if(!sel)COLORS=(cols&&cols.colors)||{};
   ST=st||{}; PEERS=(peers&&peers.ok)?peers.peers:[]; AGENTS=(agents&&agents.ok)?agents.agents:[]; SELF=ST.node_id||'';
   $('tb-self').textContent=st.name;
-  $('tb-meta').textContent=`${st.node_id} · v${st.version} · 在线 ${st.peers_online}/${st.peers_known} · ${new Date().toLocaleTimeString()}`;
+  $('tb-meta').textContent=`${st.node_id} · 在线 ${st.peers_online}/${st.peers_known} · ${new Date().toLocaleTimeString()}`;
   $('m-nodes').textContent=`${st.peers_online}/${st.peers_known}`;
   $('m-history').textContent=hist.history.length;
   $('m-transfer').textContent=st.active_transfers;
   $('m-version').textContent=st.version;
-  // 用户正在选择/复制文本：只更新内存数据，不重写 DOM（下一轮自动恢复渲染）
-  const sel=selecting();
   // 节点名 / agent 名映射（给人看）
   NAMES={}; AN={};
   if(st&&st.node_id){NAMES[st.node_id]=st.name||st.node_id;}
   for(const p of PEERS)NAMES[p.node_id]=p.name;
   for(const a of AGENTS){AN[a.node_id+'|'+a.agent_id]=(a.name||a.agent_id); NAMES[a.node_id]=a.node_name||NAMES[a.node_id]||a.node_id;}
-  if(!sel){renderPeers();renderAgents();fillAgDl();if(el('p-config')&&!el('p-config').classList.contains('hidden'))renderColorCfg();}
+  if(!sel){renderPeers();renderAgents();fillAgDl();renderColorCfg();}
   // 目标下拉（纯选择）——签名相同不重写，保住控件状态
   let opn='<optgroup label="节点（发给整机）"><option value="*">* 广播（全部节点）</option>';
   for(const p of PEERS)opn+=`<option value="${esc(p.node_id)}">${esc(p.name)}${p.online?'':'（离线）'}</option>`;

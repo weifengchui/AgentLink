@@ -480,11 +480,24 @@ fn autostart(config_path: &std::path::Path, remove: bool, force: bool) -> Result
     }
 
     // VBS quotes a literal " as "" — so the inner command reads ""..."" .
+    // 自修复模板：exe 路径失效时回落到 config 同目录的 agentlink.exe，仍不存在则静默退出，
+    // 不再让 wscript 弹 "系统找不到指定的文件 80070002" 打断开机。
     let script = format!(
-        "' AgentLink autostart (installed by `agentlink autostart`){}\n\
+        "' AgentLink autostart (installed by `agentlink autostart`)\n\
+         On Error Resume Next\n\
+         Set fso = CreateObject(\"Scripting.FileSystemObject\")\n\
          Set ws = CreateObject(\"Wscript.Shell\")\n\
-         ws.Run \"\"\"{}\"\" --config \"\"{}\"\" run --no-open\", 0, False\n",
-        "",
+         exe = \"{}\"\n\
+         cfg = \"{}\"\n\
+         If Not fso.FileExists(exe) Then\n\
+           exe2 = fso.BuildPath(fso.GetParentFolderName(cfg), \"agentlink.exe\")\n\
+           If fso.FileExists(exe2) Then\n\
+             exe = exe2\n\
+           Else\n\
+             WScript.Quit 0\n\
+           End If\n\
+         End If\n\
+         ws.Run \"\"\"\" & exe & \"\"\" --config \"\"\" & cfg & \"\"\" run --no-open\"\"\", 0, False\n",
         exe.display(),
         cfg_abs.display()
     );

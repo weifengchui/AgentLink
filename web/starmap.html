@@ -30,9 +30,6 @@ svg#map{position:absolute;inset:0;width:100%;height:100%}
 justify-content:space-between;padding:0 26px;z-index:30;pointer-events:none;
 background:linear-gradient(180deg,rgba(4,7,13,.82),transparent)}
 #brand{display:flex;align-items:center;gap:14px}
-#brand .hexlogo{width:38px;height:38px;clip-path:polygon(50% 0,93% 25%,93% 75%,50% 100%,7% 75%,7% 25%);
-background:linear-gradient(160deg,var(--cyan),#1b4f7a);display:flex;align-items:center;justify-content:center;
-font-size:calc(19px*var(--fs));color:#04121c;box-shadow:0 0 18px rgba(56,214,230,.5)}
 #brand h1{font-size:calc(20px*var(--fs));font-weight:600;letter-spacing:3px;color:#cfe4ff;margin:0}
 #brand h1 em{font-style:normal;color:var(--cyan)}
 #brand .sub{font-size:calc(11px*var(--fs));color:var(--mut);letter-spacing:.6em;border-left:1px solid var(--edge);padding-left:14px;margin-top:4px}
@@ -59,10 +56,12 @@ opacity:0;animation:stpulse 3.6s ease-in-out infinite;pointer-events:none}
 font-family:ui-monospace,Consolas,monospace;letter-spacing:.05em}
 .agt{position:absolute;transform:translate(-50%,-50%);cursor:grab;z-index:6}
 .agt.drag{cursor:grabbing}
-.agt .dot{position:relative;border-radius:999px;display:flex;align-items:center;justify-content:center;height:23px;padding:0 10px;
-background:radial-gradient(circle at 35% 30%,rgba(255,255,255,.28),transparent 60%),var(--ac,#38d6e6);
-border:1.5px solid rgba(255,255,255,.28);color:#061018;font-weight:700;font-size:calc(10.5px*var(--fs));letter-spacing:.03em;white-space:nowrap;
-box-shadow:0 0 9px 1px var(--acg,rgba(56,214,230,.42));transition:transform .2s;animation:apulse 3s ease-in-out infinite alternate}
+.agt .dot{position:relative;border-radius:14px;display:flex;align-items:center;justify-content:flex-end;height:27px;padding:2px 2px 2px 10px;
+background:var(--acn,#1c3a5e);border:1px solid rgba(255,255,255,.13);transition:transform .2s;animation:apulse 3s ease-in-out infinite alternate}
+.agt .dot .in{border-radius:999px;padding:0 9px;height:21px;line-height:21px;display:inline-block;
+background:radial-gradient(circle at 35% 30%,rgba(255,255,255,.30),transparent 60%),var(--ac,#38d6e6);
+color:#061018;font-weight:700;font-size:calc(10.5px*var(--fs));letter-spacing:.03em;white-space:nowrap;
+box-shadow:0 0 9px 1px var(--acg,rgba(56,214,230,.42))}
 .agt:hover .dot{transform:scale(1.1)}
 @keyframes apulse{from{opacity:.82}to{opacity:1}}
 
@@ -165,7 +164,7 @@ background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
   </div>
 </div></div>
 <div id="topbar">
-  <div id="brand"><div class="hexlogo">AL</div><h1>AGENT<em>LINK</em> · 消息星图</h1></div>
+  <div id="brand"><h1>AGENT<em>LINK</em> · 消息星图</h1></div>
   <div id="hud"></div>
 </div>
 <div id="bar">
@@ -198,19 +197,31 @@ background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
 const stageEl=document.getElementById("stage"),map=document.getElementById("map"),
 hud=document.getElementById("hud");
 let W=innerWidth,H=innerHeight;
+const CUR={x:innerWidth/2,y:innerHeight/2};
+addEventListener("pointermove",e=>{CUR.x=e.clientX;CUR.y=e.clientY},{passive:true});
 function barH(){const b=document.getElementById("bar");return b?b.offsetHeight:56}
 function orbR(){return Math.max(48,Math.min(112,(H-barH()-84)/3.4))}
 function staClamp(){const top=90,bot=Math.max(top+60,H-barH()-orbR()-30);return{top,bot}}
 const MACH={};let SELF=null,NODES=[],NAMES={},COLORS={},ST_ON=0,ST_ALL=0,AG_ALL=0;
 function esc(s){return String(s==null?"":s).replace(/[&<"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
-function autoCol(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)>>>0;}return "hsl("+(h%360)+",62%,55%)";}
-function colFor(nid,a){if(a&&COLORS["agent:"+nid+"|"+a])return COLORS["agent:"+nid+"|"+a];if(COLORS["node:"+nid])return COLORS["node:"+nid];return autoCol(a?(nid+"|"+a):String(nid));}
+function fnv(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)>>>0;}return h;}
+// 节点配色：按 node_id 哈希固定（改名/刷新不漂移）；深档 nodeCol=胶囊包边，亮档 staCol=站台展示
+function nodeHue(n){return fnv("N|"+String(n))%360}
+function nodeCol(n){return COLORS["node:"+n]||("hsl("+nodeHue(n)+",46%,30%)")}
+function staCol(n){return COLORS["node:"+n]||("hsl("+nodeHue(n)+",58%,66%)")}
+function staGlow(n){return COLORS["node:"+n]?COLORS["node:"+n]+"88":("hsla("+nodeHue(n)+",58%,64%,.5)")}
+// agent 内胶囊色：以所在节点色相为基准偏移 +140..239°；比节点亮一档（层级铁律与控制台一致）
+function agHue(n,a){return (nodeHue(String(n))+140+(fnv(String(a))%100))%360}
+function agCol(n,a){return COLORS["agent:"+n+"|"+a]||("hsl("+agHue(n,a)+",58%,72%)")}
+function agGlow(n,a){return COLORS["agent:"+n+"|"+a]?COLORS["agent:"+n+"|"+a]+"99":("hsla("+agHue(n,a)+",66%,58%,.6)")}
+function colFor(nid,a){return a?agCol(nid,a):staCol(nid)}
 function who(nid){return NAMES[nid]||nid;}
+function nmOf(nid){return (MACH[nid]&&MACH[nid].lab)||who(nid)}
 const T=(id,name,color,msgs)=>({id,name,color,msgs});
 const M=(t,f,to,body,kind="msg")=>({t,f:a2k(f),to:a2k(to),body,kind,hd:hdOf(f,to)});
 function a2k([m,a]){return m+"|"+a}
-function aKey2disp(k){const[m,a]=k.split("|");return (a==="@node"?"node":a)+"@"+MACH[m].ip}
-function hdOf(f,to){const nm=a=>a==="@node"?"node":a;return "【"+nm(f[1])+"@"+MACH[f[0]].ip+" -> "+nm(to[1])+"@"+MACH[to[0]].ip+"】"}
+function aKey2disp(k){const[m,a]=k.split("|");return (a==="@node"?"node":a)+"@"+nmOf(m)}
+function hdOf(f,to){const nm=a=>a==="@node"?"node":a;return "【"+nm(f[1])+"@"+nmOf(f[0])+" -> "+nm(to[1])+"@"+nmOf(to[0])+"】"}
 let TOPICS=[];
 /* ---------- positions (draggable) ---------- */
 const STA={},AGTP={}; /* AGTP[key]={dx,dy} offset from station center */
@@ -231,11 +242,11 @@ function chanD(p1,p2,bow){const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2,dx=p2.x-p1.x,d
 function bowOf(k){return 34+(hashK(k)%26);}
 /* ---------- stations & agents dom ---------- */
 const staEl={},agtEl={};
-function agCol(m,a){return colFor(m,a);}
+function shortNm(lab,m){const s=String(lab||"").trim();if(!s)return m===SELF?"本机":"节点";if(s.length<=6)return s;if(s.length<=10)return `<span style="font-size:calc(11px*var(--fs))">${esc(s)}</span>`;return esc(s.slice(0,7))+"…";}
 function buildWorld(){
  for(const m in MACH){const c=MACH[m];const d=document.createElement("div");d.className="station";
- d.style.setProperty("--sc",c.col);d.style.setProperty("--scg",c.col+"88");
- d.innerHTML=`<div class="ring"></div><div class="pulse"></div><div class="orb"></div><div class="glyph"><span>${m}</span></div><div class="lab"><b>${esc(c.lab)}</b><i>${esc(c.ip)}</i></div>`;
+ d.style.setProperty("--sc",c.col);d.style.setProperty("--scg",staGlow(m));
+ d.innerHTML=`<div class="ring"></div><div class="pulse"></div><div class="orb"></div><div class="glyph"><span>${shortNm(c.lab,m)}</span></div><div class="lab"><i>${esc(c.ip)}</i></div>`;
  d.dataset.m=m;stageEl.appendChild(d);staEl[m]=d;
  d.addEventListener("pointerdown",e=>startDrag(e,"station",m));}
  for(const m in MACH){const k=a2k([m,"@node"]);
@@ -247,8 +258,8 @@ function buildWorld(){
   w2.addEventListener("pointerleave",()=>{clearOpenTomb(k);opentomb[k]=setTimeout(()=>{opentomb[k]=null;setDeckOpen(k,false);scheduleHide(k);},140);});}
  for(const m in MACH)for(const a of MACH[m].agents){const k=a2k([m,a]);
  const d=document.createElement("div");d.className="agt";d.style.setProperty("--ac",agCol(m,a));
- d.style.setProperty("--acg",agCol(m,a)+"99");
- d.innerHTML=`<div class="dot">${a}</div><div class="flash"></div><div class="badge">0</div>`;
+ d.style.setProperty("--acg",agGlow(m,a));d.style.setProperty("--acn",nodeCol(m));
+ d.innerHTML=`<div class="dot"><span class="in">${esc(a)}</span></div><div class="flash"></div><div class="badge">0</div>`;
  stageEl.appendChild(d);agtEl[k]=d;
  d.addEventListener("pointerdown",e=>startDrag(e,"agent",k));
  d.addEventListener("pointerenter",()=>{hovAgt=k;reveal(k);applyLanes();});
@@ -309,7 +320,7 @@ function applyLanes(){const agts=new Set(),stas=new Set(),tps=new Set();
   const a=ends[0],b=ends[1],sa=a.split("|")[0],sb=b.split("|")[0];
   const hi=tps.has(tpId);
   const byA=agts.has(a)||agts.has(b),byS=stas.has(sa)||stas.has(sb);
-  l.classList.toggle("on",!!(hi||byA||byS));l.classList.toggle("hl",!!hi);
+  l.classList.toggle("on",!!(hi||byA||byS));l.classList.toggle("hl",!!(hi||byA||byS));
   if(hi){glow.add(a);glow.add(b);}
   else if(byA)glow.add(agts.has(a)?b:a);
   else if(byS&&sa!==sb)glow.add(stas.has(sa)?b:a);}
@@ -352,8 +363,8 @@ function buildDeck(k){const dw=dwraps[k];const g=groupsFor(k);
   c.addEventListener("pointerleave",()=>{c.classList.remove("hot");
    c.style.zIndex=[...dw.querySelectorAll(".gcard")].indexOf(c)+1;
    if(gTopic===c.dataset.tp)gTopic=null;applyLanes();});
-  const openG=()=>{const tp=TOPICS.find(t=>t.id===c.dataset.tp);
-   const chain=tp.msgs.filter(m=>(m.to===k||m.f===k)&&m.t>=-(winS+backS)&&m.t<=-backS).sort((a,b)=>a.t-b.t);
+  const openG=()=>{const tp=TOPICS.find(t=>t.id===c.dataset.tp);const now=Date.now();
+   const chain=tp.msgs.filter(m=>{m.t=-Math.round((now-m.abs)/1000);return (m.to===k||m.f===k)&&m.t>=-(winS+backS)&&m.t<=-backS}).sort((a,b)=>a.t-b.t);
    if(!chain.length)return;openViewer(tp,chain,chain.length-1,k);};
   c.addEventListener("click",openG);});
  layoutDeck(k);}
@@ -402,10 +413,12 @@ function posDwrap(k){const dw=dwraps[k];const p=agPos(k);
  if(!fits(raw[0])&&fits(raw[1]))raw=[raw[1],raw[0]];
  let cands=raw.concat([cr0+PAD,cl0-PAD-PW]).map(v=>Math.max(10,Math.min(W-10-PW,v)));
  cands=[...new Set(cands)];
+ // 展开态：水平位置锁定在原地，只允许纵向避让（展开只上下拉伸，不横向漂移）
+ if(deckOpen[k]&&dw.style.left)cands=[Math.max(10,Math.min(W-10-PW,parseFloat(dw.style.left)))];
  const obs=deckObs(isNode?null:k,isNode,m0);
  const hit=(x,t)=>{const q={l:x+4,t:t-span,r:x+PW-4,b:t+cardH};
   for(const o of obs)if(ovq(q,o))return o;return null};
- const t0=Math.max(minT,Math.min(maxT,p.y-36));
+ const t0=Math.max(minT,Math.min(maxT,CUR.y-40));
  let sol=null;
  for(const x of cands){for(let d=0;d<=190;d+=18){for(const s2 of (d===0?[0]:[d,-d])){
    const t=Math.max(minT,Math.min(maxT,t0+s2));
@@ -417,6 +430,8 @@ function posDwrap(k){const dw=dwraps[k];const p=agPos(k);
 function setDeckOpen(k,open){if(!dwraps[k]||dwraps[k].style.display==="none")return;
  deckOpen[k]=open;layoutDeck(k);}
 function reveal(k){const dw=dwraps[k];cancelTomb(k);
+ // 悬停某实体时其它无关卡片立即收起
+ for(const o in dwraps){if(o!==k&&dwraps[o].style.display!=="none"){cancelTomb(o);clearOpenTomb(o);dwraps[o].dataset.vis="0";deckOpen[o]=false;dwraps[o].style.display="none";}}
  buildDeck(k);if(dw.style.display!=="block"){if(!dw.querySelector(".gcard"))return;}
  dw.dataset.vis="1";dw.style.display="block";deckOpen[k]=false;layoutDeck(k);}
 function renderAllDecks(){for(const k in dwraps)buildDeck(k);}
@@ -439,7 +454,7 @@ function drawViewer(){const m=VT.chain[VT.i];
  document.getElementById("v-kind").textContent={msg:"消息",file:"文件",sys:"系统"}[m.kind]||m.kind;
  document.getElementById("v-route").textContent=aKey2disp(m.f)+" → "+aKey2disp(m.to);}
 function hdOf2(m){const[f,k1]=m.f.split("|"),[t,k2]=m.to.split("|");
- return`【${k1}@${MACH[f].ip} -> ${k2}@${MACH[t].ip}】`;}
+ return`【${k1.replace("@node","node")}@${nmOf(f)} -> ${k2.replace("@node","node")}@${nmOf(t)}】`;}
 function fmtHM(t){const d=new Date(Date.now()+t*1000);
  return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");}
 function fmtClock(t){const d=new Date(Date.now()+t*1000);
@@ -465,9 +480,12 @@ function payText(e){const p=e.payload;
   try{return JSON.stringify(p)}catch(err){return String(p)}}
  return String(p==null?(e.action||""):p);}
 const PAL=["#38d6e6","#43d97b","#ffb347","#c77dff","#7fb0ff","#ff5c7a","#8fd0ff","#e88fd0","#7ee7f2","#9adf8a","#f2c14e","#5ad1b4"];
-const FR=[[.24,.52],[.76,.24],[.72,.78],[.44,.16],[.48,.88],[.14,.2],[.9,.52],[.28,.84]];
+// 默认布局：本机站台居中，其余节点按环均分（整体重心在画面中央，任意节点数都不偏一侧）
+function frSelf(){return[.5,.5]}
+function frRing(j,n){if(n<=0)return frSelf();const ang=-Math.PI/2+j*(2*Math.PI/n);return[0.5+0.28*Math.cos(ang),0.52+0.30*Math.sin(ang)]}
+function frNew(nid){if(nid===SELF)return frSelf();const j=Object.keys(MACH).filter(k=>k!==SELF).length;return frRing(j,Math.max(j+1,2));}
 function ensureEnd(k){const[nid,a]=k.split("|");
- if(!MACH[nid]){const f=FR[Object.keys(MACH).length%FR.length];
+ if(!MACH[nid]){const f=frNew(nid);
   MACH[nid]={lab:who(nid),ip:"?",x:f[0],y:f[1],col:colFor(nid,""),agents:[]};}
  if(a!=="@node"&&!MACH[nid].agents.includes(a))MACH[nid].agents.push(a);}
 async function loadTopo(){
@@ -481,14 +499,15 @@ async function loadTopo(){
  COLORS=(co&&co.colors)||{};
  const byNode={};for(const a of(ag.agents||[])){(byNode[a.node_id]=byNode[a.node_id]||new Set()).add(a.agent_id);if(a.node_name)NAMES[a.node_id]=a.node_name;}
  ST_ON=NODES.filter(n=>n.online).length;ST_ALL=NODES.length;AG_ALL=[...new Set((ag.agents||[]).map(x=>x.node_id+"|"+x.agent_id))].length;
- NODES.forEach((n,i)=>{if(!MACH[n.id]){const f=FR[Math.min(i,FR.length-1)];MACH[n.id]={lab:n.name,ip:n.ip||"—",x:f[0],y:f[1],col:colFor(n.id,""),agents:[]};}
+ const others=NODES.filter(x=>x.id!==SELF);
+ NODES.forEach((n)=>{if(!MACH[n.id]){const j=others.findIndex(x=>x.id===n.id);const f=j<0?frSelf():frRing(j,Math.max(others.length,2));MACH[n.id]={lab:n.name,ip:n.ip||"—",x:f[0],y:f[1],col:colFor(n.id,""),agents:[]};}
   const m=MACH[n.id];m.lab=n.name;m.online=n.online;if(n.ip&&n.ip!=="—")m.ip=n.ip;m.col=colFor(n.id,"");
-  m.agents=[...(byNode[n.id]||[])].sort();});
+  m.agents=[...new Set([...(byNode[n.id]||[]),...m.agents])].sort();});
  for(const nid in byNode)if(!NODES.some(n=>n.id===nid)){ensureAll(nid,[...byNode[nid]]);}
 }
 function ensureAll(nid,ags){ensureEnd(nid+"|@node");for(const a of ags)ensureEnd(nid+"|"+a);}
 function msgOf(e){const abs=Date.parse(e.ts)||0,nid=(typeof e.node==="string"&&e.node)?e.node:SELF;
- if(!MACH[nid]){const f=FR[Object.keys(MACH).length%FR.length];
+ if(!MACH[nid]){const f=frNew(nid);
   MACH[nid]={lab:who(nid),ip:"?",x:f[0],y:f[1],col:colFor(nid,""),agents:[]};}
  const fk=String(e.from)+"|"+(e.from_agent||"@node"),tk=String(e.to)+"|"+(e.to_agent||"@node");
  ensureEnd(fk);ensureEnd(tk);
@@ -504,16 +523,17 @@ function buildTopics(ents){const byId={};for(const e of ents)byId[e.msg_id]=e;
  TOPICS=Object.values(groups);for(const tp of TOPICS)tp.msgs.sort((x,y)=>x.abs-y.abs);}
 const KNOWN=new Set();let WSIG="";
 async function poll(){
- try{await loadTopo();await syncWorld();renderLegend();
+ try{await loadTopo();
   const d=await J("/v1/history/search?limit=1500&max_mb=192&scope=all");
-  if(!d||d.ok!==true){setErr((d&&d.error==="history disabled")?"总线未启用历史记录（config history.enabled=false）":"查询失败："+((d&&d.error)||"未知"));renderLinks();renderAllDecks();return;}
+  if(!d||d.ok!==true){await syncWorld();renderLegend();setErr((d&&d.error==="history disabled")?"总线未启用历史记录（config history.enabled=false）":"查询失败："+((d&&d.error)||"未知"));renderLinks();renderAllDecks();return;}
   setErr("");
   buildTopics((d.matches||[]).slice().sort((x,y)=>String(x.ts).localeCompare(String(y.ts))));
+  await syncWorld();renderLegend(); /* world built AFTER msgs registered: agents from history+fleet in one shot */
   const edge=backS===0&&!paused;
   for(const tp of TOPICS)for(const m of tp.msgs)if(!KNOWN.has(m.id)){KNOWN.add(m.id);if(edge&&m.abs>=Date.now()-90000)flyIn(tp,m);}
   renderLinks();renderAllDecks();
  }catch(e){setErr(String(e.message||e));}}
-function worldSig(){let s="";for(const m in MACH)s+=m+"|"+MACH[m].ip+"|"+MACH[m].agents.join(",")+";";return s;}
+function worldSig(){let s="";for(const m in MACH)s+=m+"|"+MACH[m].lab+"|"+MACH[m].ip+"|"+MACH[m].agents.join(",")+";";return s;}
 async function syncWorld(){const sg=worldSig();if(sg===WSIG)return;WSIG=sg;
  if(Object.keys(STA).length){stageEl.innerHTML="";
   for(const o of[dwraps,deckOpen,hideTimers,opentomb,agtEl,staEl])for(const k in o)delete o[k];
@@ -571,7 +591,16 @@ function applyFs(){const v=+fsEl.value;document.documentElement.style.setPropert
 fsEl.oninput=applyFs;applyFs();
 document.getElementById("bPause").onclick=e=>{paused=!paused;if(paused)cancelLiveAnims();
  e.target.classList.toggle("on",paused);e.target.textContent=paused?"恢复流入":"暂停流入";};
-document.getElementById("bFs").onclick=()=>{document.fullscreenElement?document.exitFullscreen():document.body.requestFullscreen();};
+document.getElementById("bFs").onclick=()=>{
+ // 本页可能被总览 iframe 嵌入：全屏请求要打在宿主 iframe 元素上（iframe 内部对 body 发请求会被拒），
+ // 再点一次 = 退出当前全屏（无论全屏是本页还是外层按钮触发的）。
+ let fe=null;try{fe=window.frameElement}catch(e){}
+ const doc=fe?fe.ownerDocument:document;
+ if(doc.fullscreenElement){doc.exitFullscreen().catch(()=>{});return;}
+ const tgt=fe||document.documentElement;
+ let p=null;try{p=tgt.requestFullscreen()}catch(e){p=Promise.reject(e)}
+ if(p&&p.catch)p.catch(()=>{try{document.body.requestFullscreen().catch(()=>{})}catch(e){}});
+};
 document.getElementById("bSnap").onclick=snapshot;
 let recorder=null,recTimer=null;
 document.getElementById("bRec").onclick=e=>{

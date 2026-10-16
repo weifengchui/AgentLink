@@ -207,6 +207,7 @@ async fn session(
     if send_text(&send, &hello).await.is_err() {
         return;
     }
+    let mut hello_name = state.display_name();
 
     let mut peer_id: Option<String> = expected_peer;
     let mut last_recv = Instant::now();
@@ -245,6 +246,20 @@ async fn session(
                 let beat = Envelope::heartbeat(&cfg.node_id);
                 let _ = send_text(&send, &beat).await;
                 let _ = send.send(Frame::Ping(Vec::new())).await;
+                // 显示名变化（如 /web 控制台改名）：重播 hello，让对端刷新节点台账里的名字。
+                let cur = state.display_name();
+                if cur != hello_name {
+                    hello_name = cur;
+                    let nh = Hello::new(
+                        &cfg.node_id,
+                        &hello_name,
+                        &cfg.security.cluster_token,
+                    );
+                    if send_text(&send, &nh).await.is_err() {
+                        break;
+                    }
+                    tracing::info!(name = %hello_name, "conn: re-announced hello after rename");
+                }
             }
         }
     }
