@@ -142,7 +142,26 @@ pub struct AgentRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::cap_matches;
+    use super::{cap_matches, tasks_projection, HistoryEntry, TaskFilter};
+    use serde_json::json;
+
+    fn task_entry(seq: u64, payload: serde_json::Value, from: &str, to: &str) -> HistoryEntry {
+        HistoryEntry {
+            ts: format!("2026-10-17T0{}:00:00+08:00", seq % 10),
+            msg_id: format!("m{seq}"),
+            node: "n1".to_string(),
+            direction: "in".to_string(),
+            from: "n1".to_string(),
+            from_agent: Some(from.to_string()),
+            to: "n1".to_string(),
+            to_agent: Some(to.to_string()),
+            kind: "msg".to_string(),
+            action: "send".to_string(),
+            seq,
+            reply_to: None,
+            payload,
+        }
+    }
 
     #[test]
     fn cap_exact_and_wildcard() {
@@ -153,6 +172,176 @@ mod tests {
         assert!(!cap_matches("cap:edit:py", "cap:edit:js"));
         assert!(!cap_matches("cap:node", "cap:node:reboot"));
         assert!(cap_matches("*", "cap:whatever:x"));
+    }
+
+    #[test]
+    fn tasks_projection_full_lifecycle() {
+        let entries = vec![
+            task_entry(
+                1,
+                json!({"topic": "task_spec", "task_id": "t1", "type": "deploy.demo",
+                        "intent": "smoke", "correlation": "batchX"}),
+                "orch",
+                "worker",
+            ),
+            task_entry(
+                2,
+                json!({"topic": "task_accepted", "task_id": "t1"}),
+                "worker",
+                "orch",
+            ),
+            task_entry(
+                3,
+                json!({"topic": "task_progress", "task_id": "t1"}),
+                "worker",
+                "orch",
+            ),
+            task_entry(
+                4,
+                json!({"topic": "task_progress", "task_id": "t1"}),
+                "worker",
+                "orch",
+            ),
+            task_entry(
+                5,
+                json!({"topic": "task_succeeded", "task_id": "t1"}),
+                "worker",
+                "orch",
+            ),
+            // non-task chatter + specless junk must be ignored
+            task_entry(6, json!({"topic": "probe", "task_id": "t9"}), "a", "b"),
+            task_entry(7, json!({"topic": "task_progress"}), "a", "b"),
+        ];
+        let f = TaskFilter::default();
+        let tasks = tasks_projection(&entries, &f);
+        assert_eq!(tasks.len(), 1);
+        let t = &tasks[0];
+        assert_eq!(t.task_id, "t1");
+        assert_eq!(t.state, "succeeded");
+        assert!(t.terminal);
+        assert_eq!(t.correlation.as_deref(), Some("batchX"));
+        assert_eq!(t.task_type.as_deref(), Some("deploy.demo"));
+        assert_eq!(t.progress_count, 2);
+        assert_eq!(t.message_count, 5);
+        assert_eq!(t.seq, 5);
+        assert!(t.spec.is_some());
+    }
+
+    #[test]
+    fn tasks_projection_state_machine_edges() {
+        let mk = |seq: u64, topic: &str, id: &str| {
+            task_entry(
+                seq,
+                json!({"topic": topic, "task_id": id, "correlation": "c"}),
+                "o",
+                "w",
+            )
+        };
+        let entries = vec![
+            mk(1, "task_spec", "a"),
+            mk(2, "task_accepted", "a"),
+            mk(3, "task_cancel", "a"), // cancel without confirmation
+            mk(4, "task_spec", "b"),
+            mk(5, "task_declined", "b"),
+            mk(6, "task_spec", "c"),
+            mk(7, "task_failed", "c"), // failed, no later accepted -> stays failed
+            mk(8, "task_spec", "d"),
+            mk(9, "task_failed", "d"),
+            mk(10, "task_accepted", "d"), // retry re-dispatch -> running
+            mk(11, "task_accepted", "e"), // no spec in ring: still appears
+        ];
+        let f = TaskFilter::default();
+        let tasks = tasks_projection(&entries, &f);
+        let by = |id: &str| tasks.iter().find(|t| t.task_id == id).unwrap();
+        assert_eq!(by("a").state, "cancelling");
+        assert!(!by("a").terminal);
+        assert_eq!(by("b").state, "declined");
+        assert!(by("b").terminal);
+        assert_eq!(by("c").state, "failed");
+        assert!(by("c").terminal);
+        assert_eq!(by("d").state, "running");
+        assert!(!by("d").terminal);
+        // specless task: null type/correlation, state from the trail alone
+        assert_eq!(by("e").state, "running");
+        assert!(by("e").spec.is_none());
+        assert!(by("e").correlation.is_none());
+        assert_eq!(by("e").task_type, None);
+        // hard terminal is sticky: a late message cannot resurrect it
+        let entries2 = vec![
+            mk(1, "task_spec", "b"),
+            mk(2, "task_declined", "b"),
+            mk(3, "task_accepted", "b"),
+        ];
+        let tasks2 = tasks_projection(&entries2, &f);
+        assert_eq!(tasks2[0].state, "declined");
+    }
+
+    #[test]
+    fn tasks_projection_filters() {
+        let spec = |seq: u64, id: &str, corr: &str| {
+            task_entry(
+                seq,
+                json!({"topic": "task_spec", "task_id": id, "correlation": corr, "type": "x.y"}),
+                if corr == "batchX" { "orch" } else { "other" },
+                if corr == "batchX" {
+                    "worker"
+                } else {
+                    "elsewhere"
+                },
+            )
+        };
+        let entries = vec![
+            spec(1, "t1", "batchX"),
+            task_entry(
+                2,
+                json!({"topic": "task_succeeded", "task_id": "t1"}),
+                "worker",
+                "orch",
+            ),
+            spec(3, "t2", "batchX"),
+            task_entry(
+                4,
+                json!({"topic": "task_declined", "task_id": "t2"}),
+                "worker",
+                "orch",
+            ),
+            spec(5, "t3", "batchY"),
+            task_entry(
+                6,
+                json!({"topic": "task_progress", "task_id": "t3"}),
+                "elsewhere",
+                "other",
+            ),
+        ];
+        let ids = |ts: Vec<super::TaskView>| -> Vec<String> {
+            ts.into_iter().map(|t| t.task_id).collect()
+        };
+        let states = vec!["succeeded".to_string(), "failed".to_string()];
+        let base = TaskFilter::default();
+        assert_eq!(
+            ids(tasks_projection(&entries, &base)),
+            vec!["t3", "t2", "t1"]
+        ); // newest-first
+        let f = TaskFilter {
+            correlation: Some("batchX"),
+            ..Default::default()
+        };
+        assert_eq!(ids(tasks_projection(&entries, &f)), vec!["t2", "t1"]);
+        let f = TaskFilter {
+            states: Some(&states),
+            ..Default::default()
+        };
+        assert_eq!(ids(tasks_projection(&entries, &f)), vec!["t1"]);
+        let f = TaskFilter {
+            task_id: Some("t2"),
+            ..Default::default()
+        };
+        assert_eq!(ids(tasks_projection(&entries, &f)), vec!["t2"]);
+        let f = TaskFilter {
+            agent: Some("worker"),
+            ..Default::default()
+        };
+        assert_eq!(ids(tasks_projection(&entries, &f)), vec!["t2", "t1"]);
     }
 }
 
@@ -217,6 +406,231 @@ pub struct EventsView {
     /// True when `since` points below the ring after a rotation: events were
     /// lost, caller must rebuild from full `/v1/history` (HTTP 409).
     pub gap: bool,
+}
+
+/// Filter for the `/v1/tasks` projection (v0.5 kernel list §4). All fields
+/// are optional; unset fields match everything.
+#[derive(Debug, Default)]
+pub struct TaskFilter<'a> {
+    /// Exact `task_spec.correlation` match.
+    pub correlation: Option<&'a str>,
+    /// Keep tasks whose current state is one of these (empty = any).
+    pub states: Option<&'a [String]>,
+    /// Exact `task_id` match.
+    pub task_id: Option<&'a str>,
+    /// Tasks this agent participates in (as from_agent/to_agent of any
+    /// message in the trajectory).
+    pub agent: Option<&'a str>,
+    /// Max tasks per response; applied by [`Router::tasks_view`] so the
+    /// caller can still report `total` beyond the page.
+    pub limit: usize,
+}
+
+/// One task projected from its message trajectory (v0.5 §4). Derived view
+/// only — the history ring stays the single append-only source of truth.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskView {
+    pub task_id: String,
+    pub state: String,
+    #[serde(rename = "type")]
+    pub task_type: Option<String>,
+    pub intent: Option<String>,
+    pub correlation: Option<String>,
+    pub from_agent: Option<String>,
+    pub to_agent: Option<String>,
+    /// The `task_spec` payload as recorded (already observer-sanitized by
+    /// the redaction pipeline, §2). Null when the ring holds no spec.
+    pub spec: Option<serde_json::Value>,
+    /// Seq of the task's most recent message in the ring.
+    pub seq: u64,
+    pub created_ts: String,
+    pub last_ts: String,
+    pub progress_count: u64,
+    pub message_count: u64,
+    pub terminal: bool,
+}
+
+/// Task-protocol topics (docs/task-protocol.md §1). Anything else in a
+/// payload (plain `topic: "probe"` chatter, etc.) is not a task message.
+pub fn is_task_topic(topic: &str) -> bool {
+    matches!(
+        topic,
+        "task_spec"
+            | "task_accepted"
+            | "task_declined"
+            | "task_progress"
+            | "task_succeeded"
+            | "task_failed"
+            | "task_cancel"
+            | "task_cancelled"
+            | "task_rollback"
+            | "task_rolled_back"
+            | "task_ack"
+            | "task_go"
+    )
+}
+
+/// States after which no later message changes the projection again
+/// (protocol §1/§3: these are the executor-authoritative terminals).
+fn is_hard_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "succeeded" | "declined" | "cancelled" | "rolled_back"
+    )
+}
+
+/// Project task messages from the history ring into task objects, replaying
+/// the protocol §3 state machine per `task_id` in ring (seq) order.
+///
+/// Kernel-side simplification, per v0.5 list §4: a `task_failed` report
+/// shows as `failed` unless a later `task_accepted` arrives (retry/re-
+/// dispatch — the orchestrator may re-dispatch via §4 reconcile, and that
+/// next attempt's accepted moves the task back to `running`). `cancelling`
+/// is a kernel-visible intermediate for a `task_cancel` instruction whose
+/// `task_cancelled` confirmation has not landed yet. `task_progress` never
+/// changes state; `monitor`-mode tasks that never report succeeded are the
+/// orchestrator's semantics — the kernel projects the message trail as-is.
+/// Returns matches sorted newest-first by (seq, ts); `TaskFilter::limit` is
+/// *not* applied here — see [`Router::tasks_view`].
+pub fn tasks_projection(entries: &[HistoryEntry], f: &TaskFilter) -> Vec<TaskView> {
+    #[derive(Default)]
+    struct Acc {
+        state: String,
+        task_type: Option<String>,
+        intent: Option<String>,
+        correlation: Option<String>,
+        from_agent: Option<String>,
+        to_agent: Option<String>,
+        spec: Option<serde_json::Value>,
+        seq: u64,
+        created_ts: String,
+        last_ts: String,
+        progress_count: u64,
+        message_count: u64,
+    }
+
+    let mut order: Vec<String> = Vec::new();
+    let mut accs: HashMap<String, Acc> = HashMap::new();
+    for e in entries {
+        let topic = e
+            .payload
+            .get("topic")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if !is_task_topic(topic) {
+            continue;
+        }
+        let Some(task_id) = e.payload.get("task_id").and_then(|t| t.as_str()) else {
+            continue; // no id to group by: not projectable
+        };
+        if task_id.is_empty() {
+            continue;
+        }
+        let acc = accs.entry(task_id.to_string()).or_insert_with(|| {
+            order.push(task_id.to_string());
+            Acc {
+                state: "pending".to_string(),
+                created_ts: e.ts.clone(),
+                ..Default::default()
+            }
+        });
+        acc.message_count += 1;
+        acc.seq = acc.seq.max(e.seq);
+        acc.last_ts = e.ts.clone();
+        match topic {
+            "task_spec" => {
+                if acc.spec.is_none() {
+                    acc.spec = Some(e.payload.clone());
+                    acc.task_type = e
+                        .payload
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    acc.intent = e
+                        .payload
+                        .get("intent")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    acc.correlation = e
+                        .payload
+                        .get("correlation")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    acc.from_agent = e.from_agent.clone();
+                    acc.to_agent = e.to_agent.clone();
+                }
+            }
+            _ => {
+                if acc.from_agent.is_none() {
+                    acc.from_agent = e.from_agent.clone();
+                }
+                if acc.to_agent.is_none() {
+                    acc.to_agent = e.to_agent.clone();
+                }
+            }
+        }
+        if topic == "task_progress" {
+            acc.progress_count += 1;
+        } else if !is_hard_terminal(&acc.state) {
+            let next = match topic {
+                "task_accepted" => Some("running"),
+                "task_succeeded" => Some("succeeded"),
+                "task_declined" => Some("declined"),
+                "task_cancelled" => Some("cancelled"),
+                "task_rolled_back" => Some("rolled_back"),
+                "task_failed" => Some("failed"),
+                "task_cancel" => Some("cancelling"),
+                _ => None,
+            };
+            if let Some(s) = next {
+                acc.state = s.to_string();
+            }
+        }
+    }
+
+    let mut tasks: Vec<TaskView> = order
+        .into_iter()
+        .filter_map(|id| {
+            let a = accs.remove(&id)?;
+            Some(TaskView {
+                terminal: is_hard_terminal(&a.state) || a.state == "failed",
+                task_id: id,
+                state: a.state,
+                task_type: a.task_type,
+                intent: a.intent,
+                correlation: a.correlation,
+                from_agent: a.from_agent,
+                to_agent: a.to_agent,
+                spec: a.spec,
+                seq: a.seq,
+                created_ts: a.created_ts,
+                last_ts: a.last_ts,
+                progress_count: a.progress_count,
+                message_count: a.message_count,
+            })
+        })
+        .collect();
+
+    if let Some(c) = f.correlation {
+        tasks.retain(|t| t.correlation.as_deref() == Some(c));
+    }
+    if let Some(states) = f.states {
+        if !states.is_empty() {
+            tasks.retain(|t| states.iter().any(|s| s == &t.state));
+        }
+    }
+    if let Some(id) = f.task_id {
+        tasks.retain(|t| t.task_id == id);
+    }
+    if let Some(agent) = f.agent {
+        tasks.retain(|t| {
+            t.from_agent.as_deref() == Some(agent) || t.to_agent.as_deref() == Some(agent)
+        });
+    }
+    // Newest activity first: seq is the append-only ring order; ts breaks
+    // ties for legacy entries (seq == 0).
+    tasks.sort_by(|a, b| b.seq.cmp(&a.seq).then_with(|| b.last_ts.cmp(&a.last_ts)));
+    tasks
 }
 
 pub struct Router {
@@ -1226,6 +1640,20 @@ impl Router {
             oldest_seq,
             gap,
         }
+    }
+
+    /// Task-resource read for `/v1/tasks` (v0.5 §4): pure projection over
+    /// the history ring — no independent storage, the append-only ring stays
+    /// the single source of truth. Returns the page (clamped by
+    /// `TaskFilter::limit`) plus `total`, the match count before paging.
+    pub fn tasks_view(&self, f: &TaskFilter) -> (Vec<TaskView>, usize) {
+        let h = self.history.lock().unwrap();
+        let entries: Vec<HistoryEntry> = h.iter().cloned().collect();
+        drop(h);
+        let all = tasks_projection(&entries, f);
+        let total = all.len();
+        let limit = f.limit.max(1);
+        (all.into_iter().take(limit).collect(), total)
     }
 
     /// Record a file transfer event into the human-visible history.

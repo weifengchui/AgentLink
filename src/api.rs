@@ -160,6 +160,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/fleet/agents", get(fleet_agents))
         .route("/v1/history", get(history_get))
         .route("/v1/events", get(events_get))
+        .route("/v1/tasks", get(tasks_get))
         .route("/v1/history/search", get(history_search_get))
         .route("/v1/colors", get(colors_get).put(colors_put))
         .route("/v1/history/stats", get(history_stats_get))
@@ -189,7 +190,7 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
         "uptime_seconds": state.uptime_seconds(),
         // v0.5 §5: capability probe for orchestrators — endpoints listed
         // here exist on this node; absence means "degrade to legacy polling".
-        "features": ["events", "redact"],
+        "features": ["events", "redact", "tasks"],
     }))
 }
 
@@ -760,6 +761,71 @@ async fn events_get(
             "next_seq": view.next_seq,
             "oldest_seq": view.oldest_seq,
         })),
+    )
+}
+
+/// `/v1/tasks` query params (v0.5 kernel list §4). All optional.
+#[derive(Debug, Deserialize)]
+struct TasksQuery {
+    /// Exact `task_spec.correlation` match (batch tag).
+    #[serde(default)]
+    correlation: Option<String>,
+    /// Comma-separated states to keep (e.g. `succeeded,failed`).
+    #[serde(default)]
+    state: Option<String>,
+    /// Exact `task_id` match.
+    #[serde(default)]
+    task_id: Option<String>,
+    /// Only tasks this agent participates in (from_agent or to_agent).
+    #[serde(default)]
+    agent: Option<String>,
+    /// Max tasks per response (default 200, clamped to 2000).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn clean(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Task-resource view for orchestrators (v0.5 §4): the task-message trail
+/// in the history ring projected into task objects with the protocol §3
+/// state machine applied per task. Pure derivation — no independent store,
+/// the append-only ring stays the single source of truth; payloads here are
+/// the observer-sanitized copies (§2).
+async fn tasks_get(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(q): Query<TasksQuery>,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let states: Option<Vec<String>> = q.state.map(|s| {
+        s.split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    });
+    let limit = q.limit.unwrap_or(200).clamp(1, 2000);
+    let correlation = clean(q.correlation);
+    let task_id = clean(q.task_id);
+    let agent = clean(q.agent);
+    let filter = crate::router::TaskFilter {
+        correlation: correlation.as_deref(),
+        states: states.as_deref(),
+        task_id: task_id.as_deref(),
+        agent: agent.as_deref(),
+        limit,
+    };
+    let (tasks, total) = state.router.tasks_view(&filter);
+    let tasks: Vec<serde_json::Value> = tasks
+        .iter()
+        .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null))
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "tasks": tasks, "total": total })),
     )
 }
 
