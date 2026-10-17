@@ -1,0 +1,1 @@
+{"trigger": "manual", "node": "4f793d7cd6fc", "ip": "192.168.1.50", "old": "0.4.19", "new": "0.5.0", "zip": "AgentLink-v0.5.0.zip", "backup": "backups/v0.4.19_20261017-090801", "status": "done", "health_ok": true, "elapsed_ms": 2017, "node_version": "0.5.0", "sha256": "344a726b876346992f82cad80cfefa830e94f93ce8bdb0a57cb22473c4387b41", "time": "2026-10-17T09:08:05+0800"}
