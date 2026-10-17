@@ -166,10 +166,15 @@ color:var(--vc,#38d6e6);font-size:26px;line-height:1;cursor:pointer;padding:0;di
 align-items:center;justify-content:center;opacity:.82;transition:opacity .18s,box-shadow .18s,background .18s}
 .gn.show{display:flex}
 .gn:hover{opacity:1;background:rgba(13,20,32,.94);box-shadow:0 0 16px color-mix(in srgb,var(--vc,#38d6e6) 45%,transparent)}
-#v-tp{font-size:calc(17px*var(--fs));font-weight:700;color:var(--vc);padding-right:30px;letter-spacing:.04em}
-#v-seq{font-size:calc(11px*var(--fs));color:var(--mut);margin:4px 0 14px;font-family:ui-monospace,Consolas,monospace}
+/* R13（10-17 第十三轮）：弹窗去掉话题标题行（#v-tp 废除）；序列号紧贴路由行上方 */
+#v-seq{font-size:calc(11px*var(--fs));color:var(--mut);margin:4px 0 10px;font-family:ui-monospace,Consolas,monospace}
 #v-hd{font-size:calc(12.5px*var(--fs));color:#9fb4cc;background:rgba(108,168,255,.06);border:1px dashed var(--edge);
-border-left:3px solid var(--vc);border-radius:8px;padding:7px 11px;margin-bottom:12px;word-break:break-all;font-family:ui-monospace,Consolas,monospace}
+border-left:3px solid var(--vc);border-radius:8px;padding:7px 11px;margin-bottom:12px;
+display:flex;align-items:center;gap:12px}
+/* R13：路由胶囊行=左侧 A→B 胶囊 + 右侧元信息（原底部 #v-meta 并入，居右排列） */
+#v-caps{min-width:0;white-space:nowrap;overflow:hidden}
+#v-hmeta{margin-left:auto;display:inline-flex;align-items:center;gap:10px;white-space:nowrap;
+color:var(--mut);font-size:calc(11.5px*var(--fs));font-family:ui-monospace,Consolas,monospace}
 /* R1（10-17 第八轮）：弹窗路由=对话记录同款双层胶囊（CSS 与 src/api.rs 逐字一致） */
 .idc{display:inline-flex;align-items:center;justify-content:flex-end;background:var(--nc,#22344f);border-radius:13px;padding:2px 2px 2px 14px;margin-right:4px;vertical-align:middle;max-width:100%}
 .idc .idci{display:inline-block;border-radius:999px;padding:0 9px;font-weight:600;font-size:12px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;vertical-align:middle}
@@ -179,7 +184,6 @@ border-left:3px solid var(--vc);border-radius:8px;padding:7px 11px;margin-bottom
 .idn{opacity:.62;font-size:11px;margin-right:2px}
 .varr{opacity:.6;font-size:12px;padding:0 4px}
 #v-body{font-size:calc(14px*var(--fs));line-height:1.75;color:#eaf2fb;white-space:pre-wrap;word-break:break-all}
-#v-meta{margin-top:16px;display:flex;gap:16px;align-items:center;font-size:calc(11.5px*var(--fs));color:var(--mut);font-family:ui-monospace,Consolas,monospace}
 #v-kind{border:1px solid var(--vc);color:var(--vc);border-radius:9px;padding:1px 9px}
 #v-x{position:absolute;top:10px;right:12px;font-size:calc(12px*var(--fs));color:var(--mut);cursor:pointer;z-index:2;padding:3px 10px;border:1px solid rgba(140,170,200,.35);border-radius:7px}
 #v-x:hover{color:#fff}
@@ -227,11 +231,9 @@ background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
   <div id="vlist"></div>
   <div id="vmain">
    <span id="v-x">关闭</span>
-   <div id="v-tp"></div>
    <div id="v-seq"></div>
-   <div id="v-hd"></div>
+   <div id="v-hd"><span id="v-caps"></span><span id="v-hmeta"><span id="v-time"></span><span id="v-kind"></span></span></div>
    <div id="v-body"></div>
-   <div id="v-meta"><span id="v-time"></span><span id="v-kind"></span><span id="v-route"></span></div>
   </div>
   <div class="hint">点条目 / 滚轮 / ← → 翻页 · Shift+← → 换组 · ESC 关闭</div>
 </div>
@@ -543,18 +545,16 @@ function openViewer(tp,chain,i,k){if(!chain.length)return;VT={tp,chain,i,k:k||nu
  setVc(tp.color);drawViewer();
  mask.style.display="block";viewer.classList.add("show");updateGNav();}
 function drawViewer(){const m=VT.chain[VT.i];document.getElementById("vmain").scrollTop=0;
- document.getElementById("v-tp").textContent=VT.tp.name;
  const vl=document.getElementById("vlist");
  vl.innerHTML=VT.chain.map((x,idx)=>{const c=agCol(x.f.split("|")[0],x.f.split("|")[1]);
   const snd=x.f.split("|")[1].replace("@node","整机");
   return`<div class="row${idx===VT.i?' on':''}" data-i="${idx}" style="--kc:${c}"><span class="k" style="background:${c}"></span><span class="t">${fmtHM(x.t)}</span><span class="rf">${esc(snd)}</span><span class="s">${esc(x.body)}</span></div>`;}).join("");
  vl.scrollTop=Math.max(0,(VT.i)*38-vl.clientHeight/2);
  document.getElementById("v-seq").textContent=(VT.i+1)+" / "+VT.chain.length;
- document.getElementById("v-hd").innerHTML=routeHtml(m);
+ document.getElementById("v-caps").innerHTML=routeHtml(m);
  document.getElementById("v-body").textContent=m.body;
- document.getElementById("v-time").textContent="T-"+(-m.t)+"s · "+fmtClock(m.t);
- document.getElementById("v-kind").textContent={msg:"消息",file:"文件",sys:"系统"}[m.kind]||m.kind;
- document.getElementById("v-route").innerHTML=routeHtml(m);}
+ document.getElementById("v-time").textContent="T-" + (-m.t) + "s · " + fmtClock(m.t);
+ document.getElementById("v-kind").textContent={msg:"消息",file:"文件",sys:"系统"}[m.kind]||m.kind;}
 function fmtHM(t){const d=new Date(Date.now()+t*1000);
  return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");}
 function fmtClock(t){const d=new Date(Date.now()+t*1000);
