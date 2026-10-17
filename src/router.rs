@@ -1666,6 +1666,7 @@ impl Router {
         file_name: &str,
         size: u64,
         saved_path: &str,
+        from_agent: Option<&str>,
     ) {
         if !self.cfg.history.enabled {
             return;
@@ -1676,7 +1677,7 @@ impl Router {
             node: from.to_string(),
             direction: direction.to_string(),
             from: from.to_string(),
-            from_agent: None,
+            from_agent: from_agent.map(|s| s.to_string()),
             to: to.to_string(),
             to_agent: None,
             kind: "file".to_string(),

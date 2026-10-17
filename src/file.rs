@@ -129,6 +129,7 @@ pub async fn send_transfer(
     to: &str,
     path: &Path,
     ttl_seconds: Option<u64>,
+    from_agent: Option<&str>,
 ) -> anyhow::Result<String> {
     let addr = state
         .router
@@ -155,6 +156,7 @@ pub async fn send_transfer(
                 &name,
                 md.len(),
                 &saved,
+                from_agent,
             );
         }
         file_id
@@ -540,6 +542,8 @@ async fn run_receiver(
                             &fname,
                             fsize,
                             &final_path.to_string_lossy(),
+                            // 文件通道是整机级，入站无法得知对端 agent 身份
+                            None,
                         );
                         let saved = final_path.to_string_lossy().to_string();
                         send_file_frame(

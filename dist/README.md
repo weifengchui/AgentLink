@@ -29,6 +29,8 @@
 >
 > v0.5.2：Web 控制台第七/八轮——顶栏在线节点口径修正为含本机；磁盘查询防抖自动搜索；agent 胶囊 hover 微动效；星图消息弹窗路由改双层胶囊（与对话记录同款，`@node` 端 `●节点名` 回退）。纯前端，协议兼容。
 >
+> v0.5.3：Web 控制台第九轮——发消息/文件区新增「发件身份」下拉（本机注册 agent，默认记住上次选择，可选「整机」）；出站文本与文件上传（`/v1/send`、`/v1/send-file-upload` 的 `from_agent`）历史记录带上发件 agent 身份，对话记录/台账发端双层胶囊不再缺失。入站文件通道为整机级，接收侧记录不带对端 agent 身份（协议限制，代码注释注明）。加性改动，协议兼容 0.5.x/0.4.x。
+>
 > v0.4.10：数据目录默认外置（Windows `%LOCALAPPDATA%\AgentLink\data`、Linux `~/.local/share/agentlink`），
 > 不再放软件目录里以免升级覆盖；`agentlink.json` 的 `data_dir` 可按机器各自改为绝对路径，
 > 相对路径以配置文件目录为基准。发布包新增 `SKILL-agent-registration.md`（Agent 上线注册技能，
@@ -145,6 +147,16 @@ curl -X POST http://127.0.0.1:8765/v1/send-file -H "X-Auth-Token: $TOKEN" -d \
 - **v0.4.11**：`init/join --force` 保留 node_id/token/data_dir（堵死身份漂移事故）；
   fleet agents 在线状态联动节点（幽灵在线消除）；web 节点列表加「本机」标记与离线节点「遗忘」
   按钮（`DELETE /v1/peers/<id>/forget`，持久化 data_dir/forgotten_peers.json，真实握手自动解禁）。
+
+## v0.5.3 发布物说明（Web 控制台第九轮）
+
+- 发件身份下拉：发消息/文件区新增「发件身份」选择器，列出本机已注册 agent，默认值记住上次
+  选择（localStorage），可选「整机」（不携带 agent 身份）。
+- 出站历史记录带上 `from_agent`：`/v1/send` 透传身份选择；`/v1/send-file-upload` 新增
+  `from_agent` 查询参数，文件出站台账记录发件 agent——修复对话记录/台账发端双层胶囊缺失的根因
+  （发送端此前不带 from_agent）。
+- 已知边界：文件通道是整机级，入站记录无法携带对端 agent 身份（协议限制，代码注释注明）。
+- 加性改动，协议兼容 v0.5.x/v0.4.x，各机可独立择时升级。
 
 ## v0.5.2 发布物说明（Web 控制台第七/八轮）
 

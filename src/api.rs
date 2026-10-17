@@ -405,6 +405,9 @@ struct UploadParams {
     to: String,
     #[serde(default)]
     to_agent: Option<String>,
+    /// Sender agent id (web console identity selector); recorded in history only.
+    #[serde(default)]
+    from_agent: Option<String>,
     #[serde(default)]
     ttl_seconds: Option<u64>,
 }
@@ -475,7 +478,14 @@ async fn send_file_upload(
         );
     }
 
-    let result = crate::file::send_transfer(&state, &to, &path, params.ttl_seconds).await;
+    let result = crate::file::send_transfer(
+        &state,
+        &to,
+        &path,
+        params.ttl_seconds,
+        params.from_agent.as_deref(),
+    )
+    .await;
     let _ = tokio::fs::remove_file(&path).await;
     let _ = tokio::fs::remove_dir(&dir).await;
     match result {
@@ -1685,6 +1695,7 @@ th.srt:hover{color:#dbe2ea}
     <section id="p-chat" class="hidden">
       <div class="card"><h2>发送消息 / 文件</h2>
                 <div class="row"><span class="lbl">目标</span><select id="to2"></select></div>
+                <div class="row"><span class="lbl">发件身份</span><select id="from2" onchange="try{localStorage.fromagent=this.value}catch(e){}"></select><span class="hint">本机注册的 agent；出站消息与文件的历史记录带上它，对话记录里发端才会显示双层胶囊。选「整机」则只显节点名。</span></div>
         <div class="row"><textarea id="payload2" rows="2" placeholder='{"content":"你好"}　可只发附件；在框内 Ctrl+V 可直接贴图'></textarea></div>
         <div class="dz" id="dz2">📎 拖拽文件或文件夹到此　·　<button type="button" class="lk" onclick="el('file2').click()">选文件</button>　·　<button type="button" class="lk" onclick="el('dir2').click()">选目录（自动打包 zip）</button><input type="file" id="file2" class="hide-in" multiple><input type="file" id="dir2" class="hide-in" webkitdirectory multiple></div>
         <div class="row"><button class="primary" onclick="doSendAll('2')">发送</button><span id="attinfo2"></span></div>
@@ -1925,15 +1936,16 @@ async function doSendAll(sfx){
   sfx=sfx||'';
   const res=el('sendres'+sfx);
   const tgt=targetOf(val('to'+sfx)); if(!tgt.to){res.textContent='请选择目标';return;}
+  const fam=sfx==='2'?(val('from2')||'').trim():'';  // 发件身份（第九轮 R1）
   const raw=val('payload'+sfx), atts=ATT[sfx]||[];
   if(!raw&&!atts.length){res.textContent='消息内容和附件都是空的';return;}
   const done=[];
   if(raw){let payload;try{payload=JSON.parse(raw);}catch{payload={content:raw};}
     if(atts.length&&!payload.file)payload.note='附件：'+atts.map(a=>a.name).join('、');
-    try{await j('/v1/send',{method:'POST',body:JSON.stringify({to:tgt.to,to_agent:tgt.to_agent,type:'text',action:'send',payload})});done.push('消息 ok');res.textContent='消息 ok，处理附件中…';}
+    try{await j('/v1/send',{method:'POST',body:JSON.stringify({to:tgt.to,to_agent:tgt.to_agent,from_agent:fam||undefined,type:'text',action:'send',payload})});done.push('消息 ok');res.textContent='消息 ok，处理附件中…';}
     catch(e){res.textContent='发送失败: '+(e.message||e);return;}}
   let okn=0;
-  for(let i=0;i<atts.length;i++){const att=atts[i];const q=new URLSearchParams({to:tgt.to});if(tgt.to_agent)q.set('to_agent',tgt.to_agent);
+  for(let i=0;i<atts.length;i++){const att=atts[i];const q=new URLSearchParams({to:tgt.to});if(tgt.to_agent)q.set('to_agent',tgt.to_agent);if(fam)q.set('from_agent',fam);
     res.textContent=`上传附件 ${i+1}/${atts.length}：${att.name}（${fmtSize(att.size)}）`;
     try{const d=await j('/v1/send-file-upload?'+q,{method:'POST',headers:{'X-File-Name':att.name},body:att});
       okn++;done.push('📎'+att.name+' ok'+(d.file_id?' #'+String(d.file_id).slice(0,8):''));}
@@ -2105,6 +2117,13 @@ async function refresh(){
   opn+='</optgroup>';
   if(!sel&&opn!==LAST.op){LAST.op=opn;
     [el('to'),el('to2')].forEach(x=>{if(!x)return;const c=x.value;x.innerHTML=opn;if(c&&[...x.options].some(o=>o.value===c))x.value=c;});}
+  // 发件身份下拉（第九轮 R1）：本机注册 agent；默认=上次选择(localStorage)，其次=首个本机 agent
+  let fam='<option value="">整机（不带 agent 身份）</option>';
+  const myNid=String((ST&&ST.node_id)||SELF||'');
+  const locals=AGENTS.filter(a=>String(a.node_id)===myNid);
+  for(const a of locals)fam+=`<option value="${esc(a.agent_id)}">${esc(a.agent_id)}${a.name&&a.name!==a.agent_id?' · '+esc(a.name):''}</option>`;
+  if(!sel&&fam!==LAST.fam){LAST.fam=fam;const x=el('from2');if(x){let want='';try{want=localStorage.fromagent||''}catch(e){}
+    if(!want&&locals.length)want=locals[0].agent_id;x.innerHTML=fam;if([...x.options].some(o=>o.value===want))x.value=want;}}
   HIST=hist&&hist.ok?hist.history.slice():[];
   if(!sel&&histSig()!==LAST.hi){LAST.hi=histSig();ovGo(OV.page);chGo(CH.page);}
   let qt='';
