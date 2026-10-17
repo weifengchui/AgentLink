@@ -1673,7 +1673,7 @@ th.srt:hover{color:#dbe2ea}
     <span class="stat" title="进行中的文件传输"><span>传输中</span><b id="m-transfer">0</b></span>
     <div class="spacer"></div>
     <span class="sub">自动刷新 <label class="switch"><input type="checkbox" id="auto-refresh" checked><span class="slider"></span></label></span>
-    <button onclick="refresh()">刷新</button>
+    <button onclick="refresh();pokeStar()">刷新</button>
   </div>
   <div class="content">
     <section id="p-overview">
@@ -1712,7 +1712,7 @@ th.srt:hover{color:#dbe2ea}
           <span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap"><input type="datetime-local" id="ch-since" title="起始时间（本机时区，服务端按 UTC 过滤）" onchange="schedSearch()"><span class="hint">→</span><input type="datetime-local" id="ch-until" title="结束时间" onchange="schedSearch()"></span>
           <select id="ch-limit" title="最多返回条数" onchange="schedSearch()"><option value="50">最多 50</option><option value="200" selected>最多 200</option><option value="1000">最多 1000</option><option value="2000">最多 2000</option></select>
           <label class="hint" style="font-size:12px"><input type="checkbox" id="ch-all" onchange="schedSearch()">含归档</label>
-          <button class="primary" onclick="histSearch()">查磁盘</button>
+          <button class="primary" onclick="histSearch()">查询</button>
           <button onclick="histReset()">重置</button>
         </div>
         <div class="hint" id="ch-qmeta"></div>
@@ -1951,7 +1951,7 @@ async function doSendAll(sfx){
       okn++;done.push('📎'+att.name+' ok'+(d.file_id?' #'+String(d.file_id).slice(0,8):''));}
     catch(e){done.push('📎'+att.name+' 失败: '+(e.message||e));}}
   if(atts.length)clearAtt(sfx);
-  res.textContent=done.join(' · ')||'完成';refresh();}
+  res.textContent=done.join(' · ')||'完成';refresh();pokeStar();}
 function onPaste(e,sfx){const cd=e.clipboardData;if(!cd)return;let f=null;
   for(const it of (cd.items||[])){if(it.kind==='file'&&it.type&&it.type.indexOf('image/')===0){f=it.getAsFile();break;}}
   if(!f){for(const x of (cd.files||[])){if(x.type&&x.type.indexOf('image/')===0){f=x;break;}}}
@@ -2088,6 +2088,8 @@ function paintColorRow(k){const enc=CSS.escape?CSS.escape(k):k;
 async function setColor(k,v){COLORS[k]=v;paintColorRow(k);await putColors();}
 async function tgAutoCol(k,on){if(on)delete COLORS[k];else if(!COLORS[k])COLORS[k]='#5b8def';paintColorRow(k);await putColors();}
 async function putColors(){try{await j('/v1/colors',{method:'PUT',body:JSON.stringify({colors:COLORS})});}catch(e){alert('保存颜色失败：'+(e.message||e));}}
+// 第十轮 R4：手动刷新/发送成功后轻推星图 iframe（星图侧收 {al:'poke'} 合并触发一次 poll）
+function pokeStar(){try{const f=el('sm-fr');if(f&&f.contentWindow)f.contentWindow.postMessage({al:'poke'},location.origin);}catch(e){}}
 async function refresh(){
  const md=$('modal');if(md&&!md.classList.contains('hidden'))return; // token 层打开时停轮询
  histStats();
@@ -2217,10 +2219,13 @@ async fn handle_subscriber(socket: WebSocket, state: SharedState, client_id: Str
                     Ok(env) => {
                         // Agent-level routing: only deliver when addressed to
                         // this client, or to the node in general.
-                        let pass = env
-                        .to_agent
-                        .as_deref()
-                        .is_none_or(|a| a == client_id.as_str());
+                        // 第十轮 R1：不带 client 的连接 = 观察者（Web 星图页），可见本机全部
+                        // 事件含定向消息；agent 桥恒带 client，语义不变。
+                        let pass = client_id.is_empty()
+                            || env
+                            .to_agent
+                            .as_deref()
+                            .is_none_or(|a| a == client_id.as_str());
                         if !pass {
                             continue;
                         }

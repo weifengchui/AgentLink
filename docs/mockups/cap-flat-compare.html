@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<title>胶囊样式对比：现状 vs 按图扁平化</title>
+<style>
+:root{--fs:1}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0e18;color:#cfe0f2;font-family:ui-sans-serif,system-ui,"Segoe UI",sans-serif;padding:34px 40px}
+h1{font-size:19px;color:#38d6e6;letter-spacing:.06em;margin-bottom:6px}
+.sub{font-size:12px;color:#8ea6bd;margin-bottom:26px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:26px;max-width:1460px}
+.panel{background:#0d1424;border:1px solid #1c2a44;border-radius:14px;padding:20px 22px}
+.panel h2{font-size:14px;margin-bottom:4px}
+.panel .tag{font-size:11px;padding:2px 10px;border-radius:999px;display:inline-block;margin-bottom:14px}
+.now h2{color:#e8b34a}.now .tag{background:rgba(232,179,74,.12);color:#e8b34a;border:1px solid rgba(232,179,74,.35)}
+.new h2{color:#38d6e6}.new .tag{background:rgba(56,214,230,.10);color:#38d6e6;border:1px solid rgba(56,214,230,.4)}
+.row{display:flex;align-items:center;gap:18px;margin:18px 0}
+.lab{font-size:11px;color:#7d93ab;width:110px;flex:none;font-family:ui-monospace,Consolas,monospace}
+.stage{background:radial-gradient(900px 260px at 30% 40%,#0c1a2e,#070d18 75%);border-radius:10px;padding:22px 26px;display:flex;align-items:center;gap:26px;flex:1}
+.note{font-size:11.5px;color:#7d93ab;line-height:1.8;margin-top:10px}
+.note b{color:#cfe0f2;font-weight:600}
+.del{color:#ff7d92}.keep{color:#38d6e6}
+
+/* ---------- 现状：星图胶囊（web/starmap.html .agt .dot 原样） ---------- */
+.agt-old .dot{position:relative;border-radius:14px;display:flex;align-items:center;justify-content:flex-end;height:27px;padding:2px 2px 2px 10px;
+ background:var(--acn,#1c3a5e);border:1px solid rgba(255,255,255,.13);transition:transform .2s;animation:apulse 3s ease-in-out infinite alternate}
+.agt-old .dot .in{border-radius:999px;padding:0 9px;height:21px;line-height:21px;display:inline-block;
+ background:radial-gradient(circle at 35% 30%,rgba(255,255,255,.30),transparent 60%),var(--ac,#38d6e6);
+ color:#061018;font-weight:700;font-size:10.5px;letter-spacing:.03em;white-space:nowrap;
+ box-shadow:0 0 9px 1px var(--acg,rgba(56,214,230,.42))}
+.agt-old:hover .dot{transform:scale(1.1)}
+.agt-old.lit .dot{filter:brightness(1.22) saturate(1.12);animation:none;box-shadow:0 0 16px var(--acg,rgba(56,214,230,.5))}
+.agt-old.pin .dot{box-shadow:0 0 0 2px var(--acg,rgba(140,190,255,.5))}
+@keyframes apulse{from{opacity:.82}to{opacity:1}}
+.badge{position:absolute;top:-7px;right:-9px;min-width:19px;height:19px;padding:0 5px;border-radius:10px;
+ background:#0b1220;border:1px solid var(--ac,#38d6e6);color:#fff;font-size:10.5px;line-height:17px;text-align:center;
+ box-shadow:0 0 8px color-mix(in srgb,var(--ac) 45%,transparent);font-family:ui-monospace,Consolas,monospace;z-index:2}
+
+/* ---------- 拟改：按图扁平（弹窗 .idc 公式的星图尺寸版） ---------- */
+.agt-new .dot{position:relative;border-radius:13px;display:flex;align-items:center;justify-content:flex-end;height:26px;padding:2px 2px 2px 10px;
+ background:var(--acn,#1c3a5e);transition:transform .2s}
+.agt-new .dot .in{border-radius:999px;padding:0 9px;height:20px;line-height:20px;display:inline-block;
+ background:var(--ac,#38d6e6);color:#0b1420;font-weight:600;font-size:10.5px;letter-spacing:.03em;white-space:nowrap}
+.agt-new:hover .dot{transform:scale(1.1)}
+.agt-new.lit .dot{filter:brightness(1.22) saturate(1.12)}
+.agt-new.pin .dot{filter:brightness(1.15)}
+.agt-new.pin .dot::after{content:"";position:absolute;inset:-1px;border:1px solid var(--ac,#38d6e6);border-radius:14px}
+
+/* ---------- 参照：弹窗内现行扁平胶囊（= 用户给的图） ---------- */
+.idc{display:inline-flex;align-items:center;justify-content:flex-end;background:var(--nc,#22344f);border-radius:13px;padding:2px 2px 2px 14px;margin-right:4px;vertical-align:middle}
+.idc .idci{display:inline-block;border-radius:999px;padding:0 9px;font-weight:600;font-size:12px;line-height:18px;white-space:nowrap}
+.idn{opacity:.85;font-size:11px;color:#b48ae0}
+.varr{opacity:.6;font-size:12px;padding:0 4px;color:#8ea6bd}
+</style></head>
+<body>
+<h1>星图大屏 agent 胶囊 — 按图扁平化 效果图</h1>
+<div class="sub">左 = 现状（描边＋内芯高光渐变＋发光阴影）；右 = 拟改成（与消息弹窗／截图同款：纯色平面、无阴影）。上排为酒红系节点 B 的 study、下排为紫系节点 A 的 study。</div>
+<div class="grid">
+
+  <div class="panel now">
+    <h2>现状（星图大屏胶囊）</h2><span class="tag">带阴影版本</span>
+    <div class="row"><span class="lab">静止</span>
+      <div class="stage">
+        <div class="agt-old" style="--acn:#7e2539;--ac:#e15f7c;--acg:rgba(225,95,124,.5)"><div class="dot"><span class="in">study</span></div></div>
+        <div class="agt-old" style="--acn:#472a7e;--ac:#9b7ae8;--acg:rgba(155,122,232,.5)"><div class="dot"><span class="in">study</span><span class="badge">4</span></div></div>
+      </div></div>
+    <div class="row"><span class="lab">悬停/高亮 .lit</span>
+      <div class="stage">
+        <div class="agt-old lit" style="--acn:#7e2539;--ac:#e15f7c;--acg:rgba(225,95,124,.5)"><div class="dot"><span class="in">study</span></div></div>
+      </div></div>
+    <div class="row"><span class="lab">钉选</span>
+      <div class="stage">
+        <div class="agt-old pin" style="--acn:#472a7e;--ac:#9b7ae8;--acg:rgba(155,122,232,.5)"><div class="dot"><span class="in">study</span></div></div>
+      </div></div>
+    <div class="note">问题点：<span class="del">外框白描边</span>、<span class="del">内芯高光径向渐变</span>、<span class="del">box-shadow 发光</span>（静止/高亮/钉选三处都有）、字重 700 固定深字不随手选色。</div>
+  </div>
+
+  <div class="panel new">
+    <h2>拟改成（按图扁平）</h2><span class="tag">无阴影版本</span>
+    <div class="row"><span class="lab">静止</span>
+      <div class="stage">
+        <div class="agt-new" style="--acn:#7e2539;--ac:#e15f7c"><div class="dot"><span class="in">study</span></div></div>
+        <div class="agt-new" style="--acn:#472a7e;--ac:#9b7ae8"><div class="dot"><span class="in">study</span><span class="badge">4</span></div></div>
+      </div></div>
+    <div class="row"><span class="lab">悬停/高亮 .lit</span>
+      <div class="stage">
+        <div class="agt-new lit" style="--acn:#7e2539;--ac:#e15f7c"><div class="dot"><span class="in">study</span></div></div>
+      </div></div>
+    <div class="row"><span class="lab">钉选</span>
+      <div class="stage">
+        <div class="agt-new pin" style="--acn:#472a7e;--ac:#9b7ae8"><div class="dot"><span class="in">study</span></div></div>
+      </div></div>
+    <div class="note">改动：<span class="keep">去白描边</span>、<span class="keep">内芯纯色平面（同弹窗）</span>、<span class="keep">全部发光阴影去除</span>、字重 600、文字色随手选色自动深浅。<br>保留：<span class="keep">hover 放大 1.1、节点深壳＋亮芯双层结构、左侧节点色弧、徽章角标</span>。钉选态改用「1px 同色细描边＋轻微提亮」替代原来的发光圈。</div>
+  </div>
+</div>
+
+<div class="panel" style="margin-top:26px">
+  <h2 style="color:#8ea6bd">参照基准 — 消息弹窗现行胶囊（你截图里的样式，不变）</h2>
+  <div class="row" style="margin-bottom:4px">
+    <span class="lab">弹窗路由</span>
+    <div class="stage" style="background:#131a28">
+      <span class="idc" style="--nc:#7e2539"><span class="idci" style="background:#e15f7c;color:#0b1420">study</span></span><span class="idn">B</span>
+      <span class="varr">→</span>
+      <span class="idc" style="--nc:#472a7e"><span class="idci" style="background:#9b7ae8;color:#0b1420">study</span></span><span class="idn">A</span>
+    </div></div>
+  <div class="note">星图大屏胶囊将统一为这一套纯色平面双层结构（尺寸仍保持星图的紧凑档，不放大）。</div>
+</div>
+</body></html>

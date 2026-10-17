@@ -58,16 +58,18 @@ opacity:0;animation:stpulse 3.6s ease-in-out infinite;pointer-events:none}
 font-family:ui-monospace,Consolas,monospace;letter-spacing:.05em}
 .agt{position:absolute;transform:translate(-50%,-50%);cursor:grab;z-index:6}
 .agt.drag{cursor:grabbing}
-.agt .dot{position:relative;border-radius:14px;display:flex;align-items:center;justify-content:flex-end;height:27px;padding:2px 2px 2px 10px;
-background:var(--acn,#1c3a5e);border:1px solid rgba(255,255,255,.13);transition:transform .2s;animation:apulse 3s ease-in-out infinite alternate}
+/* R6（10-17 第十轮）：胶囊按图扁平化——去白描边（transparent 占位保几何）、圆角对齐弹窗 13px、
+   内芯纯色平面（无径向高光无 box-shadow 发光）、hover 微动效与对话记录统一为 cap-nudge */
+.agt .dot{position:relative;border-radius:13px;display:flex;align-items:center;justify-content:flex-end;height:27px;padding:2px 2px 2px 10px;
+ background:var(--acn,#1c3a5e);border:1px solid transparent;transition:border-color .18s,filter .18s;animation:apulse 3s ease-in-out infinite alternate}
 .agt .dot .in{border-radius:999px;padding:0 9px;height:21px;line-height:21px;display:inline-block;
-background:radial-gradient(circle at 35% 30%,rgba(255,255,255,.30),transparent 60%),var(--ac,#38d6e6);
-color:#061018;font-weight:700;font-size:calc(10.5px*var(--fs));letter-spacing:.03em;white-space:nowrap;
-box-shadow:0 0 9px 1px var(--acg,rgba(56,214,230,.42))}
-.agt:hover .dot{transform:scale(1.1)}
+ background:var(--ac,#38d6e6);color:#0b1420;font-weight:600;font-size:calc(10.5px*var(--fs));letter-spacing:.03em;white-space:nowrap}
+/* 悬停内胶囊左右缓晃一次复位（与 api.rs cap-nudge 逐字同源） */
+@keyframes cap-nudge{0%,100%{transform:translateX(0)}18%{transform:translateX(-5px)}42%{transform:translateX(4px)}64%{transform:translateX(-2.5px)}82%{transform:translateX(1.5px)}}
+.agt:hover .dot .in{animation:cap-nudge .7s cubic-bezier(.34,1.2,.64,1) 1}
+@media (prefers-reduced-motion:reduce){.agt:hover .dot .in{animation:none}}
 /* R3（10-16 第四轮）：悬停/钉选节点时，该节点全部 agent 胶囊提亮（归属感反馈） */
-.agt.lit .dot{filter:brightness(1.22) saturate(1.12);opacity:1;animation:none;
-box-shadow:0 0 16px var(--acg,rgba(56,214,230,.5))}
+.agt.lit .dot{filter:brightness(1.22) saturate(1.12);opacity:1;animation:none}
 .agt.lit .badge{box-shadow:0 0 12px color-mix(in srgb,var(--ac,#38d6e6) 60%,transparent)}
 @keyframes apulse{from{opacity:.82}to{opacity:1}}
 
@@ -87,9 +89,10 @@ font-family:ui-monospace,Consolas,monospace;z-index:2}
 .lk.hl{opacity:1;stroke-width:2.6px;filter:drop-shadow(0 0 5px rgba(160,210,255,.65))}
 .lk.temp{opacity:.5}
 .lk.lit{opacity:1;stroke-width:2.8px!important;transition:opacity .9s linear}
-.dot.glow{box-shadow:0 0 0 2px rgba(255,255,255,.6),0 0 16px var(--acg,rgba(140,190,255,.6))}
+.dot.glow{border-color:var(--ac,#38d6e6);filter:brightness(1.25) saturate(1.15)}
 .station .orb.glow{box-shadow:0 0 26px var(--scg,rgba(127,176,255,.5)),0 0 0 2px rgba(255,255,255,.5)}
-.agt.pinned .dot{box-shadow:0 0 0 2px var(--acg,rgba(140,190,255,.5))}
+/* R6（10-17 第十轮）：钉选态按拍板改 1px 同色细描边＋轻微提亮（发光圈废除，全局无阴影） */
+.agt.pinned .dot{border-color:var(--ac,#38d6e6);filter:brightness(1.15)}
 .station.pinned .ring{opacity:.55}
 /* ---------- photon ---------- */
 .ph{position:absolute;width:10px;height:10px;margin:-5px 0 0 -5px;border-radius:50%;z-index:9;pointer-events:none;
@@ -142,6 +145,8 @@ transition:transform .28s cubic-bezier(.2,1.3,.4,1)}
 #vlist .row .k{width:8px;height:8px;border-radius:2px;flex:none;box-shadow:0 0 6px var(--kc)}
 #vlist .row .t{font-size:calc(10px*var(--fs));color:var(--mut);flex:none;font-family:ui-monospace,Consolas,monospace}
 #vlist .row .s{font-size:calc(11px*var(--fs));color:#b7c6d9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:6px}
+/* R8（10-17 第十轮）：完整往来链里每条消息标注发件人 */
+#vlist .row .rf{font-size:calc(10px*var(--fs));color:#9fc3ef;flex:none;max-width:78px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,Consolas,monospace}
 #vmain{flex:1;padding:22px 26px 34px;overflow-y:auto;position:relative}
 /* R2（10-16 第五轮）：弹窗内滚动条深色定制——细窄圆角，thumb 随话题主题色 */
 #vlist,#vmain{scrollbar-width:thin;scrollbar-color:rgba(127,176,255,.32) rgba(255,255,255,.04)}
@@ -168,6 +173,9 @@ border-left:3px solid var(--vc);border-radius:8px;padding:7px 11px;margin-bottom
 /* R1（10-17 第八轮）：弹窗路由=对话记录同款双层胶囊（CSS 与 src/api.rs 逐字一致） */
 .idc{display:inline-flex;align-items:center;justify-content:flex-end;background:var(--nc,#22344f);border-radius:13px;padding:2px 2px 2px 14px;margin-right:4px;vertical-align:middle;max-width:100%}
 .idc .idci{display:inline-block;border-radius:999px;padding:0 9px;font-weight:600;font-size:12px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;vertical-align:middle}
+/* R6（10-17 第十轮）：弹窗胶囊 hover 微动效与对话记录一致（cap-nudge keyframes 见上方 .agt 区，与 api.rs 逐字同源） */
+.idc:hover .idci{animation:cap-nudge .7s cubic-bezier(.34,1.2,.64,1) 1}
+@media (prefers-reduced-motion:reduce){.idc:hover .idci{animation:none}}
 .idn{opacity:.62;font-size:11px;margin-right:2px}
 .varr{opacity:.6;font-size:12px;padding:0 4px}
 #v-body{font-size:calc(14px*var(--fs));line-height:1.75;color:#eaf2fb;white-space:pre-wrap;word-break:break-all}
@@ -180,11 +188,19 @@ border-left:3px solid var(--vc);border-radius:8px;padding:7px 11px;margin-bottom
 #bar{position:fixed;left:0;right:0;bottom:0;height:58px;display:flex;align-items:center;gap:22px;padding:0 26px;z-index:30;
 background:linear-gradient(0deg,rgba(4,7,13,.85),transparent)}
 #bar .lbl{font-size:calc(11px*var(--fs));color:var(--mut);letter-spacing:.18em;white-space:nowrap}
-#win,#back{-webkit-appearance:none;appearance:none;width:220px;height:3px;border-radius:2px;background:#1b2a40;outline:none;cursor:pointer}
-#win::-webkit-slider-thumb,#back::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:var(--cyan);
+#win{-webkit-appearance:none;appearance:none;width:220px;height:3px;border-radius:2px;background:#1b2a40;outline:none;cursor:pointer}
+#win::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:var(--cyan);
 box-shadow:0 0 12px var(--cyan);cursor:pointer}
 #winv{font-size:calc(12px*var(--fs));color:var(--cyan);font-family:ui-monospace,Consolas,monospace;width:52px}
-#rng{font-size:calc(12.5px*var(--fs));color:#cfe4ff;font-family:ui-monospace,Consolas,monospace;width:118px;white-space:nowrap}
+#rng{font-size:calc(12.5px*var(--fs));color:#cfe4ff;font-family:ui-monospace,Consolas,monospace;width:158px;white-space:nowrap}
+/* R7（10-17 第十轮）：时段切换按钮＋上方弹出选择器（应用时段按钮、时间区间滑杆废除） */
+.bwrap{position:relative;display:flex}
+#mPop{display:none;position:absolute;bottom:calc(100% + 10px);right:0;align-items:center;gap:8px;
+background:rgba(11,17,27,.94);border:1px solid var(--edge);border-radius:10px;padding:10px 12px;
+box-shadow:0 10px 26px rgba(0,0,0,.55);white-space:nowrap;z-index:40}
+#mPop.show{display:flex}
+#mFrom,#mTo{background:rgba(4,7,13,.7);border:1px solid var(--edge);border-radius:8px;padding:5px 8px;
+color:var(--txt);font-size:calc(11.5px*var(--fs));font-family:ui-monospace,Consolas,monospace;color-scheme:dark}
 #bar .btns{margin-left:auto;display:flex;gap:10px}
 .btn{font-size:calc(12px*var(--fs));color:#a9bcd2;border:1px solid var(--edge);border-radius:8px;padding:6px 14px;cursor:pointer;
 background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
@@ -205,8 +221,10 @@ background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
 </div>
 <div id="bar">
   <span class="lbl">窗口长度</span><input id="win" type="range" min="60" max="1800" step="60" value="600"><span id="winv">10min</span>
-  <span class="lbl">时间区间</span><input id="back" type="range" min="0" max="3600" step="60" value="0"><span id="rng"></span>
+  <span id="rng"></span>
   <div class="btns">
+    <div class="bwrap"><div class="btn on" id="bLive">实时</div>
+      <div id="mPop"><span class="lbl">开始</span><input type="datetime-local" id="mFrom"><span class="lbl">结束</span><input type="datetime-local" id="mTo"></div></div>
     <div class="btn" id="bReset">复位</div>
     <div class="btn" id="bPause">流入</div>
     <div class="btn" id="bSnap">截图</div>
@@ -234,7 +252,9 @@ background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
 
 const stageEl=document.getElementById("stage"),map=document.getElementById("map"),
 hud=document.getElementById("hud");
-let W=innerWidth,H=innerHeight;
+let W=0,H=0;{const vr0=stageEl.getBoundingClientRect();W=vr0.width||innerWidth;H=vr0.height||innerHeight;}
+/* R2（10-17 第十轮）：偏左根因=W/H 在解析时取 innerWidth，iframe 首帧尺寸未定即全量落位错，
+   且 resize 缺 W0=0 时 rx=Infinity 打坏坐标。改为一律以 stage 实际 rect 为准，poll 开头 syncDims 对表自愈。 */
 const CUR={x:innerWidth/2,y:innerHeight/2};
 addEventListener("pointermove",e=>{CUR.x=e.clientX;CUR.y=e.clientY},{passive:true});
 function barH(){const b=document.getElementById("bar");return b?b.offsetHeight:56}
@@ -295,8 +315,11 @@ function initPos(){const cl=staClamp(),r=orbR()+44;for(const m in MACH){const c=
  if(!AGTP[a2k([m,"@node"])])AGTP[a2k([m,"@node"])]={dx:0,dy:0};}}
 function agPos(k){const[m]=k.split("|");const s=STA[m],o=AGTP[k];return{x:s.x+o.dx,y:s.y+o.dy};}
 /* ---------- time window ---------- */
-let winS=600,backS=0;const T0=Date.now();
-function activeMsgs(){const out=[],now=Date.now();for(const tp of TOPICS)for(const msg of tp.msgs){msg.t=-Math.round((now-msg.abs)/1000);if(msg.t>=-(winS+backS)&&msg.t<=-backS&&!epHid(msg.f)&&!epHid(msg.to)&&!ghost(msg.f)&&!ghost(msg.to))out.push({...msg,tp});}return out;}
+let winS=600;const T0=Date.now();
+/* R1/R7（10-17 第十轮）：时间窗双模式——实时=跟随现在（窗口长度滑杆），时段=绝对区间 [mFrom,mTo] 冻结 */
+let LIVE=true,mFrom=0,mTo=0;
+function wBounds(){return LIVE?[Date.now()-winS*1000,Date.now()]:[mFrom,mTo];}
+function activeMsgs(){const out=[],now=Date.now(),b=wBounds();for(const tp of TOPICS)for(const msg of tp.msgs){msg.t=-Math.round((now-msg.abs)/1000);if(msg.abs>=b[0]&&msg.abs<=b[1]&&!epHid(msg.f)&&!epHid(msg.to)&&!ghost(msg.f)&&!ghost(msg.to))out.push({...msg,tp});}return out;}
 function hashK(s){let h=17;for(const c of s)h=Math.imul(h^c.charCodeAt(0),2654435761);return Math.abs(h);}
 function qp(p1,p2,bow,u){const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2,dx=p2.x-p1.x,dy=p2.y-p1.y,L=Math.hypot(dx,dy)||1;
  const qx=mx+(-dy/L)*bow,qy=my+(dx/L)*bow,it=1-u;
@@ -323,7 +346,7 @@ function buildWorld(){
  for(const m in MACH)for(const a of MACH[m].agents){const k=a2k([m,a]);
  const d=document.createElement("div");d.className="agt";d.style.setProperty("--ac",agCol(m,a));
  d.style.setProperty("--acg",agGlow(m,a));d.style.setProperty("--acn",nodeCol(m));
- d.innerHTML=`<div class="dot"><span class="in">${esc(a)}</span></div><div class="flash"></div><div class="badge">0</div>`;
+ d.innerHTML=`<div class="dot"><span class="in" style="color:${onCol(agCol(m,a))}">${esc(a)}</span></div><div class="flash"></div><div class="badge">0</div>`;
  stageEl.appendChild(d);agtEl[k]=d;
  d.addEventListener("pointerdown",e=>startDrag(e,"agent",k));
  d.addEventListener("pointerenter",()=>{hovAgt=k;reveal(k);applyLanes();});
@@ -373,8 +396,11 @@ function renderLinks(){
  applyLanes();renderBadges();renderHud();}
 function lightLink(key){const p=map.querySelector(`[data-k="${CSS.escape(key)}"]`);if(!p)return;
  p.classList.add("lit");setTimeout(()=>p.classList.remove("lit"),1200);}
-let hovAgt=null,hovSta=null,gTopic=null,pinC=null;
+let hovAgt=null,hovSta=null,gTopic=null,gOwnerK=null,pinC=null,WSOK=false;
 function applyLanes(){const agts=new Set(),stas=new Set(),tps=new Set();
+ /* R3（10-17 第十轮）：轮询重建卡组会移除正被悬停的卡片，pointerleave 永不触发 → gTopic 残留，
+    之后所有悬停都被劫持进旧话题分支（"有卡片没连线"）。归属卡组不在悬停态即清除焦点。 */
+ if(gTopic){const od=gOwnerK?dwraps[gOwnerK]:null;if(!od||!od.matches(":hover")){gTopic=null;gOwnerK=null;}}
  if(gTopic||VT){/* card/viewer focus: ONLY the relevant topic lanes + endpoints */
   if(gTopic)tps.add(gTopic);if(VT)tps.add(VT.tp.id);}
  else{if(hovAgt)agts.add(hovAgt);if(hovSta)stas.add(hovSta);
@@ -403,7 +429,8 @@ function renderBadges(){for(const k in agtEl){const n=recvCount(k);const b=agtEl
  b.textContent=n;b.classList.toggle("zero",n===0);}}
 function renderHud(){const ms=activeMsgs();
  const recent=ms.filter(m=>m.t>=-30).length;
- hud.innerHTML=`<span>窗口内 <b>${ms.length}</b></span><span>近30s <b>${recent}</b></span><span>节点 <b>${ST_ON}/${ST_ALL}</b></span><span>agents <b>${AG_ALL}</b></span>`;}
+ const push=WSOK?"实时":"轮询5s",pc=WSOK?"#43d97b":"#ffb347";
+ hud.innerHTML=`<span>窗口内 <b>${ms.length}</b></span><span>近30s <b>${recent}</b></span><span>节点 <b>${ST_ON}/${ST_ALL}</b></span><span>agents <b>${AG_ALL}</b></span><span>推送 <b style="color:${pc}">${push}</b></span>`;}
 /* ---------- per-agent topic decks ---------- */
 const dwraps={},deckOpen={},hideTimers={},opentomb={},dwAnchor={};
 function clearOpenTomb(k){if(opentomb[k]){clearTimeout(opentomb[k]);opentomb[k]=null;}}
@@ -415,32 +442,37 @@ function scheduleHide(k){cancelTomb(k);hideTimers[k]=setTimeout(()=>{const dw=dw
 function hlLinks(k,on){for(const l of map.querySelectorAll(".lk")){
  const kf=l.getAttribute("data-k").split("=>")[0];
  l.classList.toggle("hl",!!on&&kf===k);}}
-function groupsFor(k){const g=new Map();
- for(const m of activeMsgs()){if(m.to!==k&&m.f!==k)continue;
+function groupsFor(k){const g=new Map(),tot={};
+ for(const m of activeMsgs()){tot[m.tp.id]=(tot[m.tp.id]||0)+1;if(m.to!==k&&m.f!==k)continue;
   const r=g.get(m.tp.id)||{tp:m.tp,n:0,last:m,first:m,recv:0,lastRecv:null};
   r.n++;r.last=m;if(m.t<r.first.t)r.first=m;
   if(m.to===k){r.recv++;if(!r.lastRecv||m.t>r.lastRecv.t)r.lastRecv=m;}
   g.set(m.tp.id,r);}
- return[...g.values()].filter(r=>r.recv>0).sort((a,b)=>b.lastRecv.t-a.lastRecv.t);}
-/* R2：某实体在某话题组里、对其可见的消息链（开窗与换组共用，口径与原 openG 一致） */
-function chainFor(tpid,k){const tp=TOPICS.find(t=>t.id===tpid);if(!tp)return[];const now=Date.now();
- return tp.msgs.filter(m=>{m.t=-Math.round((now-m.abs)/1000);
-  return (m.to===k||m.f===k)&&m.t>=-(winS+backS)&&m.t<=-backS&&!epHid(m.f)&&!epHid(m.to)&&!ghost(m.f)&&!ghost(m.to)}).sort((a,b)=>a.t-b.t);}
+ const out=[...g.values()].filter(r=>r.recv>0);
+ for(const r of out)r.tot=tot[r.tp.id]||r.n;
+ return out.sort((a,b)=>b.lastRecv.t-a.lastRecv.t);}
+/* R8（10-17 第十轮）：弹窗展示话题完整往来链——窗口/隐藏/幽灵过滤不变，但不再按实体切片，
+   该话题里所有发、收、第三方消息全部入列；与卡片「N 条」(=话题窗口内总条数) 同口径 */
+function chainFor(tpid){const tp=TOPICS.find(t=>t.id===tpid);if(!tp)return[];const now=Date.now(),b=wBounds();
+ const out=tp.msgs.filter(m=>{m.t=-Math.round((now-m.abs)/1000);
+  return m.abs>=b[0]&&m.abs<=b[1]&&!epHid(m.f)&&!epHid(m.to)&&!ghost(m.f)&&!ghost(m.to)});
+ out.sort((a,b)=>a.t-b.t);return out;}
+function lastInvolvedIdx(chain,k){for(let j=chain.length-1;j>=0;j--)if(chain[j].to===k||chain[j].f===k)return j;return chain.length-1;}
 function buildDeck(k){const dw=dwraps[k];const g=groupsFor(k);
  dw.innerHTML=g.length?g.map((r,i)=>{const mins=Math.round(-r.lastRecv.t/60);
   return`<div class="gcard" data-tp="${r.tp.id}" style="--gc:${r.tp.color};z-index:${i+1}">
-   <div class="r1"><span class="cdot"></span><span class="cname">${esc(r.tp.name)}</span><span class="cnum">${r.n} 条</span></div>
+   <div class="r1"><span class="cdot"></span><span class="cname">${esc(r.tp.name)}</span><span class="cnum">${r.tot} 条</span></div>
    <div class="r2">${esc(r.lastRecv.body)}</div>
    <div class="r3"><span>${r.lastRecv.f.split("|")[1].replace("@node","node")} → ${r.lastRecv.to.split("|")[1].replace("@node","node")}</span><span>${mins}min 前</span></div></div>`;}).join(""):"";
  dw.style.display=(g.length&&dw.dataset.vis==="1")?"block":"none";
  dw.querySelectorAll(".gcard").forEach(c=>{
-  c.addEventListener("pointerenter",()=>{c.classList.add("hot");c.style.zIndex=99;gTopic=c.dataset.tp;applyLanes();});
+  c.addEventListener("pointerenter",()=>{c.classList.add("hot");c.style.zIndex=99;gTopic=c.dataset.tp;gOwnerK=k;applyLanes();});
   c.addEventListener("pointerleave",()=>{c.classList.remove("hot");
    c.style.zIndex=[...dw.querySelectorAll(".gcard")].indexOf(c)+1;
-   if(gTopic===c.dataset.tp)gTopic=null;applyLanes();});
+   if(gTopic===c.dataset.tp){gTopic=null;gOwnerK=null;}applyLanes();});
   const openG=()=>{const tp=TOPICS.find(t=>t.id===c.dataset.tp);
-   const chain=chainFor(c.dataset.tp,k);
-   if(!chain.length)return;openViewer(tp,chain,chain.length-1,k);};
+   const chain=chainFor(c.dataset.tp);
+   if(!chain.length)return;openViewer(tp,chain,lastInvolvedIdx(chain,k),k);};
   c.addEventListener("click",openG);});
  layoutDeck(k);}
 function layoutDeck(k){const dw=dwraps[k];const cards=[...dw.querySelectorAll(".gcard")];
@@ -489,7 +521,9 @@ function reveal(k){const dw=dwraps[k];cancelTomb(k);
  // 原卡组的 pointerenter 撤销，真正走开才收，保持"无关卡片立收"观感）
  for(const o in dwraps){if(o!==k&&dwraps[o].style.display!=="none"){cancelTomb(o);clearOpenTomb(o);scheduleHide(o);}}
  dw.dataset.vis="1";dw.style.display="block";deckOpen[k]=false;layoutDeck(k);}
-function renderAllDecks(){for(const k in dwraps)buildDeck(k);}
+function renderAllDecks(){for(const k in dwraps){const dw=dwraps[k];
+ /* R3：悬停展开中的卡组不重建——卡片 .hot 态与焦点不闪，离开后下轮自然更新 */
+ if(dw.style.display!=="none"&&dw.matches(":hover"))continue;buildDeck(k);}}
 /* ---------- viewer (big card) ---------- */
 const mask=document.getElementById("mask"),viewer=document.getElementById("viewer");
 let VT=null;
@@ -514,7 +548,8 @@ function drawViewer(){const m=VT.chain[VT.i];document.getElementById("vmain").sc
  document.getElementById("v-tp").textContent=VT.tp.name;
  const vl=document.getElementById("vlist");
  vl.innerHTML=VT.chain.map((x,idx)=>{const c=agCol(x.f.split("|")[0],x.f.split("|")[1]);
-  return`<div class="row${idx===VT.i?' on':''}" data-i="${idx}" style="--kc:${c}"><span class="k" style="background:${c}"></span><span class="t">${fmtHM(x.t)}</span><span class="s">${esc(x.body)}</span></div>`;}).join("");
+  const snd=x.f.split("|")[1].replace("@node","整机");
+  return`<div class="row${idx===VT.i?' on':''}" data-i="${idx}" style="--kc:${c}"><span class="k" style="background:${c}"></span><span class="t">${fmtHM(x.t)}</span><span class="rf">${esc(snd)}</span><span class="s">${esc(x.body)}</span></div>`;}).join("");
  vl.scrollTop=Math.max(0,(VT.i)*38-vl.clientHeight/2);
  document.getElementById("v-seq").textContent=(VT.i+1)+" / "+VT.chain.length;
  document.getElementById("v-hd").innerHTML=routeHtml(m);
@@ -548,8 +583,8 @@ function updateGNav(){const n=(VT&&VT.k)?groupsFor(VT.k).length:0;
 function gotoGroup(d){if(!VT||!VT.k)return;const gs=groupsFor(VT.k);if(gs.length<2)return;
  let idx=gs.findIndex(r=>r.tp.id===VT.tp.id);if(idx<0)idx=0;
  for(let n=0;n<gs.length;n++){idx=(idx+d+gs.length)%gs.length;
-  const chain=chainFor(gs[idx].tp.id,VT.k);
-  if(chain.length){VT={tp:gs[idx].tp,chain,i:chain.length-1,k:VT.k};gTopic=null;
+  const chain=chainFor(gs[idx].tp.id);
+  if(chain.length){VT={tp:gs[idx].tp,chain,i:lastInvolvedIdx(chain,VT.k),k:VT.k};gTopic=null;
    setVc(gs[idx].tp.color);applyLanes();drawViewer();updateGNav();return;}}}
 document.getElementById("gPrev").onclick=()=>gotoGroup(-1);
 document.getElementById("gNext").onclick=()=>gotoGroup(1);
@@ -654,26 +689,33 @@ function buildTopics(ents){const byId={};for(const e of ents)byId[e.msg_id]=e;
   tp.msgs.push(msgOf(e));}
  TOPICS=Object.values(groups);for(const tp of TOPICS)tp.msgs.sort((x,y)=>x.abs-y.abs);}
 const KNOWN=new Set();let WSIG="";
-async function poll(){
- try{await loadTopo();
+let polling=false,pollAgain=false;
+async function poll(){if(polling){pollAgain=true;return;}polling=true;
+ try{sizeUp();await loadTopo();
   const d=await J("/v1/history/search?limit=1500&max_mb=192&scope=all");
   if(!d||d.ok!==true){await syncWorld();applyHide();setErr((d&&d.error==="history disabled")?"总线未启用历史记录（config history.enabled=false）":"查询失败："+((d&&d.error)||"未知"));renderLinks();renderAllDecks();return;}
   setErr("");
   buildTopics((d.matches||[]).slice().sort((x,y)=>String(x.ts).localeCompare(String(y.ts))));
   /* R1 补充：窗口内活跃 agent 并入白名单，重算各站台胶囊名单（世界签名变化则自动重建） */
-  {const cut=Date.now()-(winS+backS)*1000;
+  {const cut=wBounds()[0];
    for(const tp of TOPICS)for(const m of tp.msgs)if(m.abs>=cut){growLive(m.f);growLive(m.to);}
    mergeAgents();}
   await syncWorld();applyHide(); /* world built AFTER msgs registered: agents from history+fleet in one shot */
-  const edge=backS===0&&!paused;
-  for(const tp of TOPICS)for(const m of tp.msgs)if(!KNOWN.has(m.id)){KNOWN.add(m.id);if(edge&&m.abs>=Date.now()-90000&&!epHid(m.f)&&!epHid(m.to)&&!ghost(m.f)&&!ghost(m.to))flyIn(tp,m);}
   renderLinks();renderAllDecks();
- }catch(e){setErr(String(e.message||e));}}
+ const edge=LIVE&&!paused;const fresh=[];
+  for(const tp of TOPICS)for(const m of tp.msgs)if(!KNOWN.has(m.id)){KNOWN.add(m.id);if(edge&&m.abs>=Date.now()-90000&&!epHid(m.f)&&!epHid(m.to)&&!ghost(m.f)&&!ghost(m.to))fresh.push([tp,m]);}
+  /* R1（10-17 第十轮）：flyIn 移到 renderLinks 之后——临时链路不再被重建清掉，
+   永久链路已存在时直接点亮；每轮最多 8 个粒子，超预算只做徽章 ping；
+   单轮新增 >60 视为突发（历史回填/高频风暴），不飞粒子——主线程不再被拖住 */
+  if(fresh.length>60){for(let i=0;i<Math.min(fresh.length,16);i++)deliver(fresh[i][1].to);}
+  else{let budget=8;for(const [tp,m] of fresh){if(budget-->0)flyIn(tp,m);else deliver(m.to);}}
+ }catch(e){setErr(String(e.message||e));}
+ finally{polling=false;if(pollAgain){pollAgain=false;poll();}}}
 function worldSig(){let s="";for(const m in MACH)s+=m+"|"+MACH[m].lab+"|"+MACH[m].ip+"|"+MACH[m].agents.join(",")+";";return s;}
 async function syncWorld(){const sg=worldSig();if(sg===WSIG)return;WSIG=sg;
  if(Object.keys(STA).length){stageEl.innerHTML="";
   for(const o of[dwraps,deckOpen,hideTimers,opentomb,dwAnchor,agtEl,staEl])for(const k in o)delete o[k];
-  hovAgt=hovSta=gTopic=pinC=null;cancelLiveAnims();if(VT)closeViewer();}
+  hovAgt=hovSta=gTopic=gOwnerK=pinC=null;cancelLiveAnims();if(VT)closeViewer();}
  initPos();buildWorld();placeWorld();}
 function renderLegend(){const el=document.getElementById("legend");if(!el)return;const seen={};
  for(const m in MACH)for(const a of MACH[m].agents)if(!(a in seen))seen[a]=agCol(m,a);
@@ -721,15 +763,36 @@ function flyIn(tp,msg){const f=msg.f,to=msg.to;
  setTimeout(arrive,4500);}
 /* ---------- bar ---------- */
 const winEl=document.getElementById("win");
-winEl.oninput=()=>{winS=+winEl.value;
+function liveUI(on){const b=document.getElementById("bLive");b.classList.toggle("on",on);b.textContent=on?"实时":"时段";}
+function setLive(on){LIVE=on;liveUI(on);if(on){mFrom=mTo=0;document.getElementById("mPop").classList.remove("show");}
+ updateRange();renderAllDecks();renderLinks();}
+winEl.oninput=()=>{if(!LIVE)setLive(true);winS=+winEl.value;
  document.getElementById("winv").textContent=winS%60===0?(winS/60)+"min":winS+"s";
  updateRange();cancelLiveAnims();renderAllDecks();renderLinks();};
-const backEl=document.getElementById("back");
-backEl.oninput=()=>{backS=+backEl.value;updateRange();cancelLiveAnims();renderAllDecks();renderLinks();};
-function fmtT(ms){const d=new Date(ms);return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");}
-function updateRange(){const end=Date.now()-backS*1000;
- document.getElementById("rng").textContent=fmtT(end-winS*1000)+" — "+fmtT(end);}
+function fmtT(ms){const d=new Date(ms),n=new Date();const hm=String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");
+ return (d.getDate()===n.getDate()&&d.getMonth()===n.getMonth())?hm:(d.getMonth()+1)+"-"+String(d.getDate()).padStart(2,"0")+" "+hm;}
+function updateRange(){const b=wBounds();
+ document.getElementById("rng").textContent=fmtT(b[0])+" — "+fmtT(b[1])+(LIVE?" 实时":" 时段");}
 updateRange();
+/* R1（10-17 第十轮）：手工时段 = 绝对区间冻结显示（数据仍每轮刷新，只展示区间内条目）；
+   回到"实时"即恢复跟随当前时间。默认预填最近 10 分钟，打开即用。 */
+function pad2(n){return String(n).padStart(2,"0")}
+function dtv(id){const v=document.getElementById(id).value;if(!v)return NaN;return Date.parse(v);}
+{const d=new Date(),e=new Date(d.getTime()-600000),mk=x=>x.getFullYear()+"-"+pad2(x.getMonth()+1)+"-"+pad2(x.getDate())+"T"+pad2(x.getHours())+":"+pad2(x.getMinutes());
+ document.getElementById("mFrom").value=mk(e);document.getElementById("mTo").value=mk(d);}
+/* R7：按钮两态切换——实时→时段（弹窗打开在按钮上方，预填最近10分钟）；时段→实时（弹窗关闭）。
+   弹窗内改时间即时生效（无「应用时段」按钮）；点弹窗外只收弹窗、保持时段态。 */
+function applyManual(){const a=dtv("mFrom"),b=dtv("mTo");
+ if(!(a<b)){setErr("时段无效：起始须早于结束");return false;}setErr("");
+ mFrom=a;mTo=b;return true;}
+function renderManual(){updateRange();cancelLiveAnims();renderAllDecks();renderLinks();}
+document.getElementById("bLive").onclick=()=>{const pop=document.getElementById("mPop");
+ if(LIVE){applyManual();LIVE=false;liveUI(false);pop.classList.add("show");renderManual();}
+ else setLive(true);};
+document.getElementById("mFrom").onchange=document.getElementById("mTo").onchange=()=>{
+ if(!LIVE&&applyManual())renderManual();};
+document.addEventListener("pointerdown",e=>{const pop=document.getElementById("mPop");
+ if(pop.classList.contains("show")&&!pop.contains(e.target)&&e.target.id!=="bLive")pop.classList.remove("show");},true);
 // 字体滑条已移除：恒用 CSS 默认 --fs:1，并清掉历史 localStorage 残留，避免旧缩放值悄悄生效
 try{localStorage.removeItem("starfs");document.documentElement.style.removeProperty("--fs");}catch(e){}
 document.getElementById("bPause").onclick=e=>{paused=!paused;if(paused)cancelLiveAnims();
@@ -783,14 +846,28 @@ function snapshotTo(g){
 function hexPath(g,x,y,r){g.beginPath();for(let i=0;i<6;i++){const a=Math.PI/3*i-Math.PI/2;
  const px=x+Math.cos(a)*r,py=y+Math.sin(a)*r;i?g.lineTo(px,py):g.moveTo(px,py);}g.closePath();}
 /* ---------- boot ---------- */
-let W0=innerWidth,H0=innerHeight;
-function sizeUp(){W=innerWidth;H=innerHeight;if(W===W0&&H===H0&&Object.keys(STA).length)return;
- if(!Object.keys(STA).length){W0=W;H0=H;return;}
- const rx=W/W0,ry=H/H0;W0=W;H0=H;
- for(const m in STA){STA[m].x*=rx;STA[m].y*=ry;}
- const cl=staClamp(),r=orbR();
- for(const m in STA)STA[m].y=Math.max(cl.top,Math.min(cl.bot,STA[m].y));
- for(const k in AGTP){const mag=Math.hypot(AGTP[k].dx,AGTP[k].dy)||1;AGTP[k].dx*=r/mag;AGTP[k].dy*=r/mag;}
+let W0=0,H0=0;
+/* R2（10-17 第十轮）：偏左根因=解析时 innerWidth 可能是 iframe 首帧(300x150)或隐藏态(0)，
+   全量按错尺寸落位；且 W0=0 时 rx=Infinity 把 STA 打坏，只能整页重载。
+   改法：一律以 stage 实际 rect 计量；上一尺寸为 0/非有限时不再缩放，改按 MACH 分数坐标重建
+   （reAnchor，保留用户拖过的胶囊）；每轮 poll 开头 sizeUp() 对表——resize 事件缺失也 5s 内自愈。 */
+function viewport(){const r=stageEl.getBoundingClientRect();return[r.width||innerWidth,r.height||innerHeight];}
+function reAnchor(){const cl=staClamp(),r=orbR()+44;for(const m in MACH){const c=MACH[m];
+ STA[m]={x:c.x*W,y:Math.max(cl.top,Math.min(cl.bot,c.y*H))};
+ c.agents.forEach((a,i)=>{const k=a2k([m,a]);if(AGP[k])return;
+  const ang=Math.PI/2+i*(2*Math.PI/Math.max(c.agents.length,3));
+  AGTP[k]={dx:Math.cos(ang)*r,dy:Math.sin(ang)*r};});
+ if(!AGTP[a2k([m,"@node"])])AGTP[a2k([m,"@node"])]={dx:0,dy:0};}}
+function sizeUp(){const vp=viewport(),nw=vp[0],nh=vp[1];
+ if(!Object.keys(STA).length){W=nw;H=nh;W0=nw;H0=nh;return;}
+ if(nw===W0&&nh===H0&&W0>0&&H0>0)return;
+ const bad=!W0||!H0||!isFinite(nw/W0)||!isFinite(nh/H0);
+ const rx=nw/(W0||1),ry=nh/(H0||1);W=nw;H=nh;W0=nw;H0=nh;
+ if(bad)reAnchor();
+ else{for(const m in STA){STA[m].x*=rx;STA[m].y*=ry;}
+  const cl=staClamp(),r=orbR();
+  for(const m in STA)STA[m].y=Math.max(cl.top,Math.min(cl.bot,STA[m].y));
+  for(const k in AGTP){const mag=Math.hypot(AGTP[k].dx,AGTP[k].dy)||1;AGTP[k].dx*=r/mag;AGTP[k].dy*=r/mag;}}
  placeWorld();renderLinks();renderAllDecks();}
 function buildStars(){const sf=document.getElementById("starfield");
  for(let i=0;i<110;i++){const t=document.createElement("i");const sz=1+Math.random()*1.8;
@@ -798,7 +875,23 @@ function buildStars(){const sf=document.getElementById("starfield");
 async function boot(){buildStars();updateRange();await poll();}
 addEventListener("resize",sizeUp);
 addEventListener("resize",posGNav); /* R2：窗口尺寸变了，‹ › 的外贴坐标要重算（世界布局由 sizeUp 与下轮 poll 处理） */
-boot();setInterval(poll,5000);
+/* R1（10-17 第十轮）：实时通道——/v1/ws 不带 client 即观察者连接（服务端本轮起放行本机全部
+   事件，含定向消息），任一事件 400ms 合并触发一次 poll；断线指数退避 2s→30s 重连；
+   5s 兜底轮询保留：WS 不可用时退回"轮询5s"（HUD 推送灯可见状态）。主控制台发信成功或点
+   「刷新」会 postMessage {al:'poke'}，出站单播也秒级上屏。手工时段模式下动画冻结、数据照常刷新。 */
+let ws=null,wsRetry=2000,pokeT=null;
+function pokePoll(){if(pokeT)return;pokeT=setTimeout(()=>{pokeT=null;poll();},400);}
+function connectWS(){if(!TOKEN){setTimeout(connectWS,2000);return;}
+ let sk=null;try{sk=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/v1/ws?token="+encodeURIComponent(TOKEN))}catch(e){return;}
+ ws=sk;
+ sk.onopen=()=>{WSOK=true;wsRetry=2000;renderHud();};
+ sk.onmessage=()=>pokePoll();
+ sk.onerror=()=>{try{sk.close();}catch(e){}};
+ sk.onclose=()=>{WSOK=false;if(ws===sk)ws=null;renderHud();setTimeout(connectWS,wsRetry);wsRetry=Math.min(wsRetry*2,30000);};}
+addEventListener("message",e=>{if(e.data&&e.data.al==="poke")pokePoll();});
+boot().then(connectWS);setInterval(poll,5000);
+/* 诊断快照：外部检查器可读（不影响任何行为；WS 状态机排障用） */
+window.__al={get wsok(){return WSOK},get live(){return LIVE},get polling(){return polling},get tok4(){return (TOKEN||"").slice(0,4)}};
 
 </script>
 </body>
