@@ -19,7 +19,7 @@
 - 结构化 JSON 日志 + trace_id（reply_to 链即天然 trace 骨架）【§7.1】
 - /web 任务 timeline 视图（首个用例=滚动升级）+ 一键 lockdown【§3.2、§4.5】
 - CLI 薄壳 `agentlink get nodes / apply / logs`（REST wrapper）【§3.3】
-- 首次运行 wizard + hello-world 自检任务（自动遍历节点汇总）【§3.1、§3.4】
+- 首次运行 wizard + hello-world 自检任务（自动遍历节点汇总）【§3.1、§3.4】✅ v0.5.6 完成（`agentlink setup`/裸启动向导 + `agentlink hello` + 内核 `__node__` 应答）
 
 验收门：一次真实滚动升级全程走 task 协议、零手工对账；编排由轮询改事件驱动。
 

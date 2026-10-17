@@ -194,7 +194,7 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
         // "json-log" (v0.5 §7.1): structured JSON logging with trace_id
         // injection is available (`log.format` = json / `--log-format json`).
         // "lockdown" (v0.5 §4.5): 一键熔断端点存在。
-        "features": ["events", "redact", "tasks", "json-log", "lockdown"],
+        "features": ["events", "redact", "tasks", "json-log", "lockdown", "hello"],
     }))
 }
 
