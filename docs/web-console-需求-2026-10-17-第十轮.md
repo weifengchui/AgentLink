@@ -65,5 +65,6 @@
 - 服务端下发页脚本 node --check 全绿（served_star/served_web，各 1 块）。
 
 ## 发布
+- v0.5.4 发布记录（10-17 17:0x）：commit d84ecba + tag v0.5.4；dist zip `AgentLink-v0.5.4.zip`（2,990,925 B，sha256 79ae3f8d…cbf51c）；双端产物 mtime 16:57/16:59、strings 烧录标记 mPop×6/lastInvolvedIdx×3/bMan×0 全绿；GitHub 443 不稳，push 走后台重试循环（attempt 记录在 /tmp/al_r78_push.log）。按分发拍板：本机生产节点换新 exe 由用户执行；各机交付用户自理，不做全网通知。
 - v0.5.4：Cargo.toml bump → fmt/clippy → 双平台 release → dist zip → commit + tag → push → 本地上线（本机生产节点换新 exe，用户在线检查）。按分发拍板：只交版本号+更新要点，不做全网通知。
 - 遗留（不入本轮）：工作树中 57 个 dist 旧版 zip 的删除记录待用户拍板（历史发布产物，台账引用较多，建议恢复）；对话记录卡片标题文案「可按条件查磁盘全量」未改（R5 只改按钮）。
