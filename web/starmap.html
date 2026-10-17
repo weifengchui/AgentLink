@@ -165,6 +165,11 @@ align-items:center;justify-content:center;opacity:.82;transition:opacity .18s,bo
 #v-seq{font-size:calc(11px*var(--fs));color:var(--mut);margin:4px 0 14px;font-family:ui-monospace,Consolas,monospace}
 #v-hd{font-size:calc(12.5px*var(--fs));color:#9fb4cc;background:rgba(108,168,255,.06);border:1px dashed var(--edge);
 border-left:3px solid var(--vc);border-radius:8px;padding:7px 11px;margin-bottom:12px;word-break:break-all;font-family:ui-monospace,Consolas,monospace}
+/* R1（10-17 第八轮）：弹窗路由=对话记录同款双层胶囊（CSS 与 src/api.rs 逐字一致） */
+.idc{display:inline-flex;align-items:center;justify-content:flex-end;background:var(--nc,#22344f);border-radius:13px;padding:2px 2px 2px 14px;margin-right:4px;vertical-align:middle;max-width:100%}
+.idc .idci{display:inline-block;border-radius:999px;padding:0 9px;font-weight:600;font-size:12px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;vertical-align:middle}
+.idn{opacity:.62;font-size:11px;margin-right:2px}
+.varr{opacity:.6;font-size:12px;padding:0 4px}
 #v-body{font-size:calc(14px*var(--fs));line-height:1.75;color:#eaf2fb;white-space:pre-wrap;word-break:break-all}
 #v-meta{margin-top:16px;display:flex;gap:16px;align-items:center;font-size:calc(11.5px*var(--fs));color:var(--mut);font-family:ui-monospace,Consolas,monospace}
 #v-kind{border:1px solid var(--vc);color:var(--vc);border-radius:9px;padding:1px 9px}
@@ -266,13 +271,19 @@ function agLit(a){return 56+(fm32(fnv("L|"+String(a)))%24)}
 function agCol(n,a){return COLORS["agent:"+n+"|"+a]||("hsl("+agHue(a)+","+agSat(a)+"%,"+agLit(a)+"%)")}
 function agGlow(n,a){return COLORS["agent:"+n+"|"+a]?COLORS["agent:"+n+"|"+a]+"99":("hsla("+agHue(a)+","+(agSat(a)+8)+"%,"+(agLit(a)-14)+"%,.6)")}
 function colFor(nid,a){return a?agCol(nid,a):staCol(nid)}
+// 手选色可能是深 hex——按亮度给胶囊内文字配可读前景（与 api.rs onCol 逐字一致）
+function onCol(c){if(typeof c==="string"&&c[0]==="#"&&c.length===7){const r=parseInt(c.substr(1,2),16),g=parseInt(c.substr(3,2),16),b=parseInt(c.substr(5,2),16);return (0.299*r+0.587*g+0.114*b)>150?"#0b1420":"#eef4fb";}return "#0b1420";}
+// 实体键 "<node>|<agent|@node>" → 双层胶囊（10-17 第八轮 R1：与对话记录 chip() 同构）
+function capHtml(k){const i=k.indexOf("|");const n=k.slice(0,i);const a=k.slice(i+1);
+ if(a==="@node")return `<span style="color:${staCol(n)}" title="${esc(n)}">●</span><span class="idn">${esc(nmOf(n))}</span>`;
+ const c=agCol(n,a);
+ return `<span class="idc" style="--nc:${nodeCol(n)}" title="${esc(n)} / ${esc(a)}"><span class="idci" style="background:${c};color:${onCol(c)}">${esc(a)}</span></span><span class="idn" style="color:${staCol(n)};opacity:.85" title="${esc(n)}">${esc(nmOf(n))}</span>`;}
+function routeHtml(m){return capHtml(m.f)+'<span class="varr">→</span>'+capHtml(m.to);}
 function who(nid){return NAMES[nid]||nid;}
 function nmOf(nid){return (MACH[nid]&&MACH[nid].lab)||who(nid)}
 const T=(id,name,color,msgs)=>({id,name,color,msgs});
-const M=(t,f,to,body,kind="msg")=>({t,f:a2k(f),to:a2k(to),body,kind,hd:hdOf(f,to)});
+const M=(t,f,to,body,kind="msg")=>({t,f:a2k(f),to:a2k(to),body,kind});
 function a2k([m,a]){return m+"|"+a}
-function aKey2disp(k){const[m,a]=k.split("|");return (a==="@node"?"node":a)+"@"+nmOf(m)}
-function hdOf(f,to){const nm=a=>a==="@node"?"node":a;return "【"+nm(f[1])+"@"+nmOf(f[0])+" -> "+nm(to[1])+"@"+nmOf(to[0])+"】"}
 let TOPICS=[];
 /* ---------- positions (draggable) ---------- */
 const STA={},AGTP={}; /* AGTP[key]={dx,dy} offset from station center */
@@ -506,13 +517,11 @@ function drawViewer(){const m=VT.chain[VT.i];document.getElementById("vmain").sc
   return`<div class="row${idx===VT.i?' on':''}" data-i="${idx}" style="--kc:${c}"><span class="k" style="background:${c}"></span><span class="t">${fmtHM(x.t)}</span><span class="s">${esc(x.body)}</span></div>`;}).join("");
  vl.scrollTop=Math.max(0,(VT.i)*38-vl.clientHeight/2);
  document.getElementById("v-seq").textContent=(VT.i+1)+" / "+VT.chain.length;
- document.getElementById("v-hd").textContent=hdOf2(m);
+ document.getElementById("v-hd").innerHTML=routeHtml(m);
  document.getElementById("v-body").textContent=m.body;
  document.getElementById("v-time").textContent="T-"+(-m.t)+"s · "+fmtClock(m.t);
  document.getElementById("v-kind").textContent={msg:"消息",file:"文件",sys:"系统"}[m.kind]||m.kind;
- document.getElementById("v-route").textContent=aKey2disp(m.f)+" → "+aKey2disp(m.to);}
-function hdOf2(m){const[f,k1]=m.f.split("|"),[t,k2]=m.to.split("|");
- return`【${k1.replace("@node","node")}@${nmOf(f)} -> ${k2.replace("@node","node")}@${nmOf(t)}】`;}
+ document.getElementById("v-route").innerHTML=routeHtml(m);}
 function fmtHM(t){const d=new Date(Date.now()+t*1000);
  return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");}
 function fmtClock(t){const d=new Date(Date.now()+t*1000);
