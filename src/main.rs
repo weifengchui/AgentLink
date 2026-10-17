@@ -4,6 +4,7 @@
 //! over the local HTTP/WS API; nodes talk to each other over WebSocket.
 
 mod api;
+mod cli;
 mod config;
 mod conn;
 mod discovery;
@@ -39,6 +40,14 @@ struct Cli {
     /// Path to the configuration file.
     #[arg(long, global = true, default_value = DEFAULT_CONFIG_FILE)]
     config: PathBuf,
+    /// 薄壳子命令（get/logs/apply）访问的 local API 基址。
+    /// 默认 http://127.0.0.1:<--config 的 listen_port>。
+    #[arg(long, global = true)]
+    url: Option<String>,
+    /// 薄壳子命令使用的 local API token（头 X-Auth-Token）。
+    /// 默认读 --config 指定的 agentlink.json 的 local_api.token。
+    #[arg(long, global = true)]
+    token: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -103,6 +112,19 @@ enum Command {
     Peers,
     /// Print the version.
     Version,
+    /// 集群视图查询（REST 薄壳：不启动节点，只读本机 local API）。
+    #[command(subcommand)]
+    Get(cli::GetTarget),
+    /// 读取总线事件流（/v1/events，观察者脱敏件）；--follow 持续跟随。
+    Logs {
+        #[command(flatten)]
+        opts: cli::LogsArgs,
+    },
+    /// 提交 task_spec（协议 §2 的 JSON 文件）到总线（POST /v1/send）。
+    Apply {
+        #[command(flatten)]
+        opts: cli::ApplyArgs,
+    },
 }
 
 /// Open a URL in the OS default browser (best effort).
@@ -268,6 +290,16 @@ async fn main() -> Result<()> {
             run(cfg, cfg_path, no_open).await
         }
         Some(Command::Autostart { remove, force }) => autostart(&cli.config, remove, force),
+
+        Some(Command::Get(what)) => {
+            cli::get(what, cli.url.as_deref(), cli.token.as_deref(), &cli.config).await
+        }
+        Some(Command::Logs { opts }) => {
+            cli::logs(opts, cli.url.as_deref(), cli.token.as_deref(), &cli.config).await
+        }
+        Some(Command::Apply { opts }) => {
+            cli::apply(opts, cli.url.as_deref(), cli.token.as_deref(), &cli.config).await
+        }
         None => {
             let cfg = load_config(&cli.config, false)?;
             logging::init(&cfg.log);
