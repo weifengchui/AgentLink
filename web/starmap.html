@@ -192,15 +192,7 @@ background:linear-gradient(0deg,rgba(4,7,13,.85),transparent)}
 #win::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:var(--cyan);
 box-shadow:0 0 12px var(--cyan);cursor:pointer}
 #winv{font-size:calc(12px*var(--fs));color:var(--cyan);font-family:ui-monospace,Consolas,monospace;width:52px}
-#rng{font-size:calc(12.5px*var(--fs));color:#cfe4ff;font-family:ui-monospace,Consolas,monospace;width:158px;white-space:nowrap}
-/* R7（10-17 第十轮）：时段切换按钮＋上方弹出选择器（应用时段按钮、时间区间滑杆废除） */
-.bwrap{position:relative;display:flex}
-#mPop{display:none;position:absolute;bottom:calc(100% + 10px);right:0;align-items:center;gap:8px;
-background:rgba(11,17,27,.94);border:1px solid var(--edge);border-radius:10px;padding:10px 12px;
-box-shadow:0 10px 26px rgba(0,0,0,.55);white-space:nowrap;z-index:40}
-#mPop.show{display:flex}
-#mFrom,#mTo{background:rgba(4,7,13,.7);border:1px solid var(--edge);border-radius:8px;padding:5px 8px;
-color:var(--txt);font-size:calc(11.5px*var(--fs));font-family:ui-monospace,Consolas,monospace;color-scheme:dark}
+/* R12（10-17 第十二轮）：实时按钮、时段弹出面板、时间区间文本全部废除——星图只提供实时视图 */
 #bar .btns{margin-left:auto;display:flex;gap:10px}
 .btn{font-size:calc(12px*var(--fs));color:#a9bcd2;border:1px solid var(--edge);border-radius:8px;padding:6px 14px;cursor:pointer;
 background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
@@ -220,11 +212,8 @@ background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
   <div id="hud"></div>
 </div>
 <div id="bar">
-  <span class="lbl">窗口长度</span><input id="win" type="range" min="60" max="1800" step="60" value="600"><span id="winv">10min</span>
-  <span id="rng"></span>
+  <span class="lbl">窗口长度</span><input id="win" type="range" min="60" max="3600" step="60" value="600"><span id="winv">10min</span>
   <div class="btns">
-    <div class="bwrap"><div class="btn on" id="bLive">实时</div>
-      <div id="mPop"><span class="lbl">开始</span><input type="datetime-local" id="mFrom"><span class="lbl">结束</span><input type="datetime-local" id="mTo"></div></div>
     <div class="btn" id="bReset">复位</div>
     <div class="btn" id="bPause">流入</div>
     <div class="btn" id="bSnap">截图</div>
@@ -316,9 +305,8 @@ function initPos(){const cl=staClamp(),r=orbR()+44;for(const m in MACH){const c=
 function agPos(k){const[m]=k.split("|");const s=STA[m],o=AGTP[k];return{x:s.x+o.dx,y:s.y+o.dy};}
 /* ---------- time window ---------- */
 let winS=600;const T0=Date.now();
-/* R1/R7（10-17 第十轮）：时间窗双模式——实时=跟随现在（窗口长度滑杆），时段=绝对区间 [mFrom,mTo] 冻结 */
-let LIVE=true,mFrom=0,mTo=0;
-function wBounds(){return LIVE?[Date.now()-winS*1000,Date.now()]:[mFrom,mTo];}
+/* R12（10-17 第十二轮）：时段模式废除——时间窗恒为跟随现在的滑窗（[now-winS, now]），窗口长度最大 1 小时。 */
+function wBounds(){return [Date.now()-winS*1000,Date.now()];}
 function activeMsgs(){const out=[],now=Date.now(),b=wBounds();for(const tp of TOPICS)for(const msg of tp.msgs){msg.t=-Math.round((now-msg.abs)/1000);if(msg.abs>=b[0]&&msg.abs<=b[1]&&!epHid(msg.f)&&!epHid(msg.to)&&!ghost(msg.f)&&!ghost(msg.to))out.push({...msg,tp});}return out;}
 function hashK(s){let h=17;for(const c of s)h=Math.imul(h^c.charCodeAt(0),2654435761);return Math.abs(h);}
 function qp(p1,p2,bow,u){const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2,dx=p2.x-p1.x,dy=p2.y-p1.y,L=Math.hypot(dx,dy)||1;
@@ -391,8 +379,18 @@ function renderLinks(){
  for(const m of activeMsgs()){const key=m.f+"=>"+m.to+"#"+m.tp.id;
   if(seen.has(key))continue;seen.add(key);
   LINKS.push({key,f:m.f,t:m.to,color:m.tp.color,first:m});}
+ /* R-fix（10-17）：innerHTML 全量替换会顺手抹掉飞行中粒子的 temp 连线——poke 400ms 快轮询
+    正好发生在 1.7s 飞行窗口内，线被抹、粒子裸飞、到达又整体重建，用户看不见连线。
+    保留尚未被永久线集合覆盖的 temp 线（同一 key 已有永久线则丢弃旧的，避免叠线）。 */
+ const temps=[...map.querySelectorAll(".lk.temp")].filter(t=>!seen.has(t.getAttribute("data-k")));
  map.innerHTML=LINKS.map(l=>{const p1=agPos(l.f),p2=agPos(l.t);
   return`<path class="lk" data-k="${l.key}" d="${chanD(p1,p2,bowOf(l.key))}" stroke="${l.color}" stroke-width="1.5"/>`;}).join("");
+ for(const t of temps)map.appendChild(t);
+ /* 飞行中的线在整体重建后须连续点亮（旧永久线节点被替换、闭包里的 ln 已脱离 DOM）：
+    把飞行实体重新绑到新节点并补 lit，避免"线亮→中途暗一截→到达才重新亮"的闪烁。 */
+ for(const e of liveAnims){if(!e.ln||e.ln.parentNode!==map){
+  const n=map.querySelector(`[data-k="${CSS.escape(e.key)}"]`);
+  if(n){e.rebind(n);n.classList.add("lit");}}}
  applyLanes();renderBadges();renderHud();}
 function lightLink(key){const p=map.querySelector(`[data-k="${CSS.escape(key)}"]`);if(!p)return;
  p.classList.add("lit");setTimeout(()=>p.classList.remove("lit"),1200);}
@@ -598,7 +596,10 @@ addEventListener("keydown",e=>{if(e.key==="Escape"){closeViewer();clearPin();}
 /* ---------- data layer (real AgentLink bus) ---------- */
 const LS_KEY="al_token";let TOKEN="";try{TOKEN=sessionStorage.getItem(LS_KEY)||""}catch(e){}
 const HDR=()=>({"X-Auth-Token":TOKEN});
-async function J(u){const r=await fetch(u,{headers:HDR()});
+async function J(u){const c=new AbortController(),tm=setTimeout(()=>c.abort(),8000);let r;
+ /* R-fix（10-17）：半死连接下 fetch 无超时会永远挂住，polling 恒 true、后续所有 poll 直接 return——
+    新消息永不连线、页面死卡到手动刷新。8s abort 让卡死的轮询下轮自愈。 */
+ try{r=await fetch(u,{headers:HDR(),signal:c.signal})}finally{clearTimeout(tm);}
  if(r.status===401)throw new Error("未授权：请先在主控制台页面输入 token（同会话 sessionStorage 共享）");
  if(!r.ok)throw new Error(u+" HTTP "+r.status);return r.json();}
 function setErr(t){const e=document.getElementById("err");if(!e)return;e.style.display=t?"block":"none";e.textContent=t||"";}
@@ -652,7 +653,8 @@ function ghost0(k){const i=k.indexOf("|");return !LIVE_N.has(k.slice(0,i));}
 function mergeAgents(){for(const n of NODES){const mm=MACH[n.id];if(!mm)continue;
  const set=new Set(mm.agents);for(const a of LIVE_A.get(n.id)||[])set.add(a);mm.agents=[...set].sort();}}
 async function loadTopo(){
- if(!TOKEN){try{const r=await fetch("/web/setup");const d=await r.json();
+ if(!TOKEN){try{const _c=new AbortController(),_t=setTimeout(()=>_c.abort(),8000);
+   const r=await fetch("/web/setup",{signal:_c.signal});clearTimeout(_t);const d=await r.json();
    if(d&&d.ok&&d.token){TOKEN=d.token;try{sessionStorage.setItem(LS_KEY,TOKEN)}catch(e){}}}catch(e){}}
  const [st,pr,ag,co]=await Promise.all([J("/v1/status"),J("/v1/peers"),J("/v1/fleet/agents"),J("/v1/colors")]);
  SELF=st.node_id;NAMES={};NODES=[{id:SELF,name:st.name||SELF,online:true,ip:"本机"}];
@@ -702,7 +704,7 @@ async function poll(){if(polling){pollAgain=true;return;}polling=true;
    mergeAgents();}
   await syncWorld();applyHide(); /* world built AFTER msgs registered: agents from history+fleet in one shot */
   renderLinks();renderAllDecks();
- const edge=LIVE&&!paused;const fresh=[];
+ const edge=!paused;const fresh=[];
   for(const tp of TOPICS)for(const m of tp.msgs)if(!KNOWN.has(m.id)){KNOWN.add(m.id);if(edge&&m.abs>=Date.now()-90000&&!epHid(m.f)&&!epHid(m.to)&&!ghost(m.f)&&!ghost(m.to))fresh.push([tp,m]);}
   /* R1（10-17 第十轮）：flyIn 移到 renderLinks 之后——临时链路不再被重建清掉，
    永久链路已存在时直接点亮；每轮最多 8 个粒子，超预算只做徽章 ping；
@@ -710,13 +712,26 @@ async function poll(){if(polling){pollAgain=true;return;}polling=true;
   if(fresh.length>60){for(let i=0;i<Math.min(fresh.length,16);i++)deliver(fresh[i][1].to);}
   else{let budget=8;for(const [tp,m] of fresh){if(budget-->0)flyIn(tp,m);else deliver(m.to);}}
  }catch(e){setErr(String(e.message||e));}
- finally{polling=false;if(pollAgain){pollAgain=false;poll();}}}
+ finally{flushLateLit();restoreHov();polling=false;if(pollAgain){pollAgain=false;poll();}}}
 function worldSig(){let s="";for(const m in MACH)s+=m+"|"+MACH[m].lab+"|"+MACH[m].ip+"|"+MACH[m].agents.join(",")+";";return s;}
 async function syncWorld(){const sg=worldSig();if(sg===WSIG)return;WSIG=sg;
- if(Object.keys(STA).length){stageEl.innerHTML="";
+ if(Object.keys(STA).length){
+  /* R-fix（10-17）：整体换 DOM 会销毁鼠标下的胶囊/卡组，新元素对静止光标不会自发补发 pointerenter——
+     悬停断线断卡直到移动鼠标或刷新。快照悬停实体与卡组锚点，poll 尾部 restoreHov 补发；
+     飞行中粒子改走 cancelLiveAnims(false) 非静默取消，重建后由 flushLateLit 补放闪光。 */
+  hovPrev=null;
+  if(hovAgt)hovPrev={k:hovAgt,isSta:false,an:dwAnchor[hovAgt]?{x:dwAnchor[hovAgt].x,y:dwAnchor[hovAgt].y}:null};
+  else if(hovSta){const kk=a2k([hovSta,"@node"]);hovPrev={k:kk,isSta:true,an:dwAnchor[kk]?{x:dwAnchor[kk].x,y:dwAnchor[kk].y}:null};}
+  stageEl.innerHTML="";
   for(const o of[dwraps,deckOpen,hideTimers,opentomb,dwAnchor,agtEl,staEl])for(const k in o)delete o[k];
-  hovAgt=hovSta=gTopic=gOwnerK=pinC=null;cancelLiveAnims();if(VT)closeViewer();}
+  hovAgt=hovSta=gTopic=gOwnerK=pinC=null;cancelLiveAnims(false);if(VT)closeViewer();}
  initPos();buildWorld();placeWorld();}
+let hovPrev=null;
+function restoreHov(){const p=hovPrev;hovPrev=null;if(!p)return;
+ const dw=dwraps[p.k];if(!dw)return;
+ if(p.an&&Math.hypot(CUR.x-p.an.x,CUR.y-p.an.y)>320)return;
+ if(p.isSta)hovSta=p.k.split("|")[0];else hovAgt=p.k;
+ reveal(p.k);applyLanes();}
 function renderLegend(){const el=document.getElementById("legend");if(!el)return;const seen={};
  for(const m in MACH)for(const a of MACH[m].agents)if(!(a in seen))seen[a]=agCol(m,a);
  const nrow=Object.keys(MACH).filter(m=>m!=="*").map(m=>`<span class="lgi${hideNodes.has(m)?" off":""}" data-t="n" data-k="${esc(m)}"><span class="dotl" style="background:${staCol(m)}"></span>${esc(nmOf(m))}</span>`).join("");
@@ -724,7 +739,11 @@ function renderLegend(){const el=document.getElementById("legend");if(!el)return
  el.innerHTML=`<div class="lgrow"><span class="lgsec">节点</span>${nrow}</div><div class="lgrow"><span class="lgsec">Agent</span>${arow}</div>`;
  el.querySelectorAll(".lgi").forEach(s=>{s.onclick=()=>{const set=s.dataset.t==="n"?hideNodes:hideAgt,k=s.dataset.k;
   if(set.has(k))set.delete(k);else set.add(k);saveHide();applyHide();};});}
-function applyHide(){renderLegend();cancelLiveAnims();
+function applyHide(){renderLegend();
+ /* R-fix（10-17）：原来每轮 poll 无条件 cancelLiveAnims()——poke 400ms 快轮询正好落在 1.7s 飞行窗口内，
+    粒子被绞杀、连线永远不亮，且消息已入 KNOWN 不再重飞，只能刷新（清 KNOWN）才看得见——就是"新消息没有连线"。
+    现在只静默取消命中隐藏/幽灵端点的飞行，其余任其飞完。 */
+ for(const e of liveAnims.slice())if(epHid(e.f)||epHid(e.to)||ghost(e.f)||ghost(e.to))e.cancel(true);
  for(const m in staEl){const h=hideNodes.has(m);staEl[m].classList.toggle("hid",h);
   const w=dwraps[a2k([m,"@node"])];if(h&&w){w.style.display="none";w.dataset.vis="0";deckOpen[a2k([m,"@node"])]=false;}}
  for(const k in agtEl){const h=epHid(k);agtEl[k].classList.toggle("hid",h);
@@ -734,11 +753,17 @@ function applyHide(){renderLegend();cancelLiveAnims();
 /* ---------- live flight: only real new messages animate ---------- */
 let paused=false;
 const liveAnims=[];
-function cancelLiveAnims(){while(liveAnims.length){try{liveAnims.pop()();}catch(e){}}}
+/* R-fix（10-17）：取消飞行粒子分两种语义——silent（切时间窗/暂停/清理，规格要求静默取消，不补）；
+   非 silent（名单重建，消息是真的）只停粒子，进 lateLit 队列，由 poll 尾部 flushLateLit 补放连线闪光+徽标 ping。 */
+let lateLit=[];
+function cancelLiveAnims(silent){while(liveAnims.length){try{liveAnims[liveAnims.length-1].cancel(silent!==false);}catch(e){liveAnims.pop();}}}
 function flashDot(k,cls){const el=agtEl[k];if(!el)return;const f=el.querySelector("."+cls);
  if(!f)return;f.classList.remove("fire");void f.offsetWidth;f.classList.add("fire");}
 function deliver(k){const el=agtEl[k];if(!el)return;const b=el.querySelector(".badge");
  b.classList.remove("ping");void b.offsetWidth;b.classList.add("ping");}
+/* R-fix：名单重建（非静默取消）攒下的迟到闪光——重建与 renderLinks 之后统一补放，消息不再"无声吞线" */
+function flushLateLit(){if(!lateLit.length)return;const q=lateLit;lateLit=[];
+ for(const e of q){lightLink(e.key);deliver(e.to);}}
 function flyIn(tp,msg){const f=msg.f,to=msg.to;
  const key=f+"=>"+to+"#"+tp.id;
  let ln=map.querySelector(`[data-k="${CSS.escape(key)}"]`);
@@ -746,12 +771,16 @@ function flyIn(tp,msg){const f=msg.f,to=msg.to;
   ln.setAttribute("class","lk temp");ln.setAttribute("data-k",key);ln.setAttribute("stroke",tp.color);
   ln.setAttribute("stroke-width","1.8");ln.setAttribute("opacity",".4");
   ln.setAttribute("d",chanD(agPos(f),agPos(to),bowOf(key)));map.appendChild(ln);}
- let dead=false;
- liveAnims.push(()=>{dead=true;ln.remove();if(ph)ph.remove();});
+ let dead=false,done=false,ph;
+ const ent={key,f,to,ln,rebind(n){ln=n;ent.ln=n},cancel(silent){if(done||dead)return;dead=true;ln.remove();if(ph)ph.remove();
+  const i=liveAnims.indexOf(ent);if(i>=0)liveAnims.splice(i,1);
+  if(!silent)lateLit.push(ent);}};
+ liveAnims.push(ent);
  ln.classList.add("lit");flashDot(f,"flash");
- const ph=document.createElement("div");ph.className="ph";ph.style.color=tp.color;stageEl.appendChild(ph);
- const t0=performance.now(),dur=1700;let done=false;
+ ph=document.createElement("div");ph.className="ph";ph.style.color=tp.color;stageEl.appendChild(ph);
+ const t0=performance.now(),dur=1700;
  function arrive(){if(done||dead)return;done=true;ph.remove();ln.remove();
+  const i=liveAnims.indexOf(ent);if(i>=0)liveAnims.splice(i,1);
   renderLinks();buildDeck(to);
   const fl=map.querySelector(`[data-k="${CSS.escape(key)}"]`);
   if(fl){fl.classList.add("lit");setTimeout(()=>fl.classList.remove("lit"),1200);}
@@ -762,37 +791,11 @@ function flyIn(tp,msg){const f=msg.f,to=msg.to;
   if(u<1)requestAnimationFrame(step);else arrive();})(t0);
  setTimeout(arrive,4500);}
 /* ---------- bar ---------- */
+/* R12（10-17 第十二轮）：实时按钮/时段面板/区间文本废除——只剩实时视图与窗口长度滑杆（最大 1 小时）。 */
 const winEl=document.getElementById("win");
-function liveUI(on){const b=document.getElementById("bLive");b.classList.toggle("on",on);b.textContent=on?"实时":"时段";}
-function setLive(on){LIVE=on;liveUI(on);if(on){mFrom=mTo=0;document.getElementById("mPop").classList.remove("show");}
- updateRange();renderAllDecks();renderLinks();}
-winEl.oninput=()=>{if(!LIVE)setLive(true);winS=+winEl.value;
+winEl.oninput=()=>{winS=+winEl.value;
  document.getElementById("winv").textContent=winS%60===0?(winS/60)+"min":winS+"s";
- updateRange();cancelLiveAnims();renderAllDecks();renderLinks();};
-function fmtT(ms){const d=new Date(ms),n=new Date();const hm=String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");
- return (d.getDate()===n.getDate()&&d.getMonth()===n.getMonth())?hm:(d.getMonth()+1)+"-"+String(d.getDate()).padStart(2,"0")+" "+hm;}
-function updateRange(){const b=wBounds();
- document.getElementById("rng").textContent=fmtT(b[0])+" — "+fmtT(b[1])+(LIVE?" 实时":" 时段");}
-updateRange();
-/* R1（10-17 第十轮）：手工时段 = 绝对区间冻结显示（数据仍每轮刷新，只展示区间内条目）；
-   回到"实时"即恢复跟随当前时间。默认预填最近 10 分钟，打开即用。 */
-function pad2(n){return String(n).padStart(2,"0")}
-function dtv(id){const v=document.getElementById(id).value;if(!v)return NaN;return Date.parse(v);}
-{const d=new Date(),e=new Date(d.getTime()-600000),mk=x=>x.getFullYear()+"-"+pad2(x.getMonth()+1)+"-"+pad2(x.getDate())+"T"+pad2(x.getHours())+":"+pad2(x.getMinutes());
- document.getElementById("mFrom").value=mk(e);document.getElementById("mTo").value=mk(d);}
-/* R7：按钮两态切换——实时→时段（弹窗打开在按钮上方，预填最近10分钟）；时段→实时（弹窗关闭）。
-   弹窗内改时间即时生效（无「应用时段」按钮）；点弹窗外只收弹窗、保持时段态。 */
-function applyManual(){const a=dtv("mFrom"),b=dtv("mTo");
- if(!(a<b)){setErr("时段无效：起始须早于结束");return false;}setErr("");
- mFrom=a;mTo=b;return true;}
-function renderManual(){updateRange();cancelLiveAnims();renderAllDecks();renderLinks();}
-document.getElementById("bLive").onclick=()=>{const pop=document.getElementById("mPop");
- if(LIVE){applyManual();LIVE=false;liveUI(false);pop.classList.add("show");renderManual();}
- else setLive(true);};
-document.getElementById("mFrom").onchange=document.getElementById("mTo").onchange=()=>{
- if(!LIVE&&applyManual())renderManual();};
-document.addEventListener("pointerdown",e=>{const pop=document.getElementById("mPop");
- if(pop.classList.contains("show")&&!pop.contains(e.target)&&e.target.id!=="bLive")pop.classList.remove("show");},true);
+ cancelLiveAnims();renderAllDecks();renderLinks();};
 // 字体滑条已移除：恒用 CSS 默认 --fs:1，并清掉历史 localStorage 残留，避免旧缩放值悄悄生效
 try{localStorage.removeItem("starfs");document.documentElement.style.removeProperty("--fs");}catch(e){}
 document.getElementById("bPause").onclick=e=>{paused=!paused;if(paused)cancelLiveAnims();
@@ -872,7 +875,7 @@ function sizeUp(){const vp=viewport(),nw=vp[0],nh=vp[1];
 function buildStars(){const sf=document.getElementById("starfield");
  for(let i=0;i<110;i++){const t=document.createElement("i");const sz=1+Math.random()*1.8;
   t.style.cssText=`left:${Math.random()*100}%;top:${Math.random()*100}%;width:${sz}px;height:${sz}px;--d:${(2+Math.random()*4).toFixed(1)}s;animation-delay:${(-Math.random()*5).toFixed(1)}s`;sf.appendChild(t);}}
-async function boot(){buildStars();updateRange();await poll();}
+async function boot(){buildStars();await poll();}
 addEventListener("resize",sizeUp);
 addEventListener("resize",posGNav); /* R2：窗口尺寸变了，‹ › 的外贴坐标要重算（世界布局由 sizeUp 与下轮 poll 处理） */
 /* R1（10-17 第十轮）：实时通道——/v1/ws 不带 client 即观察者连接（服务端本轮起放行本机全部
@@ -891,7 +894,7 @@ function connectWS(){if(!TOKEN){setTimeout(connectWS,2000);return;}
 addEventListener("message",e=>{if(e.data&&e.data.al==="poke")pokePoll();});
 boot().then(connectWS);setInterval(poll,5000);
 /* 诊断快照：外部检查器可读（不影响任何行为；WS 状态机排障用） */
-window.__al={get wsok(){return WSOK},get live(){return LIVE},get polling(){return polling},get tok4(){return (TOKEN||"").slice(0,4)}};
+window.__al={get wsok(){return WSOK},get live(){return true},/* R12：时段模式废除，恒为实时 */get polling(){return polling},get tok4(){return (TOKEN||"").slice(0,4)}};
 
 </script>
 </body>
