@@ -18,6 +18,7 @@ mod redact;
 mod router;
 mod store;
 mod trace;
+mod wizard;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -130,6 +131,18 @@ enum Command {
     Apply {
         #[command(flatten)]
         opts: cli::ApplyArgs,
+    },
+    /// 首次运行向导（v0.5 收官）：角色/名称/端口/安全模式 → 写配置 → 可选启动。
+    /// 裸 `agentlink` 在无配置且交互终端时会自动进入；`--yes` 非交互写默认值。
+    Setup {
+        /// 不提问，直接写默认配置（适合脚本/CI）。
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 自检：向总线所有已知节点的 `__node__` 发 hello 探针，聚合应答一张表。
+    Hello {
+        #[command(flatten)]
+        opts: cli::HelloArgs,
     },
 }
 
@@ -309,7 +322,16 @@ async fn main() -> Result<()> {
         Some(Command::Apply { opts }) => {
             cli::apply(opts, cli.url.as_deref(), cli.token.as_deref(), &cli.config).await
         }
+        Some(Command::Setup { yes }) => setup_flow(&cli.config, cli.log_format.clone(), yes).await,
+        Some(Command::Hello { opts }) => {
+            cli::hello(opts, cli.url.as_deref(), cli.token.as_deref(), &cli.config).await
+        }
         None => {
+            // v0.5 收官：裸启动 + 无配置 + 交互终端 → 自动进入首次向导
+            // （Windows 双击 exe 的新机器旅程，不需要先读任何文档）。
+            if !cli.config.exists() && wizard::is_interactive() {
+                return setup_flow(&cli.config, cli.log_format.clone(), false).await;
+            }
             let mut cfg = load_config(&cli.config, false)?;
             if let Some(fmt) = cli.log_format.clone() {
                 cfg.log.format = fmt;
@@ -319,6 +341,62 @@ async fn main() -> Result<()> {
             let cfg_path = cli.config.clone();
             run(cfg, cfg_path, false).await
         }
+    }
+}
+
+/// `agentlink setup` 与裸启动自动向导共用入口（v0.5 收官）。
+/// 只做向导交互 + 配置落盘 + 可选启动；机器身份复用
+/// `generate_preserving_identity` 保留。
+async fn setup_flow(config_path: &Path, log_format: Option<String>, yes: bool) -> Result<()> {
+    let plan = if yes {
+        wizard::WizardPlan {
+            name: None,
+            listen_port: None,
+            cluster_token: None,
+            mode: None,
+            start_now: false,
+        }
+    } else if wizard::is_interactive() {
+        match wizard::run_wizard(config_path, api::VERSION)? {
+            Some(p) => p,
+            // 用户在确认前放弃：未写任何文件，正常退出。
+            None => return Ok(()),
+        }
+    } else {
+        bail!(
+            "非交互终端：请用 `agentlink init` / `agentlink join <TOKEN>`，\n\
+             或 `agentlink setup --yes` 直接写默认配置"
+        );
+    };
+
+    let mut cfg =
+        generate_preserving_identity(config_path, plan.name, plan.cluster_token, plan.mode);
+    if let Some(port) = plan.listen_port {
+        cfg.listen_port = port;
+    }
+    cfg.save(config_path)?;
+    println!("已写入配置: {}", config_path.display());
+    println!("  node_id: {}", cfg.node_id);
+    println!("  name:    {}", cfg.name);
+    println!("  listen:  {}:{}", cfg.local_api.host, cfg.listen_port);
+    if cfg.security.mode == "strict" {
+        println!(
+            "\n其他机器配对: agentlink join {}   （查看令牌: agentlink token）",
+            cfg.security.cluster_token
+        );
+    }
+    println!("节点启动后自检总线连通: agentlink hello");
+
+    if plan.start_now {
+        if let Some(fmt) = log_format {
+            cfg.log.format = fmt;
+        }
+        logging::init(&cfg.log);
+        ensure_dirs(&cfg)?;
+        run(cfg, config_path.to_path_buf(), false).await
+    } else {
+        println!("\n启动节点: agentlink run");
+        Ok(())
     }
 }
 

@@ -290,10 +290,12 @@ async fn handle_text(
     let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
     match action {
-        "hello" => {
+        // v0.5 收官：`__node__` hello 探针是业务帧（type=text，无 auth 字段），
+        // 必须落进底部业务分支交给内核拦截；这里只认握手帧（Hello 必带 auth）。
+        "hello" if value.get("auth").is_some() => {
             let hello: Hello = match serde_json::from_value(value) {
                 Ok(h) => h,
-                Err(_) => return false,
+                Err(_) => return true, // 畸形握手帧：忽略，不断链
             };
             if hello.v > PROTOCOL_VERSION {
                 tracing::warn!(peer_v = hello.v, "conn: unsupported peer protocol version");

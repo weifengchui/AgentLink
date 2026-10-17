@@ -564,6 +564,290 @@ pub async fn apply(
     Ok(())
 }
 
+// ---- hello ------------------------------------------------------------------
+
+/// `agentlink hello` 参数（v0.5 收官：首次安装自检）。
+#[derive(Debug, clap::Args)]
+pub struct HelloArgs {
+    /// 只探测指定节点（node_id 或名称，可重复）；默认=本机自身+全部已知对端
+    #[arg(long = "node")]
+    node: Vec<String>,
+    /// 等待应答的总时长（秒），默认 10
+    #[arg(long, default_value_t = 10)]
+    timeout: u64,
+    /// 输出 JSON（机器可读：{ok,total,pass,nodes:[…]}）
+    #[arg(long)]
+    json: bool,
+    /// 不探测本机自身
+    #[arg(long)]
+    no_self: bool,
+}
+
+struct HelloProbe {
+    node_id: String,
+    name: String,
+    addr: String,
+    online: bool,
+    is_self: bool,
+    /// 已发出探针的 msg_id；发送失败为 None。
+    msg_id: Option<String>,
+    sent: Option<std::time::Instant>,
+    /// 收到的 hello_reply 帧 payload；超时/失败为 None。
+    reply: Option<Value>,
+    rtt_ms: Option<u128>,
+    error: Option<String>,
+}
+
+/// `agentlink hello`：向总线里每个已知节点发一枚 `__node__` hello 探针，
+/// 聚合应答（版本/RTT/在线态），一张表判断"这套安装是否真的通了"。
+/// 纯 local API 消费者（同 get/logs/apply），内核零启动依赖——但要求本机
+/// 节点在跑，否则连接失败即报错。
+pub async fn hello(
+    opts: HelloArgs,
+    url: Option<&str>,
+    token: Option<&str>,
+    config: &Path,
+) -> Result<()> {
+    let api = Api::connect(url, token, config).await?;
+    let health = api.get("/v1/health", &[]).await?;
+    let self_id = s(&health, "node_id");
+
+    // 目标清单：自身 + /v1/peers；--node 过滤（node_id 前缀或名称精确）。
+    let peers = api.get("/v1/peers", &[]).await?;
+    let mut probes: Vec<HelloProbe> = Vec::new();
+    if !opts.no_self && target_selected(&opts.node, &self_id, &s(&health, "name")) {
+        probes.push(HelloProbe {
+            node_id: self_id.clone(),
+            name: s(&health, "name"),
+            addr: api.base.clone(),
+            online: true,
+            is_self: true,
+            msg_id: None,
+            sent: None,
+            reply: None,
+            rtt_ms: None,
+            error: None,
+        });
+    }
+    for p in peers
+        .get("peers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let (id, name) = (s(&p, "node_id"), s(&p, "name"));
+        if !target_selected(&opts.node, &id, &name) {
+            continue;
+        }
+        probes.push(HelloProbe {
+            node_id: id,
+            name,
+            addr: s_or(&p, "addr", "-"),
+            online: p.get("online").and_then(Value::as_bool) == Some(true),
+            is_self: false,
+            msg_id: None,
+            sent: None,
+            reply: None,
+            rtt_ms: None,
+            error: None,
+        });
+    }
+    if probes.is_empty() {
+        println!("(没有可探测的节点：总线里只有自己，先 `agentlink join` 或在另一台机器起节点)");
+        return Ok(());
+    }
+
+    // 熔断提示：hello_reply 是业务帧，lockdown 期间会被出口拦截。
+    let lockdown_on = api
+        .get("/v1/lockdown", &[])
+        .await
+        .map(|b| b.get("on").and_then(Value::as_bool) == Some(true))
+        .unwrap_or(false);
+
+    // 事件水位基线：只看发出探针之后到达的 hello_reply。
+    let ev0 = api.get("/v1/events", &[("limit", "1".into())]).await?;
+    let mut since = ev0.get("next_seq").and_then(Value::as_u64).unwrap_or(0);
+
+    // 发探针（离线对端照常发：入离线队列，多半超时，表里如实呈现）。
+    for pr in probes.iter_mut() {
+        let body = json!({
+            "to": pr.node_id,
+            "type": "text",
+            "action": "hello",
+            "from_agent": "cli",
+            "to_agent": crate::router::HELLO_AGENT,
+            "payload": { "probe": pr.node_id },
+        });
+        let sent_at = std::time::Instant::now();
+        match api.post("/v1/send", &body).await {
+            Ok(resp) => {
+                pr.msg_id = Some(s(&resp, "msg_id"));
+                pr.sent = Some(sent_at);
+                if pr.msg_id.is_none() {
+                    pr.error = Some("应答缺少 msg_id".to_string());
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                pr.error = Some(if msg.contains("lockdown") {
+                    "熔断中：业务帧被本机出口拦截".to_string()
+                } else {
+                    truncate_chars(&msg, 60)
+                });
+            }
+        }
+    }
+
+    // 轮询事件环直到全部命中或超时。
+    let deadline = std::time::Instant::now() + Duration::from_secs(opts.timeout.max(1));
+    loop {
+        if probes
+            .iter()
+            .all(|p| p.reply.is_some() || p.msg_id.is_none())
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let body = api
+            .get(
+                "/v1/events",
+                &[
+                    ("since", since.to_string()),
+                    ("types", "text".into()),
+                    ("limit", "1000".into()),
+                ],
+            )
+            .await?;
+        if let Some(arr) = body.get("events").and_then(Value::as_array) {
+            for ev in arr {
+                let f = ev.get("frame").cloned().unwrap_or(json!({}));
+                if f.get("action").and_then(Value::as_str) != Some("hello_reply") {
+                    continue;
+                }
+                let rt = f.get("reply_to").and_then(Value::as_str);
+                let Some(probe_id) = f
+                    .get("payload")
+                    .and_then(|p| p.get("probe"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                for pr in probes.iter_mut() {
+                    let hit = rt.map(|r| Some(r) == pr.msg_id.as_deref()).unwrap_or(false)
+                        || probe_id == pr.node_id;
+                    if pr.reply.is_none() && pr.msg_id.is_some() && hit {
+                        pr.reply = f.get("payload").cloned();
+                        pr.rtt_ms = pr.sent.map(|t| t.elapsed().as_millis());
+                        break;
+                    }
+                }
+            }
+        }
+        since = body
+            .get("next_seq")
+            .and_then(Value::as_u64)
+            .unwrap_or(since);
+    }
+
+    let pass = probes.iter().filter(|p| p.reply.is_some()).count();
+    let total = probes.len();
+
+    if opts.json {
+        let nodes: Vec<Value> = probes
+            .iter()
+            .map(|p| {
+                json!({
+                    "node_id": p.node_id,
+                    "name": p.name,
+                    "addr": p.addr,
+                    "self": p.is_self,
+                    "online": p.online,
+                    "status": if p.reply.is_some() { "ok" } else { "fail" },
+                    "rtt_ms": p.rtt_ms,
+                    "version": p.reply.as_ref().and_then(|r| r.get("version")).and_then(Value::as_str),
+                    "protocol": p.reply.as_ref().and_then(|r| r.get("protocol")),
+                    "uptime_seconds": p.reply.as_ref().and_then(|r| r.get("uptime_seconds")),
+                    "error": p.error,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": pass == total, "pass": pass, "total": total,
+                "lockdown": lockdown_on, "nodes": nodes,
+            }))?
+        );
+    } else {
+        if lockdown_on {
+            println!("(提示：本机熔断开启中，hello_reply 属业务帧会被拦截，超时属预期)");
+        }
+        let rows: Vec<Vec<String>> = probes
+            .iter()
+            .map(|p| {
+                let (status, rtt) = match (&p.reply, p.rtt_ms) {
+                    (Some(_), ms) => ("OK".to_string(), format!("{}ms", ms.unwrap_or(0))),
+                    (None, _) => (
+                        "超时".to_string(),
+                        if p.msg_id.is_some() && !p.online && !p.is_self {
+                            "(离线，已入离线队列)".to_string()
+                        } else {
+                            String::new()
+                        },
+                    ),
+                };
+                vec![
+                    status,
+                    if p.is_self {
+                        format!("{}(本机)", p.name)
+                    } else {
+                        p.name.clone()
+                    },
+                    short_id(&p.node_id).to_string(),
+                    rtt,
+                    p.reply
+                        .as_ref()
+                        .and_then(|r| r.get("version"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("-")
+                        .to_string(),
+                    p.error.clone().unwrap_or_default(),
+                ]
+            })
+            .collect();
+        render_table(&["状态", "名称", "node_id", "RTT", "版本", "备注"], &rows);
+    }
+
+    // --json 模式下 stdout 必须保持纯 JSON（供脚本消费），摘要走 stderr；退出码表达成败。
+    if opts.json {
+        if pass != total {
+            eprintln!("hello 自检未过：{}/{} 节点应答", pass, total);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if pass == total {
+        println!("hello 自检通过：{}/{} 节点应答", pass, total);
+        Ok(())
+    } else {
+        println!("hello 自检未过：{}/{} 节点应答", pass, total);
+        std::process::exit(1);
+    }
+}
+
+/// --node 过滤：空=全选；node_id 全匹配或前缀≥4 位、名称精确匹配。
+fn target_selected(filter: &[String], node_id: &str, name: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    filter
+        .iter()
+        .any(|f| node_id == f || (f.len() >= 4 && node_id.starts_with(f.as_str())) || name == f)
+}
+
 // ---- 表格渲染 ---------------------------------------------------------------
 
 fn s(v: &Value, key: &str) -> String {

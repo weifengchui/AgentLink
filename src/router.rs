@@ -146,9 +146,62 @@ pub struct AgentRecord {
 mod tests {
     use super::{
         cap_matches, lockdown_blocks_frame, tasks_projection, Config, Envelope, HistoryEntry,
-        Router, TaskFilter,
+        Router, TaskFilter, HELLO_AGENT,
     };
     use serde_json::json;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn router_hello_self_reply() {
+        // v0.5 收官：__node__ hello 由内核自应答，不投递本地 agent、不进 inbox。
+        let mut cfg = Config::generate(
+            Some("router-hello-test".to_string()),
+            Some("tok".to_string()),
+            Some("open".to_string()),
+        );
+        cfg.data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("router-hello-test");
+        cfg.history.enabled = true;
+        cfg.history.file = String::new();
+        cfg.delivery.persist = false;
+        let node = cfg.node_id.clone();
+        let r = Arc::new(Router::new(&cfg));
+
+        let req = Envelope::business(
+            &node,
+            &node,
+            "text",
+            "hello",
+            json!({ "probe": "p1" }),
+            None,
+            None,
+            Some("cli".to_string()),
+            Some(HELLO_AGENT.to_string()),
+        );
+        let msg_id = req.msg_id.clone();
+        let dup = req.clone();
+        r.send(req).await.unwrap();
+        // 重复帧（同 msg_id）不应产生第二次应答。
+        let mut dup = dup;
+        r.handle_incoming(&mut dup).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let h = r.history();
+        let replies: Vec<_> = h.iter().filter(|e| e.action == "hello_reply").collect();
+        assert_eq!(replies.len(), 1, "hello_reply 应恰好一条: {h:?}");
+        let reply = &replies[0];
+        assert_eq!(reply.reply_to.as_deref(), Some(msg_id.as_str()));
+        assert_eq!(reply.from_agent.as_deref(), Some(HELLO_AGENT));
+        assert_eq!(reply.to_agent.as_deref(), Some("cli"));
+        assert_eq!(reply.payload["probe"], json!("p1"));
+        assert_eq!(reply.payload["name"], json!("router-hello-test"));
+        assert!(reply.payload["version"].is_string());
+        assert!(reply.payload["protocol"].is_number());
+        // hello 帧与应答都留审计，但都不进 inbox。
+        assert!(h.iter().any(|e| e.action == "hello" && e.direction == "in"));
+        assert_eq!(r.inbox_len(), 0);
+    }
 
     fn task_entry(seq: u64, payload: serde_json::Value, from: &str, to: &str) -> HistoryEntry {
         HistoryEntry {
@@ -542,6 +595,11 @@ pub struct HistoryEntry {
     pub blocked: Option<bool>,
 }
 
+/// Reserved agent id for the node's built-in self-responder (v0.5 收官：
+/// hello-world 自检). Frames addressed to `__node__` are answered by the
+/// kernel itself and never reach local agents or the inbox.
+pub const HELLO_AGENT: &str = "__node__";
+
 /// Incremental event-stream read result for `/v1/events` (v0.5 §1).
 #[derive(Debug)]
 pub struct EventsView {
@@ -882,6 +940,8 @@ pub struct Router {
     blocked_out: AtomicU64,
     /// 本机入站侧（WS 帧到达本节点后被拦）计数。
     blocked_in: AtomicU64,
+    /// 进程启动时刻——`__node__` hello 应答携带 uptime（v0.5 收官）。
+    started: Instant,
 }
 
 impl Router {
@@ -985,6 +1045,7 @@ impl Router {
             lockdown: AtomicBool::new(false),
             blocked_out: AtomicU64::new(0),
             blocked_in: AtomicU64::new(0),
+            started: Instant::now(),
         }
     }
 
@@ -1452,6 +1513,29 @@ impl Router {
             );
             return false;
         }
+        // v0.5 收官（§3.1/§3.4）：hello-world 自检。发往保留 agent
+        // `__node__` 的 hello 帧由内核自身应答；内核发出的 hello_reply 同样
+        // 由内核消费——两向都不投递本地 agent、不进 inbox/local_pending
+        // （CLI/agent 经 /v1/events 读审计）。type 走业务线 `text`（协议
+        // §3.1，与节点握手的 ctrl/hello 以 type 区分）；熔断检查之前拦截——
+        // lockdown 期间 hello_reply 出站照常走 send()（业务帧被拦属预期）。
+        let hello_in = env.to_agent.as_deref() == Some(HELLO_AGENT);
+        let hello_reply_in =
+            env.action == "hello_reply" && env.from_agent.as_deref() == Some(HELLO_AGENT);
+        if (hello_in || hello_reply_in) && env.kind != "ctrl" && env.kind != "event" {
+            let is_new = {
+                let mut dedup = self.dedup.lock().unwrap();
+                dedup.record(&env.msg_id)
+            };
+            if is_new {
+                self.j(store::Rec::add_id("seen", &env.msg_id));
+                self.record_history(env, "in", &env.from);
+                if env.action == "hello" {
+                    self.hello_reply(env).await;
+                }
+            }
+            return true;
+        }
         // v0.5 §4.5 薄档熔断：入站业务帧同样拦截（不投递给本地 agent、
         // 不记录为已送达）；返回 false 但连接层的 ack 照常——发送方据此
         // 停止重发，被拦帧恢复后不补投。控制面帧照常。
@@ -1543,6 +1627,42 @@ impl Router {
     }
 
     // ---- acks ---------------------------------------------------------------
+
+    /// v0.5 收官：构造并发送 `__node__` hello 应答帧。远端请求走正常
+    /// `send()`（strict 签名、trace 续链、history 记账免费获得）；本机自
+    /// 探针则直接记账回环——若仍调 send() 会形成 async 递归（E0733），
+    /// 且应答帧本就被 handle_incoming 的 hello_reply_in 分支消费，
+    /// 绕开投递路径与事件环记账等效、更干净。
+    async fn hello_reply(&self, req: &Envelope) {
+        let payload = serde_json::json!({
+            "node_id": self.cfg.node_id,
+            "name": self.cfg.name,
+            "version": crate::api::VERSION,
+            "protocol": PROTOCOL_VERSION,
+            "uptime_seconds": self.started.elapsed().as_secs(),
+            "probe": req.payload.get("probe").cloned().unwrap_or(serde_json::Value::Null),
+        });
+        let reply = Envelope::business(
+            &self.cfg.node_id,
+            &req.from,
+            "text",
+            "hello_reply",
+            payload,
+            Some(30),
+            Some(req.msg_id.clone()),
+            Some(HELLO_AGENT.to_string()),
+            req.from_agent.clone(),
+        );
+        if reply.to == self.cfg.node_id {
+            self.record_history(&reply, "in", &self.cfg.node_id);
+            return;
+        }
+        // send→handle_incoming→hello_reply→send 是编译期递归环，本边必须
+        // 装箱断链（E0733）；仅远端请求走到这里，热路径无额外开销。
+        if let Err(e) = Box::pin(self.send(reply)).await {
+            tracing::debug!(error = %e, "router: hello_reply send failed (lockdown or offline)");
+        }
+    }
 
     /// Remote ACKed one of our point-to-point messages.
     pub fn on_ack(&self, msg_id: &str) {
