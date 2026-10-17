@@ -24,6 +24,8 @@ use crate::store;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const INBOX_MAX: usize = 1024;
 const OFFLINE_MAX_PER_PEER: usize = 1024;
+/// v0.5 §7.1: bound of the msg_id -> trace_id continuation map.
+const TRACE_MAP_CAP: usize = 8192;
 const TS_SKEW_SECONDS: i64 = 60;
 const LOCAL_PENDING_TTL: Duration = Duration::from_secs(3600);
 
@@ -159,6 +161,7 @@ mod tests {
             action: "send".to_string(),
             seq,
             reply_to: None,
+            trace_id: None,
             payload,
         }
     }
@@ -391,6 +394,10 @@ pub struct HistoryEntry {
     /// history lines written before v0.4.16 (serde default = None).
     #[serde(default)]
     pub reply_to: Option<String>,
+    /// v0.5 §7.1: trace id of the message (absent for lines written by
+    /// older nodes and for events without a message context).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     #[serde(default)]
     pub payload: serde_json::Value,
 }
@@ -660,6 +667,9 @@ pub struct Router {
     /// Observer-side payload sanitizer (v0.5 §2). Applied when history
     /// entries are built — never on the delivery path.
     redactor: crate::redact::Redactor,
+    /// v0.5 §7.1: msg_id -> trace_id continuation map (bounded; a miss only
+    /// degrades to deriving a fresh trace id, never to data loss).
+    trace_map: Mutex<crate::trace::TraceMap>,
     /// Append-only journal backing inbox/offline/pending/local/seen.
     journal: store::Journal,
     journal_ops: AtomicUsize,
@@ -760,6 +770,7 @@ impl Router {
             next_seq: AtomicU64::new(seed_seq),
             evicted: AtomicU64::new(0),
             redactor: crate::redact::Redactor::from_config(&cfg.redact),
+            trace_map: Mutex::new(crate::trace::TraceMap::new(TRACE_MAP_CAP)),
             journal,
             journal_ops: AtomicUsize::new(0),
             // Rewrite the journal from live state on the first maintenance
@@ -899,6 +910,7 @@ impl Router {
             action: env.action,
             seq: 0,
             reply_to: env.reply_to,
+            trace_id: env.trace_id,
             payload: env.payload,
         })
     }
@@ -976,6 +988,14 @@ impl Router {
     pub fn register_peer(&self, sink: PeerSink) {
         self.registry.insert(sink.clone());
         tracing::info!(peer = %sink.name, node_id = %sink.node_id, addr = %sink.addr, "router: peer registered");
+        // v0.5 §7.1 structured twin (debug level: default text output of the
+        // existing fleet stays byte-identical). `from` carries the peer node.
+        tracing::debug!(
+            trace_id = "-", correlation_id = "-", msg_id = "-",
+            from = %sink.node_id, to = "-", from_agent = "-", to_agent = "-",
+            node_id = %self.cfg.node_id, topic = "peer",
+            "al.peer.up"
+        );
         let ev = Envelope::event(&self.cfg.node_id, "join", &sink.node_id, &sink.name);
         let _ = self.events.send(ev);
     }
@@ -992,6 +1012,12 @@ impl Router {
             .unwrap_or_default();
         if removed {
             tracing::info!(node_id, agents = cached.len(), "router: peer unregistered");
+            tracing::debug!(
+                trace_id = "-", correlation_id = "-", msg_id = "-",
+                from = %node_id, to = "-", from_agent = "-", to_agent = "-",
+                node_id = %self.cfg.node_id, topic = "peer",
+                "al.peer.down"
+            );
             let ev = Envelope::event(&self.cfg.node_id, "leave", node_id, node_id);
             let _ = self.events.send(ev);
         }
@@ -1006,6 +1032,18 @@ impl Router {
 
     // ---- outbound (local agent -> network) ---------------------------------
 
+    /// Resolve the trace id for an envelope and inject it into the frame
+    /// metadata (`trace_id`), so forwarding and local delivery carry it on
+    /// to downstream agents (v0.5 §7.1). Idempotent: an already-injected
+    /// envelope simply keeps its id. Injection is protocol-safe because the
+    /// envelope HMAC covers `from|msg_id|ts` only and serde ignores unknown
+    /// fields on read, so legacy peers still verify and route the frame.
+    fn trace_for(&self, env: &mut Envelope) -> String {
+        let t = crate::trace::resolve_and_remember(&mut self.trace_map.lock().unwrap(), env);
+        env.trace_id = Some(t.clone());
+        t
+    }
+
     /// Send an envelope addressed to a specific peer or `"*"`.
     pub async fn send(&self, mut env: Envelope) -> anyhow::Result<String> {
         env.v = PROTOCOL_VERSION;
@@ -1013,6 +1051,16 @@ impl Router {
         if env.msg_id.is_empty() {
             return Err(anyhow::anyhow!("envelope needs a msg_id"));
         }
+        // Trace metadata is resolved *before* signing; the signature input
+        // does not include it, so strict-mode verification is unaffected.
+        let trace_id = self.trace_for(&mut env);
+        crate::trace::log_event(
+            tracing::Level::DEBUG,
+            "message.send",
+            &self.cfg.node_id,
+            &trace_id,
+            Some(&env),
+        );
         if self.cfg.security.mode == "strict" {
             let sig = envelope_sign(
                 &self.cfg.security.cluster_token,
@@ -1025,7 +1073,7 @@ impl Router {
 
         // Local delivery: addressed to this very node (agents on this machine).
         if env.to == self.cfg.node_id {
-            let _ = self.handle_incoming(&env).await;
+            let _ = self.handle_incoming(&mut env).await;
             return Ok(env.msg_id);
         }
 
@@ -1035,7 +1083,15 @@ impl Router {
             self.record_history(&env, "out", "*");
             let sinks: Vec<PeerSink> = self.registry.all();
             for sink in sinks {
-                self.send_raw(&sink, &env).await;
+                if self.send_raw(&sink, &env).await {
+                    crate::trace::log_event(
+                        tracing::Level::DEBUG,
+                        "message.forward",
+                        &self.cfg.node_id,
+                        &trace_id,
+                        Some(&env),
+                    );
+                }
             }
             // Deliver to our own local subscribers too.
             self.deliver_local(env.clone()).await;
@@ -1046,6 +1102,13 @@ impl Router {
         match self.registry.get(&env.to) {
             Some(sink) => {
                 if self.send_raw(&sink, &env).await {
+                    crate::trace::log_event(
+                        tracing::Level::DEBUG,
+                        "message.forward",
+                        &self.cfg.node_id,
+                        &trace_id,
+                        Some(&env),
+                    );
                     self.register_pending(&env, 0);
                 } else {
                     self.enqueue_offline(&env).await;
@@ -1115,11 +1178,24 @@ impl Router {
     // ---- inbound (network -> local) ----------------------------------------
 
     /// Record an incoming envelope. Returns `true` when first seen.
-    pub async fn handle_incoming(&self, env: &Envelope) -> bool {
+    pub async fn handle_incoming(&self, env: &mut Envelope) -> bool {
         if !self.verify_incoming(env) {
             tracing::warn!(msg_id = %env.msg_id, from = %env.from, "router: incoming rejected (signature or timestamp)");
+            let trace_id = crate::trace::dash(&env.trace_id);
+            crate::trace::log_event(
+                tracing::Level::DEBUG,
+                "message.reject",
+                &self.cfg.node_id,
+                &trace_id,
+                Some(env),
+            );
             return false;
         }
+        // Continue or start the trace chain for this inbound frame. A frame
+        // from a legacy upstream may arrive without trace_id: we derive or
+        // map it here, and the injected value rides along into history and
+        // local delivery (downstream agents can echo it back).
+        let trace_id = self.trace_for(env);
         let is_new = {
             let mut dedup = self.dedup.lock().unwrap();
             dedup.record(&env.msg_id)
@@ -1135,6 +1211,13 @@ impl Router {
                     .insert(env.msg_id.clone(), (Instant::now(), store::now_wall()));
                 self.j(store::Rec::add_id("local", &env.msg_id));
             }
+            crate::trace::log_event(
+                tracing::Level::DEBUG,
+                "message.incoming",
+                &self.cfg.node_id,
+                &trace_id,
+                Some(env),
+            );
         }
         is_new
     }
@@ -1159,6 +1242,7 @@ impl Router {
     }
 
     async fn deliver_local(&self, env: Envelope) {
+        let trace_id = crate::trace::dash(&env.trace_id);
         if self.events.receiver_count() == 0 {
             let mut inbox = self.inbox.lock().await;
             if inbox.len() >= INBOX_MAX {
@@ -1168,8 +1252,22 @@ impl Router {
                 }
             }
             self.j(store::Rec::add_env("inbox", env.clone()));
+            crate::trace::log_event(
+                tracing::Level::DEBUG,
+                "message.inbox",
+                &self.cfg.node_id,
+                &trace_id,
+                Some(&env),
+            );
             inbox.push_back(env);
         } else {
+            crate::trace::log_event(
+                tracing::Level::DEBUG,
+                "message.deliver",
+                &self.cfg.node_id,
+                &trace_id,
+                Some(&env),
+            );
             let _ = self.events.send(env);
         }
     }
@@ -1239,6 +1337,13 @@ impl Router {
         for (msg_id, pend) in overdue {
             if pend.tries >= max_retries {
                 tracing::warn!(msg_id, peer = %pend.peer_id, "router: delivery failed after retries");
+                crate::trace::log_event(
+                    tracing::Level::DEBUG,
+                    "message.fail",
+                    &self.cfg.node_id,
+                    &crate::trace::dash(&pend.env.trace_id),
+                    Some(&pend.env),
+                );
                 continue;
             }
             match self.registry.get(&pend.peer_id) {
@@ -1269,6 +1374,13 @@ impl Router {
             }
         }
         self.j(store::Rec::add_offline(env.clone(), exp_wall));
+        crate::trace::log_event(
+            tracing::Level::DEBUG,
+            "message.defer",
+            &self.cfg.node_id,
+            &crate::trace::dash(&env.trace_id),
+            Some(env),
+        );
         queue.push_back(OfflineEntry {
             env: env.clone(),
             expires_at: Instant::now() + Duration::from_secs(ttl),
@@ -1416,6 +1528,12 @@ impl Router {
             .lock()
             .unwrap()
             .insert(agent_id.to_string(), rec.clone());
+        tracing::debug!(
+            trace_id = "-", correlation_id = "-", msg_id = "-",
+            from = %self.cfg.node_id, to = "-", from_agent = "-",
+            to_agent = %agent_id, node_id = %self.cfg.node_id, topic = "registry",
+            agent = ?rec.name, "al.agent.register"
+        );
         self.persist_agents();
         self.sync_push_agents();
         rec
@@ -1424,6 +1542,12 @@ impl Router {
     pub fn unregister_agent(&self, agent_id: &str) -> bool {
         let removed = self.agents.lock().unwrap().remove(agent_id).is_some();
         if removed {
+            tracing::debug!(
+                trace_id = "-", correlation_id = "-", msg_id = "-",
+                from = %self.cfg.node_id, to = "-", from_agent = %agent_id,
+                to_agent = "-", node_id = %self.cfg.node_id, topic = "registry",
+                "al.agent.unregister"
+            );
             self.persist_agents();
             self.sync_push_agents();
         }
@@ -1557,6 +1681,7 @@ impl Router {
             action: env.action.clone(),
             seq: 0,
             reply_to: env.reply_to.clone(),
+            trace_id: env.trace_id.clone(),
             // v0.5 §2: observer copy is sanitized; the delivered frame above
             // (routed from `env` directly) still carries the original payload.
             payload: self.redactor.redact_value(&env.payload),
@@ -1584,6 +1709,20 @@ impl Router {
                     &line,
                     self.cfg.history.max_file_mb,
                     self.cfg.history.archive_days,
+                );
+                // v0.5 §7.1: history 落盘 as a structured event (debug level).
+                let t = crate::trace::dash(&entry.trace_id);
+                let corr =
+                    crate::trace::payload_field(&entry.payload, "correlation").unwrap_or("-");
+                let topic = crate::trace::payload_field(&entry.payload, "topic").unwrap_or("-");
+                tracing::debug!(
+                    trace_id = %t, correlation_id = %corr, msg_id = %entry.msg_id,
+                    from = %entry.from, to = %entry.to,
+                    from_agent = %crate::trace::dash(&entry.from_agent),
+                    to_agent = %crate::trace::dash(&entry.to_agent),
+                    node_id = %self.cfg.node_id, topic = %topic,
+                    direction = %entry.direction, seq = entry.seq,
+                    "al.history.persist"
                 );
                 if self.cfg.history.archive_keep > 0 {
                     store::prune_archives(&self.cfg.data_dir, self.cfg.history.archive_keep);
@@ -1684,6 +1823,7 @@ impl Router {
             action: "file".to_string(),
             seq: 0,
             reply_to: None,
+            trace_id: None,
             payload: self.redactor.redact_value(&serde_json::json!({
                 "file_name": file_name,
                 "size": size,

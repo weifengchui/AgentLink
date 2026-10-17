@@ -136,6 +136,12 @@ pub struct Envelope {
     pub ts: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// Trace id (v0.5 §7.1): either supplied by the sending agent or
+    /// injected by the kernel so downstream agents keep the chain. Additive
+    /// metadata — the envelope HMAC covers only `from|msg_id|ts`, never this
+    /// field, and legacy nodes ignore unknown fields on read (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,6 +163,7 @@ impl Envelope {
             payload: serde_json::Value::Null,
             ts: now_rfc3339(),
             reply_to: None,
+            trace_id: None,
             ttl_seconds: None,
             sig: None,
         }
@@ -187,6 +194,7 @@ impl Envelope {
             payload,
             ts: now_rfc3339(),
             reply_to,
+            trace_id: None,
             ttl_seconds,
             sig: None,
         }

@@ -190,7 +190,9 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
         "uptime_seconds": state.uptime_seconds(),
         // v0.5 §5: capability probe for orchestrators — endpoints listed
         // here exist on this node; absence means "degrade to legacy polling".
-        "features": ["events", "redact", "tasks"],
+        // "json-log" (v0.5 §7.1): structured JSON logging with trace_id
+        // injection is available (`log.format` = json / `--log-format json`).
+        "features": ["events", "redact", "tasks", "json-log"],
     }))
 }
 
@@ -305,6 +307,10 @@ struct SendRequest {
     /// Target agent id on the destination node.
     #[serde(default)]
     to_agent: Option<String>,
+    /// Optional trace id (v0.5 §7.1): echo a previously injected value to
+    /// continue a chain explicitly; when absent the kernel resolves it.
+    #[serde(default)]
+    trace_id: Option<String>,
 }
 
 /// Send a message to a peer (`node_id` or name) or broadcast to `"*"`.
@@ -330,7 +336,7 @@ async fn send(
     } else {
         req.payload
     };
-    let env = Envelope::business(
+    let mut env = Envelope::business(
         &state.config.node_id,
         &to,
         &req.kind,
@@ -341,6 +347,7 @@ async fn send(
         req.from_agent,
         req.to_agent,
     );
+    env.trace_id = req.trace_id.filter(|t| !t.is_empty());
     match state.router.send(env).await {
         Ok(msg_id) => (
             StatusCode::OK,

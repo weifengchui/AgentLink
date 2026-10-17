@@ -372,7 +372,7 @@ async fn handle_text(
 
         _ => {
             // Business frames (or unknown control): let the router decide.
-            let Ok(env) = serde_json::from_value::<Envelope>(value) else {
+            let Ok(mut env) = serde_json::from_value::<Envelope>(value) else {
                 return true;
             };
             if env.kind == "ctrl" {
@@ -387,7 +387,7 @@ async fn handle_text(
                 );
                 return true;
             }
-            let first = state.router.handle_incoming(&env).await;
+            let first = state.router.handle_incoming(&mut env).await;
             if !first {
                 tracing::trace!(msg_id = %env.msg_id, "conn: duplicate message");
             }
