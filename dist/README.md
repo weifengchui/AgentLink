@@ -144,6 +144,19 @@ curl -X POST http://127.0.0.1:8765/v1/send-file -H "X-Auth-Token: $TOKEN" -d \
   fleet agents 在线状态联动节点（幽灵在线消除）；web 节点列表加「本机」标记与离线节点「遗忘」
   按钮（`DELETE /v1/peers/<id>/forget`，持久化 data_dir/forgotten_peers.json，真实握手自动解禁）。
 
+## v0.5.0 发布物说明（及时响应标准化）
+
+- 新增**及时响应标准三件套**发布物：`AgentLink-v0.5.0-response-kit.zip`（顶层 `response-kit/`：
+  install-all.sh、hermes_bridge.py、wake_hook.py、bridge.sh、README.md、SKILL.md、
+  **SKILL-message-response.md**（标准正本）、**al_watch.py**（cron 看门狗通用版））。
+- 散件同步入本目录：`SKILL-message-response.md`、`al_watch.py`；
+  `AGENTS-使用说明.md` 新增 §11「及时响应标准（强烈建议默认配置）」；
+  `SKILL.md` 上线自检新增第 7 步；`ONBOARDING-新机器接入.md` 刷新至 v0.5.0 口径。
+- 清理过期发布件：`SKILL-agent-registration.md`（与 `SKILL.md` 逐字节重复）已删除——
+  注册技能正本从此**只有** `SKILL.md` 一个文件。
+- 产品立场：常驻桥+唤醒钩子+看门狗是使用 AgentLink 的**强烈建议默认配置**，
+  各接入 agent 应按 `SKILL-message-response.md` 的自查清单完成标准化并定期复查。
+
 ## v0.4.15 发布物说明
 
 - 对话记录不再丢：活动文件写满或超龄后**整份搬进** `data/history_archive/`（按滚动时刻命名），

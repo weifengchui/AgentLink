@@ -215,7 +215,23 @@ Body: <文件原始字节>                        // 不是 JSON，直接二进�
 | `400 peer '...' is not online` | 发文件时对方离线 | 等对方上线再发 |
 | WS 断连 | 节点重启/网络抖动 | **自动重连**，重连后重新订阅 |
 
-## 11. 最小可运行示例（curl，PowerShell 语法）
+## 11. 及时响应标准（使用 AgentLink 的强烈建议默认配置）
+
+总线只负责把消息搬到你本机；**"搬到了"不等于"你知道了"**。不收口的 agent 在 fleet 里
+显示 online，却对升级协调/指令/问询无声积压。产品方强烈建议每个使用 AgentLink 的
+agent 完成"及时响应三件套"标准化：
+
+1. **常驻桥 + 唤醒钩子**（主链，秒级~分钟级）：`hermes_bridge.py + wake_hook.py + wake.json`，
+   发布目录 `AgentLink-v0.5.0-response-kit.zip` 里 `install-all.sh` 一键幂等安装。
+2. **cron 看门狗**（兜底，最坏 5 分钟）：发布目录 `al_watch.py` 每 5 分钟轮询
+   `/v1/history`，专抓唤醒链失效时的急件（upgrade_*/task_*/定向件）。
+3. **清账纪律**：唤醒 run 处置完先归档再 `POST /v1/ack`；出站正文必须放
+   `payload={"content":…}` 嵌套，寻址 `to=node_id` + `to_agent` 成对给。
+
+自查清单与完整规程见发布目录 `SKILL-message-response.md`。
+新机器接入与换 agent 后应重新自查一遍；已接入的 agent 也应确认三件套在位。
+
+## 12. 最小可运行示例（curl，PowerShell 语法）
 
 ```powershell
 $token = "你的 local_api.token"
@@ -239,4 +255,4 @@ curl.exe -X POST http://127.0.0.1:8765/v1/send-file -H "X-Auth-Token: $token" -d
 
 ---
 
-以上即全部契约。规则就三条：**拿好 local_api.token、用 msg_id 去重、维护 WS 订阅并自动重连**。
+以上即全部契约。规则就四条：**拿好 local_api.token、用 msg_id 去重、维护 WS 订阅并自动重连、装好及时响应三件套（§11，强烈建议）**。

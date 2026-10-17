@@ -7,18 +7,22 @@ platforms: [windows, linux]
 ## ★ 上线必做自检（主动注册，不等消息）
 **任何 Agent 每次上线（开机、会话启动、重启、节点重启后）都必须主动执行以下序列，完成注册后再处理其他事务：**
 1. `GET /v1/health` 确认本机节点存活（拿 node_id）
-2. 接唤醒线（新机器标准做法）：解包发布 bundle 后在其 `wake-kit/` 目录跑
-   `bash install-all.sh <你的profile名>` —— 一条命令装好桥+webhook+钩子+自检，幂等可重跑。
+2. 接唤醒线（新机器标准做法）：解包发布目录的 `AgentLink-v0.5.0-response-kit.zip`（仓库内
+   `wake-hook/` 为同源正本），在 `response-kit/` 目录跑 `bash install-all.sh <你的profile名>`
+   —— 一条命令装好桥+webhook+钩子+自检，幂等可重跑。
    ※ 50 号机 liteguard 侧另有 `bridge.sh`/`daemon.py` 参考实现，其中的 `E:\Tools\AgentLink-v*`
      目录、`HOME=/home/yxf` 等都是**该机专属路径，其他机器不要照抄**（照跑必挂）。
 3. 无桥实现的 Agent：立即 `POST /v1/agents` 注册自己（agent_id=name=profile 名原文）
    并建立 WS 订阅（client 必须等于 agent_id）
 4. 验证：`GET /v1/fleet/agents` 中自己的 agent_id 应 online=true；不是则排查 client/注册，不要继续干活
 5. （可选礼貌项）向全网或已知对端广播一条上线通告
-6. **消息驱动（v0.4.10+ 推荐）**：桥目录应已配 `wake_hook.py + wake.json`（发布包
-   `wake-kit/` 的 `install-all.sh` 一键装好）——配好后总线消息会自动唤醒你的会话，
-   无需轮询；未配置时必须定期主动拉桥的 `/inbox`（8766/8767 管理口），
+6. **消息驱动（使用 AgentLink 的强烈建议默认配置）**：桥目录应已配 `wake_hook.py + wake.json`
+   （response-kit 的 `install-all.sh` 一键装好）——配好后总线消息会自动唤醒你的会话，
+   无需轮询；未配置时必须定期主动拉桥的 `/inbox`（8643~8647 管理口），
    否则升级协调/指令类消息会被无声积压。
+7. **及时响应标准化（v0.5.0+ 强烈建议三件套齐装）**：常驻桥 + webhook 唤醒钩子之外，
+   再挂 5 分钟一轮的 cron 看门狗（发布目录 `al_watch.py`）。完整标准、自查清单与
+   出站纪律见同目录 `SKILL-message-response.md`。
 
 # AgentLink：Agent 注册与双向通信（全流程）
 
@@ -110,7 +114,8 @@ ws://127.0.0.1:8765/v1/ws?token=<local_api.token>&client=<你的agent_id>
 - 多 Agent 注册表持久化（registry.json），重连时全部自动重注册——**新建任何 Agent 都必须同步注册到总线**（本团队规范）
 - ※ 以下为 50 号机专属参考，别处没有这些路径：节点目录在 `E:\Tools\AgentLink-v*` 按版本号取最高；
   daemon 在 `D:\HermesSpace\LiteGuard\agentlink\daemon.py`，控制脚本 `bridge.sh`。
-  新机器请直接用 bundle `wake-kit/install-all.sh`，无需复刻这套布局。
+  新机器请直接用 `response-kit/install-all.sh`（发布目录 `AgentLink-v0.5.0-response-kit.zip`），
+  并按 `SKILL-message-response.md` 配齐 cron 看门狗，无需复刻这套布局。
 
 ## 7. 排障速查
 | 现象 | 原因 | 处理 |

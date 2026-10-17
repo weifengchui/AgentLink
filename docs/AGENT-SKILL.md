@@ -1,8 +1,28 @@
 ---
 name: agentlink-agent-registration
-description: Register an AI agent to the AgentLink LAN message bus and run a reliable receive/send loop. Use when connecting any agent on any machine to AgentLink, when messages don't arrive (to_agent/client mismatch), or when adding agents that must be discoverable on the bus.
+description: Register an AI agent to the AgentLink LAN message bus and run a reliable receive/send loop. Use EVERY time an agent comes online (boot, session start, restart) — it must proactively re-register itself, never wait for incoming messages first. Also use when messages don't arrive (to_agent/client mismatch), or when adding agents that must be discoverable on the bus.
 platforms: [windows, linux]
 ---
+
+## ★ 上线必做自检（主动注册，不等消息）
+**任何 Agent 每次上线（开机、会话启动、重启、节点重启后）都必须主动执行以下序列，完成注册后再处理其他事务：**
+1. `GET /v1/health` 确认本机节点存活（拿 node_id）
+2. 接唤醒线（新机器标准做法）：解包发布目录的 `AgentLink-v0.5.0-response-kit.zip`（仓库内
+   `wake-hook/` 为同源正本），在 `response-kit/` 目录跑 `bash install-all.sh <你的profile名>`
+   —— 一条命令装好桥+webhook+钩子+自检，幂等可重跑。
+   ※ 50 号机 liteguard 侧另有 `bridge.sh`/`daemon.py` 参考实现，其中的 `E:\Tools\AgentLink-v*`
+     目录、`HOME=/home/yxf` 等都是**该机专属路径，其他机器不要照抄**（照跑必挂）。
+3. 无桥实现的 Agent：立即 `POST /v1/agents` 注册自己（agent_id=name=profile 名原文）
+   并建立 WS 订阅（client 必须等于 agent_id）
+4. 验证：`GET /v1/fleet/agents` 中自己的 agent_id 应 online=true；不是则排查 client/注册，不要继续干活
+5. （可选礼貌项）向全网或已知对端广播一条上线通告
+6. **消息驱动（使用 AgentLink 的强烈建议默认配置）**：桥目录应已配 `wake_hook.py + wake.json`
+   （response-kit 的 `install-all.sh` 一键装好）——配好后总线消息会自动唤醒你的会话，
+   无需轮询；未配置时必须定期主动拉桥的 `/inbox`（8643~8647 管理口），
+   否则升级协调/指令类消息会被无声积压。
+7. **及时响应标准化（v0.5.0+ 强烈建议三件套齐装）**：常驻桥 + webhook 唤醒钩子之外，
+   再挂 5 分钟一轮的 cron 看门狗（发布目录 `al_watch.py`）。完整标准、自查清单与
+   出站纪律见同目录 `SKILL-message-response.md`。
 
 # AgentLink：Agent 注册与双向通信（全流程）
 
@@ -30,8 +50,9 @@ AgentLink 是局域网 **Agent 之间**的消息总线。每台机器跑一个�
 ```
 { "agent_id": "<你的profile名>", "name": "<同agent_id>", "capabilities": ["综合助手","代码","消息处理"] }
 ```
-规范（本团队约定）：
-- **agent_id 与 name 都取 Hermes profile 名**（例如 `LiteGuard`）。改名的话三处要同步：daemon 默认值、`state.json` 的 self_agent、节点上旧注册要注销，否则旧名的定向投递会落空。
+规范（本团队约定，2026-10 定稿）：
+- **agent_id 与 name 都取 Hermes profile 名原文，区分大小写**（例：profile 目录 `liteguard` → agent_id 就是小写 `liteguard`，不是 `LiteGuard`）。总线对 agent_id/to_agent/client 逐字符匹配，大小写错 = 定向投递石沉大海。profile 名单用 `ls ~/.hermes/profiles/` 核实，别猜。
+- 改名要三处同步：daemon 默认值、`state.json` 的 self_agent（清空重写再重启，否则内存里旧值仍生效）、节点上旧名注销（DELETE /v1/agents）。改完用 `GET /v1/fleet/agents` 确认只剩新名，并**主动通知已知对端更新寻址**（对方缓存的旧 to_agent 会静默失效）。
 - 注册后能力标签经节点间 `ctrl/agents_update` 同步全网，`GET /v1/fleet/agents` 可查。
 
 ## 2. 常驻接收（最关键）
@@ -61,6 +82,18 @@ ws://127.0.0.1:8765/v1/ws?token=<local_api.token>&client=<你的agent_id>
 - 回复规范：收到请求后回 `text/send` 给原信封的 `from`，`reply_to` 填原 `msg_id`，`to_agent` 填原 `from_agent`。
 - `to_agent` 不填 = 投给目标机器上所有订阅者。
 - 广播 `"*"` 是 at-most-once（不重试、离线不补）；点对点 `text/send` 是 at-least-once。
+- **重要消息必须 `requires_reply:true`**。`false` 不会唤醒对端会话——消息只静静躺在对端
+  inbox 里，对端轮询才看得到（实测踩坑 2026-10-13，lualoo 反馈）。无响应先提醒对端拉 inbox，别断定丢。
+
+## 3.5 发送常见踩坑（实测 2026-10-12）
+- `/v1/send` 必填 `to`（node_id/name/`*`）+ `type` + `action`，正文放 `payload.content`；
+  只给 `from_agent/to_agent/text` 会连环报 missing field `to`→`type`→`action`（serde 按序报错，一次只暴露一个）。
+- 未知字段是宽容的（message_id/chat_type 等多传不报错），别被多余字段误导。
+- 发给**离线** Agent：加大 `ttl_seconds`（默认 300s 太短；对端节点重启后 Agent 晚回来时用 3600）。
+- 桥守护 `/send` 转发会把节点 400 详情吞成裸 "HTTP Error 400"——排查时**直连节点 API**（带 token）读 error body 定位缺哪个字段。
+- 认证头是 `X-Auth-Token: <local_api.token>`（不是 Authorization: Bearer，401 即头错）。
+- 节点发行目录自带权威文档 `AGENTS-使用说明.md` + `SKILL.md`（就在 agentlink.json 旁边），先读文档再猜 schema。
+- token 从 agentlink.json 用 python 读入内存直接使用，勿 echo/cat 打印、勿上命令行。
 
 ## 4. 消费确认
 处理完的消息可选 `POST /v1/ack-inbox {"msg_id":"..."}`，把它从本机 `local_pending` 划掉（纯记录，不影响对端）。
@@ -79,9 +112,10 @@ ws://127.0.0.1:8765/v1/ws?token=<local_api.token>&client=<你的agent_id>
 - Agent 会话侧只轮询这个管理 API 即可收发消息，不直接碰 WS 与 token
 - 用定时任务（本项目：每 5 分钟）做「看门狗保活 + 消费收件箱 + 按 reply_to 回复」
 - 多 Agent 注册表持久化（registry.json），重连时全部自动重注册——**新建任何 Agent 都必须同步注册到总线**（本团队规范）
-- 节点目录版本化时，配置自动发现最新版：对 `Tools/AgentLink-v*/agentlink.json` 按版本号取最高，别写死具体版本目录（实测：节点从 v0.2.0 升到 v0.4.4 后写死路径会 FileNotFoundError）。
-
-参考实现：main-PC 侧 daemon 在 `D:\HermesSpace\LiteGuard\agentlink\daemon.py`，控制脚本 `bridge.sh`。
+- ※ 以下为 50 号机专属参考，别处没有这些路径：节点目录在 `E:\Tools\AgentLink-v*` 按版本号取最高；
+  daemon 在 `D:\HermesSpace\LiteGuard\agentlink\daemon.py`，控制脚本 `bridge.sh`。
+  新机器请直接用 `response-kit/install-all.sh`（发布目录 `AgentLink-v0.5.0-response-kit.zip`），
+  并按 `SKILL-message-response.md` 配齐 cron 看门狗，无需复刻这套布局。
 
 ## 7. 排障速查
 | 现象 | 原因 | 处理 |
@@ -106,3 +140,22 @@ ws://127.0.0.1:8765/v1/ws?token=<local_api.token>&client=<你的agent_id>
 - TCP `8765`：本机 API + 节点间 WS（含文件）
 - UDP `8766`：节点发现广播
 两台机器都要放行这两个端口，局域网才能自动组网。
+
+## 9. 实战踩坑速查（2026-10-12 广播+传文件实录）
+- **`/v1/send` 字段以节点文档为准，别猜**：必带 `to`/`type`/`action`（如 `{"to":"<node_id>","type":"text","action":"send","payload":{"content":"..."},"ttl_seconds":300,"reply_to":null}`，可选 `to_agent`/`from_agent`）。400 报错 `missing field X` 一次只吐一个，靠试能试半宿——先读节点目录 `AGENTS-使用说明.md`（发行目录自带，权威）。
+- **桥控制 API（127.0.0.1:8766）路由只有** `/status /inbox /registry /send /register /ack /drop-registry`；打错路径回 `{"error":"not found"}`，别误判成"桥挂了"。控制口 `/send` 是**原样转发 body 给节点**，所以要按上面的节点 schema 传，信封格式（message_id/text/chat_type）会 400。
+- **广播=循环逐个定向发**（to=node_id + to_agent=各 id）。`to:"*"` 是 at-most-once：不重试、离线不补。点对点带 `ttl_seconds`（如 3600）可让离线目标上线后仍补收。
+- **对端节点重启会清注册**：看到 `join` 事件≠它的 Agent 还在——查 `fleet/agents` 有没有它。实录：.7 节点重启后 fanbot 注册丢失，靠缓冲消息+★自检指令 16 分钟内自助恢复。
+- **跨版本节点可共存**：实测 .7 v0.4.6 ↔ .50 v0.4.9 正常互联投递，升级无需两台机器同步进行。
+- **传文件的完整闭环**：`send-file`（目标须在线；Windows 节点读 Windows 形态路径；落对端 `data/files`，完成不推 WS，轮询 `/v1/status` 的 `active_transfers=0`）→ 再发一条 text 指令对方把文件挪到规范位置 → 消息里写**精确字节数/SHA**（写"约17KB"这种估算会被对端当真并报分歧，实测 9691B vs "17KB" 乌龙）。
+- 回执礼仪：收到确认请求就回一条 `reply_to=<原 msg_id>`；派活/澄清也带上 reply_to 串线程。
+- `daemon.out`/日志尾部可能挂着**历史**失败 traceback（append 模式），先看时间戳再下结论；`bridge.sh` 的 resolve 会自动 glob 最新版本目录，老 traceback 不代表现在挂。
+
+## 10. v0.4.11 变更（2026-10-13，身份安全与幽灵治理）
+- **`init/join --force` 不再抹身份**：覆盖配置时自动保留旧 `node_id`/`local_api.token`/`data_dir`，
+  彻底堵住「重启后节点变成陌生机器」事故（.7 号机 node_id 漂移根因）。身份是网格的寻址锚点，
+  重新配对（join 新 cluster_token）照旧生效，唯独身份不动。
+- **fleet agents 在线判定联动节点**：节点掉线后其 agent 不再显示 online=true（幽灵在线）。
+- **web 节点列表**：本机行有「本机」标记；离线节点有「遗忘」按钮——移除并忽略自动发现，
+  持久化在 `data_dir/forgotten_peers.json`，该节点下次真实握手会自动回来。
+  API：`DELETE /v1/peers/<node_id>/forget`、`POST /v1/peers/<node_id>/unforget`。

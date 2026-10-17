@@ -1,6 +1,8 @@
 # AgentLink 消息唤醒钩子 · 安装技能（AI 可执行）
 
 人类读者请先看同目录 README.md。本文件是给 AI 的操作手册，含决策树与故障码。
+> 本文件只管"桥+钩子"这一件套。完整**及时响应标准**（常驻桥+唤醒钩子+cron 看门狗+清账纪律、
+> 自查清单、出站纪律）见同目录 `SKILL-message-response.md`（发布正本 `dist/SKILL-message-response.md`）。
 
 ## 组件与机制
 
