@@ -27,6 +27,8 @@
 >
 > v0.5.0：AgentMesh v0.5 内核首版——新增 `/v1/events` 控制面事件流（append-only seq 续传、环满 409 降级、agent/types 过滤，编排方告别轮询）；payload 脱敏管线（history/events/web 观察者统一净化，收件人拿原文，`redact.patterns` 可配 + 内置默认集）；`/v1/fleet/agents?requires=` 能力查询（cap: 分层通配，仅在线）；`/v1/tasks` 任务资源视图（history 派生投影，correlation/state 过滤，任务协议 v1 见 docs/task-protocol.md）；`/v1/health` 增 `features` 数组供编排方探测降级；Web 控制台第五/六轮收口（history 节点+agent 四维过滤、status 暴露 listen_addr、星图端点下拉与自检面板）。全部加性接口，老节点混跑不破。
 >
+> v0.5.2：Web 控制台第七/八轮——顶栏在线节点口径修正为含本机；磁盘查询防抖自动搜索；agent 胶囊 hover 微动效；星图消息弹窗路由改双层胶囊（与对话记录同款，`@node` 端 `●节点名` 回退）。纯前端，协议兼容。
+>
 > v0.4.10：数据目录默认外置（Windows `%LOCALAPPDATA%\AgentLink\data`、Linux `~/.local/share/agentlink`），
 > 不再放软件目录里以免升级覆盖；`agentlink.json` 的 `data_dir` 可按机器各自改为绝对路径，
 > 相对路径以配置文件目录为基准。发布包新增 `SKILL-agent-registration.md`（Agent 上线注册技能，
@@ -143,6 +145,20 @@ curl -X POST http://127.0.0.1:8765/v1/send-file -H "X-Auth-Token: $TOKEN" -d \
 - **v0.4.11**：`init/join --force` 保留 node_id/token/data_dir（堵死身份漂移事故）；
   fleet agents 在线状态联动节点（幽灵在线消除）；web 节点列表加「本机」标记与离线节点「遗忘」
   按钮（`DELETE /v1/peers/<id>/forget`，持久化 data_dir/forgotten_peers.json，真实握手自动解禁）。
+
+## v0.5.2 发布物说明（Web 控制台第七/八轮）
+
+- 版本号说明：0.5.1 编号预留给待并入的合并线（CLI 薄壳 / JSON 日志 / 任务 Timeline 熔断），
+  本发布为纯 Web 控制台改动，跳号 0.5.2。前端-only、协议兼容 v0.5.0/v0.4.x，各机可独立择时升级。
+- 第七轮：总览顶栏「在线节点」口径修正为**含本机**（原来少算本机，如 3/3 实际 4 台显示 4/4）；
+  磁盘查询条件 350ms 防抖自动搜索（保留手动按钮）；agent 双层胶囊 hover 时内胶囊左右缓晃微动效
+  （`prefers-reduced-motion` 自动降级为不动）。
+- 第八轮：星图消息弹窗的路由（头部 `v-hd` 与 meta 行 `v-route`）从纯文本
+  `【a@node -> b@node】` 改为**双层胶囊**，CSS/配色/几何与对话记录 `chip()` 逐字同源
+  （外层节点深档壳 + 内嵌 agent 派生色胶囊，左弧 ≈14px）；节点级端点（`@node`）与对话记录
+  一致回退 `●+节点名`。
+- 已知问题归档：对话记录部分定时消息行首无 agent 胶囊（只有 `●节点`），根因是**发送端脚本**
+  未带 `from_agent` 字段，属数据侧，渲染层回退正确；发送端修复另行推进，不影响本机升级。
 
 ## v0.5.0 发布物说明（及时响应标准化）
 
