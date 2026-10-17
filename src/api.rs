@@ -1573,6 +1573,10 @@ select#to,select#to2{width:340px;max-width:340px}
 .att-chip{display:inline-flex;align-items:center;gap:7px;padding:2px 10px;border-radius:14px;background:#182238;color:#9db4dd;font-size:12px}
 .idc{display:inline-flex;align-items:center;justify-content:flex-end;background:var(--nc,#22344f);border-radius:13px;padding:2px 2px 2px 14px;margin-right:4px;vertical-align:middle;max-width:100%}
 .idc .idci{display:inline-block;border-radius:999px;padding:0 9px;font-weight:600;font-size:12px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;vertical-align:middle}
+/* R3（10-17 第七轮）：悬停双层胶囊 → 内胶囊左右缓晃一次复位，hover 响应微反馈 */
+@keyframes cap-nudge{0%,100%{transform:translateX(0)}18%{transform:translateX(-5px)}42%{transform:translateX(4px)}64%{transform:translateX(-2.5px)}82%{transform:translateX(1.5px)}}
+.idc:hover .idci{animation:cap-nudge .7s cubic-bezier(.34,1.2,.64,1) 1}
+@media (prefers-reduced-motion:reduce){.idc:hover .idci{animation:none}}
 .idn{opacity:.62;font-size:11px;margin-right:2px}
 #cf-colors{display:flex;flex-direction:column;gap:7px;margin-top:6px}
 #cf-colors .cfrow{display:flex;align-items:center;gap:12px}
@@ -1654,7 +1658,7 @@ th.srt:hover{color:#dbe2ea}
 <div id="main">
   <div id="topbar">
     <div style="display:flex;align-items:baseline;gap:10px"><div class="t" id="tb-self">—</div><div class="sub" id="tb-meta">—</div></div>
-    <span class="stat" title="在线节点 / 已知节点"><span>在线节点</span><b id="m-nodes">0</b></span>
+    <span class="stat" title="在线节点 / 已知节点（含本机）"><span>在线节点</span><b id="m-nodes">0</b></span>
     <span class="stat" title="内存中最近对话条数"><span>历史消息</span><b id="m-history">0</b></span>
     <span class="stat" title="进行中的文件传输"><span>传输中</span><b id="m-transfer">0</b></span>
     <div class="spacer"></div>
@@ -1690,13 +1694,13 @@ th.srt:hover{color:#dbe2ea}
         <div class="row"><input id="ch-kw" placeholder="搜索：内容 / 节点 / agent…" style="flex:2" oninput="chGo(1)">
         <select id="ch-size" onchange="chGo(1)"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option></select></div>
         <div class="row">
-          <select id="ch-from" title="发送方" style="flex:1;min-width:220px"></select>
-          <select id="ch-to" title="接收方" style="flex:1;min-width:220px"></select>
+          <select id="ch-from" title="发送方" onchange="schedSearch()" style="flex:1;min-width:220px"></select>
+          <select id="ch-to" title="接收方" onchange="schedSearch()" style="flex:1;min-width:220px"></select>
         </div>
         <div class="row">
-          <span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap"><input type="datetime-local" id="ch-since" title="起始时间（本机时区，服务端按 UTC 过滤）"><span class="hint">→</span><input type="datetime-local" id="ch-until" title="结束时间"></span>
-          <select id="ch-limit" title="最多返回条数"><option value="50">最多 50</option><option value="200" selected>最多 200</option><option value="1000">最多 1000</option><option value="2000">最多 2000</option></select>
-          <label class="hint" style="font-size:12px"><input type="checkbox" id="ch-all">含归档</label>
+          <span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap"><input type="datetime-local" id="ch-since" title="起始时间（本机时区，服务端按 UTC 过滤）" onchange="schedSearch()"><span class="hint">→</span><input type="datetime-local" id="ch-until" title="结束时间" onchange="schedSearch()"></span>
+          <select id="ch-limit" title="最多返回条数" onchange="schedSearch()"><option value="50">最多 50</option><option value="200" selected>最多 200</option><option value="1000">最多 1000</option><option value="2000">最多 2000</option></select>
+          <label class="hint" style="font-size:12px"><input type="checkbox" id="ch-all" onchange="schedSearch()">含归档</label>
           <button class="primary" onclick="histSearch()">查磁盘</button>
           <button onclick="histReset()">重置</button>
         </div>
@@ -2008,7 +2012,8 @@ function histSig(){return HIST.length+'|'+(HIST.length?HIST[HIST.length-1].msg_i
 let LAST_HSTAT=0;
 async function histStats(){if(Date.now()-LAST_HSTAT<30000)return;LAST_HSTAT=Date.now();try{const d=await j('/v1/history/stats');if(!d||d.ok!==true)return;const mb=Number(d.rotate_mb)||1024;const lim=mb*1048576;const tot=Number(d.total_bytes)||0;const act=Number(d.active_bytes)||0;const warn=act>=lim*0.8;let txt='当前 '+fmtSize(d.active_bytes)+' · 归档 '+fmtSize(d.archive_bytes)+'（'+(d.archive_count||0)+' 个）· 合计 '+fmtSize(tot)+' · 满 '+mb+' MB 或 '+(d.archive_days||0)+' 天自动归档，记录不删除';if(d.archive_keep)txt+=' · 仅保留最近 '+d.archive_keep+' 份归档';if(warn)txt+=' · 接近阈值，建议导出备份';for(const id of ['ov-stats','ch-stats']){const e=el(id);if(!e)continue;e.textContent=txt;e.style.color=warn?'#f85149':'';}}catch(err){}}
 function exportHist(p,fmt){const s=el(p+'-scope');const sc=s?s.value:'all';window.location.href='/v1/history/export?format='+fmt+'&scope='+sc;}
-async function histSearch(){
+let SCHT=null;function schedSearch(){clearTimeout(SCHT);SCHT=setTimeout(histSearch,350);}
+async function histSearch(){clearTimeout(SCHT);
  const p=new URLSearchParams();
  const put=(k,id)=>{const v=val(id);if(v)p.set(k,v);};
  put('q','ch-kw');
@@ -2083,7 +2088,7 @@ async function refresh(){
   ST=st||{}; PEERS=(peers&&peers.ok)?peers.peers:[]; AGENTS=(agents&&agents.ok)?agents.agents:[]; SELF=ST.node_id||'';
   $('tb-self').textContent=st.name;
   $('tb-meta').textContent=`${st.node_id} · ${new Date().toLocaleTimeString()}`;
-  $('m-nodes').textContent=`${st.peers_online}/${st.peers_known}`;
+  $('m-nodes').textContent=`${st.peers_online+1}/${st.peers_known+1}`;
   $('m-history').textContent=hist.history.length;
   $('m-transfer').textContent=st.active_transfers;
   // 节点名 / agent 名映射（给人看）
