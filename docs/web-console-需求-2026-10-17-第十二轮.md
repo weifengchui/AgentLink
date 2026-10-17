@@ -13,4 +13,4 @@
 - 状态：☑ 完成（2026-10-17）。验收记录：隔离节点 al055-test@18797（release 二进制）实机——DOM 断言 bLive/mPop/mFrom/mTo/rng 全部不存在；底栏按钮恰为 复位/流入/截图/录屏/全屏；滑杆 min60/max3600/step60，拖到 max 显示 60min、回 60 显示 1min（oninput 生效）；`window.__al.live===true`；注入三方话题后 HUD 窗口内 3、悬停胶囊出卡组 2 卡；vision 复核底栏截图无实时按钮/无区间文本。源码与服务端下发 `/v1/starmap` 脚本 node --check 全绿；双端二进制 strings 标记 max="3600"×1、bLive/mPop/updateRange×0。
 
 ## 发布
-- v0.5.5：☑ 已发布（commit+tag；zip `AgentLink-v0.5.5.zip` 2,992,689 B，sha256 6abb5c15…cc676；随本批含第十一轮连线闪烁修复）。按分发拍板：只交版本号+更新要点，各机交付用户自理，不做全网通知。
+- v0.5.5：☑ commit ce08bae + tag v0.5.5；dist zip 已入库（2,992,689 B，sha256 6abb5c15…cc676；随本批含第十一轮连线闪烁修复）。push：当晚 443 全断（ls-remote 亦挂死），走后台重试循环（日志 /home/yxf/al055_push2.log），落地判据=ls-remote --tags 返回 v0.5.5。按分发拍板：只交版本号+更新要点，各机交付用户自理，不做全网通知。
