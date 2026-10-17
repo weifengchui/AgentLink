@@ -304,7 +304,8 @@ function initPos(){const cl=staClamp(),r=orbR()+44;for(const m in MACH){const c=
   const ang=Math.PI/2+i*(2*Math.PI/Math.max(c.agents.length,3));
   AGTP[k]={dx:Math.cos(ang)*r,dy:Math.sin(ang)*r};});
  if(!AGTP[a2k([m,"@node"])])AGTP[a2k([m,"@node"])]={dx:0,dy:0};}}
-function agPos(k){const[m]=k.split("|");const s=STA[m],o=AGTP[k];return{x:s.x+o.dx,y:s.y+o.dy};}
+/* R14-A（10-17 第十四轮）：agPos 出口叠加 AVO 临时避让偏移（不写 AGTP/AGP/STA，不持久化）。 */
+function agPos(k){const[m]=k.split("|");const s=STA[m],o=AGTP[k],v=AVO[k];return{x:s.x+o.dx+(v?v.x:0),y:s.y+o.dy+(v?v.y:0)};}
 /* ---------- time window ---------- */
 let winS=600;const T0=Date.now();
 /* R12（10-17 第十二轮）：时段模式废除——时间窗恒为跟随现在的滑窗（[now-winS, now]），窗口长度最大 1 小时。 */
@@ -347,6 +348,45 @@ function buildWorld(){
 function placeWorld(){
  for(const m in MACH){const s=STA[m];staEl[m].style.left=s.x+"px";staEl[m].style.top=s.y+"px";}
  for(const k in agtEl){const p=agPos(k);const e=agtEl[k];e.style.left=p.x+"px";e.style.top=p.y+"px";}}
+/* R14-A（10-17 第十四轮）：拖动避让——AVO 临时偏移层（stage 像素），agPos 出口叠加，
+   连线/粒子/卡组经 agPos 自动跟随；AVOT 为目标偏移，rAF 滑移动画，松手清零后回位。 */
+const AVO={},AVOT={},AGSZ={};
+function pillSize(k){const e=agtEl[k];if(!e)return{w:90,h:18};
+ if(!AGSZ[k]){const d=e.querySelector(".dot");AGSZ[k]={w:(d&&d.offsetWidth)||90,h:(d&&d.offsetHeight)||18};}return AGSZ[k];}
+function agBase(k){const[m]=k.split("|");const s=STA[m],o=AGTP[k];return{x:s.x+o.dx,y:s.y+o.dy};}
+function avoidTargets(){ /* 被拖胶囊为唯一斥力源：其余胶囊沿中心连线推出到矩形不相交（外扩 6px），单枚上限 120px */
+ if(!drag||drag.kind==="station")return;
+ const P=agPos(drag.id),sP=pillSize(drag.id);
+ for(const k in agtEl){
+  if(k===drag.id){delete AVOT[k];continue;}
+  const B=agBase(k),sQ=pillSize(k);
+  const dx=B.x-P.x,dy=B.y-P.y,L=Math.hypot(dx,dy);
+  const needX=sP.w/2+sQ.w/2+10,needY=sP.h/2+sQ.h/2+10;/* R14-A：留 10px 外扩（恰好贴边解在渲染舍入后仍会被判叠，实测已验） */
+  let t=0;
+  if(Math.abs(dx)<needX&&Math.abs(dy)<needY){ /* 两矩形（含外扩）相交才避让 */
+   const ux=L?dx/L:0,uy=L?dy/L:-1; /* 中心重合：向上推 */
+   let tx=Infinity,ty=Infinity;
+   if(Math.abs(ux)>1e-3)tx=(needX-Math.abs(dx))/Math.abs(ux);
+   if(Math.abs(uy)>1e-3)ty=(needY-Math.abs(dy))/Math.abs(uy);
+   t=Math.min(120,Math.max(tx,ty));if(!isFinite(t))t=120;}
+  AVOT[k]={x:(L?dx/L:0)*t,y:(L?dy/L:(dx?0:-1))*t};
+ }}
+let avRaf=null;
+function avTick(){
+ let busy=false;
+ for(const k in AVO){const tv=AVOT[k]||{x:0,y:0},v=AVO[k];
+  v.x+=(tv.x-v.x)*0.3;v.y+=(tv.y-v.y)*0.3;
+  if(Math.abs(tv.x-v.x)<0.3&&Math.abs(tv.y-v.y)<0.3){v.x=tv.x;v.y=tv.y;
+   if(tv.x===0&&tv.y===0)delete AVO[k];}else busy=true;}
+ for(const k in AVOT){if(!AVO[k]){const tv=AVOT[k];if(tv.x===0&&tv.y===0){delete AVOT[k];continue;}
+  AVO[k]={x:0,y:0};}}
+ placeWorld();renderLinks();for(const k in dwraps)posDwrap(k);
+ avRaf=busy?requestAnimationFrame(avTick):null;}
+function avKick(){if(avRaf===null)avRaf=requestAnimationFrame(avTick);}
+/* R14-A（10-17 第十四轮）：拖动中瞬时到位（滑移追不上快拖会残留叠帧，实测 CDP 路径验证）；滑移只用于松手回位。 */
+function avSnap(){for(const k in AVO){const t=AVOT[k];if(!t||(t.x===0&&t.y===0))delete AVO[k];else{const v=AVO[k];v.x=t.x;v.y=t.y;}}
+ for(const k in AVOT){const t=AVOT[k];if(t&&(t.x!==0||t.y!==0)&&!AVO[k])AVO[k]={x:t.x,y:t.y};}}
+function avoidClear(){for(const o of[AVO,AVOT,AGSZ])for(const k in o)delete o[k];}
 /* ---------- drag ---------- */
 let drag=null;
 function startDrag(e,kind,id){
@@ -363,12 +403,15 @@ addEventListener("pointermove",e=>{
   s.x=Math.max(110,Math.min(W-110,drag.sx+dx));const cl=staClamp();s.y=Math.max(cl.top,Math.min(cl.bot,drag.sy+dy));
  }else{const o=AGTP[drag.id];const st=STA[drag.id.split("|")[0]];
   const ang=Math.atan2(e.clientY-st.y,e.clientX-st.x);
-  o.dx=Math.cos(ang)*drag.r;o.dy=Math.sin(ang)*drag.r;}
+  o.dx=Math.cos(ang)*drag.r;o.dy=Math.sin(ang)*drag.r;
+  avoidTargets();avSnap();}
  placeWorld();renderLinks();for(const k in dwraps)posDwrap(k);});
 addEventListener("pointerup",()=>{
  if(drag){const kind=drag.kind,id=drag.id,moved=drag.moved;
   if(kind==="station")staEl[id].classList.remove("drag");else agtEl[id].classList.remove("drag");
   drag=null;
+  /* R14-A（10-17 第十四轮）：拖拽结束清目标偏移，avTick 把被避让者滑回原位（station 拖拽不受影响）。 */
+  if(kind==="agent"){for(const k in AVOT)delete AVOT[k];avKick();}
   if(moved&&kind!=="station")AGP[id]=1;
   if(!moved){const t=kind==="station"?"sta":"agt",was=pinC&&pinC.t===t&&pinC.k===id;
    clearPin();
@@ -715,6 +758,7 @@ async function poll(){if(polling){pollAgain=true;return;}polling=true;
  finally{flushLateLit();restoreHov();polling=false;if(pollAgain){pollAgain=false;poll();}}}
 function worldSig(){let s="";for(const m in MACH)s+=m+"|"+MACH[m].lab+"|"+MACH[m].ip+"|"+MACH[m].agents.join(",")+";";return s;}
 async function syncWorld(){const sg=worldSig();if(sg===WSIG)return;WSIG=sg;
+ avoidClear(); /* R14-A（10-17 第十四轮）：整体重建世界前作废 AVO 偏移与胶囊尺寸缓存（agtEl 将重填）。 */
  if(Object.keys(STA).length){
   /* R-fix（10-17）：整体换 DOM 会销毁鼠标下的胶囊/卡组，新元素对静止光标不会自发补发 pointerenter——
      悬停断线断卡直到移动鼠标或刷新。快照悬停实体与卡组锚点，poll 尾部 restoreHov 补发；
@@ -802,6 +846,7 @@ document.getElementById("bPause").onclick=e=>{paused=!paused;if(paused)cancelLiv
  e.target.classList.toggle("on",paused);e.target.textContent=paused?"⏸︎流入":"流入";};
 document.getElementById("bReset").onclick=()=>{cancelLiveAnims();clearPin();
  for(const o of[STA,AGTP])for(const k in o)delete o[k];
+ avoidClear(); /* R14-A（10-17 第十四轮）：复位同时清掉避让偏移与尺寸缓存。 */
  applyDefaultLayout();initPos();placeWorld();renderLinks();renderAllDecks();};
 document.getElementById("bFs").onclick=()=>{
  // 本页可能被总览 iframe 嵌入：全屏请求要打在宿主 iframe 元素上（iframe 内部对 body 发请求会被拒），
