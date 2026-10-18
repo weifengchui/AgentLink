@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn full_lifecycle_edges() {
         // 对拍 router.rs :375：spec→accepted→progress×2→succeeded + junk 帧。
-        let frames = vec![
+        let frames = [
             frame(
                 1,
                 "task_spec",
@@ -624,15 +624,16 @@ mod tests {
         assert_eq!(t["k"].state, TaskState::Cancelled);
         assert!(t["k"].state.is_hard_terminal());
         let before = t.clone();
-        let mut s = 5u64;
-        for topic in [
+        for (i, topic) in [
             "task_accepted",
             "task_succeeded",
             "task_progress",
             "task_failed",
-        ] {
-            apply_event(&mut t, &frame(s, topic, "k", None));
-            s += 1;
+        ]
+        .iter()
+        .enumerate()
+        {
+            apply_event(&mut t, &frame(5 + i as u64, topic, "k", None));
         }
         assert_eq!(t["k"].state, TaskState::Cancelled); // 状态粘性
         assert_eq!(t["k"].attempts, before["k"].attempts); // 不被伪造推进

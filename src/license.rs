@@ -366,7 +366,7 @@ mod tests {
         out
     }
 
-    fn valid_entries<'a>(expires: &'a str) -> Vec<(&'a str, &'a str)> {
+    fn valid_entries(expires: &str) -> Vec<(&str, &str)> {
         vec![
             ("tier", "starter"),
             ("node_quota", "10"),

@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::body::{Body, Bytes};
@@ -28,9 +29,12 @@ use tokio::sync::{broadcast, mpsc};
 use crate::config::Config;
 use crate::conn;
 use crate::file::FileManager;
+use crate::license::{self, LicenseInfo};
 use crate::peer::{DiscoveredPeer, PeerTable};
 use crate::proto::{constant_time_eq, Envelope};
 use crate::router::Router;
+use crate::taskengine::{self, TaskRecord, TaskTable};
+use crate::taskstore::{TaskEvent, TaskStore};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -56,6 +60,11 @@ pub struct AppState {
     pub files: Arc<FileManager>,
     /// Live identity (node name / tags), editable from the web UI.
     pub runtime: std::sync::RwLock<Runtime>,
+    /// AgentMesh 任务引擎运行态（v0.6 M1，设计 §4 P1-5）。`None` = 免费层：
+    /// mesh 关闭或 license 无效——写面 403、features 不加 "engine"、引擎态
+    /// 完全不实例化，行为与 0.5.9 逐字符一致。启动时由 main.rs 经
+    /// [`build_mesh`] 装配一次，运行期只读。
+    pub mesh: Option<Arc<MeshRuntime>>,
 }
 
 impl AppState {
@@ -81,6 +90,7 @@ impl AppState {
             router,
             files,
             runtime: std::sync::RwLock::new(runtime),
+            mesh: None,
         }
     }
 
@@ -124,6 +134,148 @@ impl AppState {
 
 pub type SharedState = Arc<AppState>;
 
+/// 快照节流阈值：每 N 次成功 append 落一次全量快照（顺带 compact journal）。
+/// M1 简单计数即可——重启不丢由 journal 逐条 fsync 保证，快照只是压缩增量。
+const MESH_SNAPSHOT_EVERY: u64 = 32;
+
+/// AgentMesh 任务引擎运行态（v0.6 M1，设计 §2.1/§2.2，引擎休眠版）。
+///
+/// 组成：持久存储 `TaskStore`（journal+快照）+ 内存任务表 `TaskTable`
+/// （taskengine 的 BTreeMap 领域表）。M1 只开声明式写面；reconcile loop、
+/// 总线派发、cancel 帧外发全部推迟 M2（P2-1/P2-2 接线）。
+pub struct MeshRuntime {
+    /// 任务持久存储（journal append 逐条 fsync；快照=state.json 全量+清扫）。
+    pub store: TaskStore,
+    /// 引擎权威表。std Mutex：临界区内只有同步操作（apply/append 落盘），
+    /// 绝不跨 `.await` 持锁；表锁与 store 内部锁的获取顺序恒为 table→store，
+    /// 无反向路径，无死锁面。
+    pub table: Mutex<TaskTable>,
+    /// journal 事件修订号（单调自增）。存储层语义是"后写覆盖"，rev 只做
+    /// 诊断观测，不参与比较。
+    pub rev: AtomicU64,
+    /// 快照节流计数器（见 [`MESH_SNAPSHOT_EVERY`]）。
+    pub appends_since_snapshot: AtomicU64,
+    /// 验签通过的 license（quota 接线消费预留给 M3，设计 §3.2）。
+    #[allow(dead_code)] // M3 配额闭环（P3-4）接线前的休眠字段
+    pub license: LicenseInfo,
+}
+
+impl MeshRuntime {
+    fn next_rev(&self) -> u64 {
+        self.rev.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// 节流快照：每积满阈值落一次 state.json 并 compact journal；失败只
+    /// log——journal 有逐条 fsync，快照丢了不丢数据，下轮再试。
+    fn maybe_snapshot(&self) {
+        let n = self.appends_since_snapshot.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= MESH_SNAPSHOT_EVERY {
+            self.appends_since_snapshot.store(0, Ordering::Relaxed);
+            if let Err(e) = self.store.snapshot_save() {
+                tracing::error!(error = %e, "mesh: 任务快照失败（journal 已 fsync，重启不丢）");
+            }
+        }
+    }
+}
+
+/// 启动装配 mesh 引擎态（设计 §3.2 生效矩阵；main.rs 在 run() 里调用一次）。
+///
+/// 返回 `None` = 按免费层运行（与 0.5.9 行为逐字符一致）：
+/// - `mesh.enabled=false`（默认）：直接返回，引擎态**完全不实例化**；
+/// - enabled 但 license 缺失/验签失败/存储打开失败：`tracing::error` 后
+///   退化免费层，绝不 crash-loop（对齐 store.rs"空态好过崩"哲学）。
+pub fn build_mesh(cfg: &Config, config_file: &Path) -> Option<Arc<MeshRuntime>> {
+    if !cfg.mesh.enabled {
+        return None;
+    }
+    // license 路径：相对路径按 agentlink.json 同目录解析（节点目录即 license
+    // 分发目录，行为确定，不受启动 cwd 影响）。
+    let license_path = match cfg.mesh.license_file.as_ref() {
+        Some(p) if p.is_absolute() => p.clone(),
+        Some(p) => config_file
+            .parent()
+            .map(|dir| dir.join(p))
+            .unwrap_or_else(|| p.clone()),
+        None => {
+            tracing::error!(
+                "mesh.enabled=true 但未配置 mesh.license_file；按免费层运行（写面 403）"
+            );
+            return None;
+        }
+    };
+    let license = match license::verify_license_file(&license_path) {
+        Ok(info) => info,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                path = %license_path.display(),
+                "mesh license 校验失败；退化为免费层运行（引擎不启用，写面 403）"
+            );
+            return None;
+        }
+    };
+    let store = match TaskStore::open(&cfg.data_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, data_dir = %cfg.data_dir.display(), "mesh: 任务存储打开失败；按免费层运行");
+            return None;
+        }
+    };
+    let records = match store.rebuild() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "mesh: 任务存储重建失败；按免费层运行");
+            return None;
+        }
+    };
+    // 重启灌表口径（设计 §2.1）：**直接读整行 rec 反序列化**，不用
+    // taskengine::apply_event 逐帧重放——taskstore 的 journal 存的是
+    // `TaskEvent`（整行 TaskRecord 快照，"后写覆盖"即最终态），不是协议
+    // 帧序列；逐帧重放需要帧语义而落盘只有行，且 message_count/attempts
+    // 等观测量在整行覆盖时已含最终值，重放反而会双计。直接灌表是语义
+    // 损失最小的实现。形状不合法的行（人工改坏/旧版本残留）warn 跳过，
+    // 不炸启动。
+    let mut table = TaskTable::new();
+    for (task_id, rec) in records {
+        match serde_json::from_value::<TaskRecord>(rec) {
+            Ok(r) => {
+                table.insert(task_id, r);
+            }
+            Err(e) => {
+                tracing::warn!(task_id = %task_id, error = %e, "mesh: 跳过形状非法的任务表行");
+            }
+        }
+    }
+    tracing::info!(
+        tier = license.tier.as_str(),
+        node_quota = license.node_quota,
+        tasks = table.len(),
+        "mesh 引擎已装配（M1 休眠：写面开、reconcile 未起）"
+    );
+    Some(Arc::new(MeshRuntime {
+        store,
+        table: Mutex::new(table),
+        rev: AtomicU64::new(1),
+        appends_since_snapshot: AtomicU64::new(0),
+        license,
+    }))
+}
+
+/// Mesh 门统一应答（拍板记录第 2 条：写面+引擎循环+调度整体=AgentMesh，
+/// 免费层一律 403）。设计文档 §2.2 写的 `mesh_license_required` 下划线体
+/// 属早期措辞，以本波拍板原文 `mesh license required` 为准，M2 若改协议
+/// 文案再统一。
+fn mesh_required() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "mesh license required" })),
+    )
+}
+
+fn bad_request(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": msg })))
+}
+
 /// Build the router: local API and the peer WebSocket endpoint.
 pub fn router(state: SharedState) -> AxRouter {
     // Browser uploads stream raw bytes into `Bytes`. Axum's default body limit is
@@ -160,7 +312,14 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/fleet/agents", get(fleet_agents))
         .route("/v1/history", get(history_get))
         .route("/v1/events", get(events_get))
-        .route("/v1/tasks", get(tasks_get))
+        // v0.6 M1 声明式写面（设计 §2.2）：GET 保持 0.5.9 只增不改，
+        // POST/cancel/DELETE 全走 mesh license 门（免费层 403）。
+        .route("/v1/tasks", get(tasks_get).post(tasks_post))
+        .route(
+            "/v1/tasks/:task_id",
+            get(tasks_get_one).delete(tasks_delete),
+        )
+        .route("/v1/tasks/:task_id/cancel", post(tasks_cancel_post))
         .route("/v1/lockdown", get(lockdown_get).post(lockdown_post))
         .route("/v1/history/search", get(history_search_get))
         .route("/v1/colors", get(colors_get).put(colors_put))
@@ -182,6 +341,15 @@ pub fn router(state: SharedState) -> AxRouter {
 
 /// Liveness probe. Intentionally unauthenticated.
 async fn health(State(state): State<SharedState>) -> impl IntoResponse {
+    // v0.6 M1：features 动态化（设计 §2.2）。默认态（mesh 关/license 无效，
+    // state.mesh=None）输出数组与 0.5.9 **逐字符一致**——单测
+    // `health_features_default_pins_059` 钉死，编排方按旧数组硬编码不受影响；
+    // 仅 mesh 生效（引擎态真实装配）时追加 "engine"。
+    let mut features: Vec<&str> =
+        vec!["events", "redact", "tasks", "json-log", "lockdown", "hello"];
+    if state.mesh.is_some() {
+        features.push("engine");
+    }
     Json(json!({
         "ok": true,
         "version": VERSION,
@@ -194,7 +362,7 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
         // "json-log" (v0.5 §7.1): structured JSON logging with trace_id
         // injection is available (`log.format` = json / `--log-format json`).
         // "lockdown" (v0.5 §4.5): 一键熔断端点存在。
-        "features": ["events", "redact", "tasks", "json-log", "lockdown", "hello"],
+        "features": features,
     }))
 }
 
@@ -850,6 +1018,305 @@ async fn tasks_get(
         StatusCode::OK,
         Json(json!({ "ok": true, "tasks": tasks, "total": total })),
     )
+}
+
+// ---- v0.6 M1 声明式任务写面（设计 §2.2，license 门控） ----------------------
+//
+// 三门鉴权顺序：local API token（401）→ mesh license 门（403）→ 请求体
+// 校验（400）→ 资源语义（404/409）。写面+引擎+调度整体=Mesh（拍板记录
+// 第 2 条），state.mesh=None（免费层）时四个端点一律 403。
+//
+// **M2 接线点（本波刻意留白）**：
+// - POST 落表只进引擎表+taskstore journal，**不发总线 task_spec 帧**——
+//   派发=调度器选 candidate 后走 Router send（P2-1 事件收敛 / P3-2 派发
+//   接线），届时"pending 行由 reconcile tick 派发"才成立；
+// - cancel 同理只置表，不发 task_cancel 帧（P2 接总线）；
+// - deadline/expired/backoff 重试等 timer 动作全在 M2 tick（P2-3）；
+// - node_quota 超额拒绝在 M3（P3-4，LicenseInfo 已挂 MeshRuntime.license）。
+
+/// `POST /v1/tasks` 声明式创建（设计 §2.2）：body=task_spec 协议 §2 原文。
+/// 校验 task_id+type 必填 → 400；同 task_id 非终态重复声明 → 409；
+/// 有效则 apply_event 进表（pending）+ journal up 落盘 + 节流快照，202。
+/// M1 不派发（引擎休眠，注释见上方接线点清单）。
+async fn tasks_post(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    JsonAny(body): JsonAny<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let Some(mesh) = state.mesh.as_ref().cloned() else {
+        return mesh_required();
+    };
+    // 协议 §2 必填门：task_id / type 为非空字符串。其余字段（requires、
+    // deadline、payload、budget、priority、correlation…）原样透传——
+    // 引擎表存原文，不做 schema 白名单（前向兼容，对齐 taskstore 透传口径）。
+    let Some(spec) = body.as_object() else {
+        return bad_request("task_spec 必须是 JSON 对象");
+    };
+    let task_id = match spec.get("task_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.trim().is_empty() => id.to_string(),
+        _ => return bad_request("task_spec 缺必填字段 task_id"),
+    };
+    match spec.get("type").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => {}
+        _ => return bad_request("task_spec 缺必填字段 type"),
+    }
+    // taskengine::apply_event 的取体口径是 frame["payload"]（信封形）——
+    // 协议 §2 的 spec 体内本身带名为 payload 的任务载荷字段，裸传会被误认
+    // 为信封，故必须包一层：外帧 payload=spec 原文；spec 体内缺 topic 时补
+    // 定 "task_spec"（apply_event 从 payload 里读 topic；已有 topic 一律不
+    // 覆盖，非法 topic 走 Ignored→400），其余字段原样入库（rec.spec 原文）。
+    let mut spec = body.clone();
+    if let Some(map) = spec.as_object_mut() {
+        map.entry("topic".to_string())
+            .or_insert_with(|| json!("task_spec"));
+    }
+    let frame = json!({ "topic": "task_spec", "payload": spec });
+
+    let mut table = mesh.table.lock().unwrap();
+    if let Some(rec) = table.get(&task_id) {
+        // 同 task_id **非终态**重复声明 → 409（设计 §2.2"未清扫 → 409"）。
+        // 终态行允许重投：apply_event 对硬终态粘性、failed 行 spec 首见
+        // 定版不覆盖——等于幂等读回当前行，不产生双行；要重建请先 DELETE。
+        if !rec.state.is_terminal() {
+            let st = rec.state.as_str();
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!("task {task_id} 已存在（state: {st}），非终态禁止重复声明"),
+                    "task_id": task_id,
+                    "state": st,
+                })),
+            );
+        }
+    }
+    let prev = table.get(&task_id).cloned();
+    if let taskengine::ApplyOutcome::Ignored { reason } =
+        taskengine::apply_event(&mut table, &frame)
+    {
+        // Ignored 承诺表零改动（MissingTaskId/NonTaskTopic/DuplicateSeq 都在
+        // 建行之前返回），无需回滚；映射到客户端可读的错误。
+        tracing::warn!(task_id = %task_id, ?reason, "mesh: task_spec 被引擎拒收");
+        return match reason {
+            taskengine::IgnoreReason::DuplicateSeq => (
+                StatusCode::CONFLICT,
+                Json(
+                    json!({ "error": format!("task {task_id} seq 幂等键重复"), "task_id": task_id }),
+                ),
+            ),
+            other => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("task_spec 非法（{other:?}）：需 task_id 与任务面 topic"),
+                    "task_id": task_id,
+                })),
+            ),
+        };
+    }
+    let rec_json = match table.get(&task_id).map(serde_json::to_value) {
+        Some(Ok(v)) => v,
+        // 防御：apply 后行必在；序列化理论恒成，真出事也不留幻影行。
+        _ => {
+            rollback_row(&mut table, &task_id, prev);
+            tracing::error!(task_id = %task_id, "mesh: 任务行序列化失败");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "task record serialize failed" })),
+            );
+        }
+    };
+    let ev = TaskEvent::up(&task_id, mesh.next_rev(), rec_json);
+    if let Err(e) = mesh.store.append(&ev) {
+        rollback_row(&mut table, &task_id, prev);
+        tracing::error!(error = %e, task_id = %task_id, "mesh: 任务 journal 落盘失败");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "task journal append failed" })),
+        );
+    }
+    let final_state = table
+        .get(&task_id)
+        .map(|r| r.state.as_str().to_string())
+        .unwrap_or_else(|| "pending".to_string());
+    drop(table);
+    mesh.maybe_snapshot();
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "ok": true, "task_id": task_id, "state": final_state })),
+    )
+}
+
+/// journal 落盘失败时把内存表回滚到 apply 前状态（表赢于日志的前提是
+/// 日志绝不比表新；幻影行重启即蒸发，宁可当场拒绝写入）。
+fn rollback_row(table: &mut TaskTable, task_id: &str, prev: Option<TaskRecord>) {
+    match prev {
+        Some(rec) => {
+            table.insert(task_id.to_string(), rec);
+        }
+        None => {
+            table.remove(task_id);
+        }
+    }
+}
+
+/// `GET /v1/tasks/{task_id}` 单任务详情（引擎表行，设计 §2.2）。
+/// M1 返回纯表行（spec 原文、未脱敏、字段 snake_case）；表+trail 合并
+/// 视图挂 M2 事件收敛接线后做。license 无效时的 history 回退按拍板
+/// "写面=Mesh"处理为 403（免费层用既有 `GET /v1/tasks?task_id=` 投影）。
+async fn tasks_get_one(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    UrlPath(task_id): UrlPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let Some(mesh) = state.mesh.as_ref() else {
+        return mesh_required();
+    };
+    let table = mesh.table.lock().unwrap();
+    match table.get(&task_id) {
+        Some(rec) => {
+            let value = serde_json::to_value(rec).unwrap_or(serde_json::Value::Null);
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "task_id": task_id, "task": value })),
+            )
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("task {task_id} not found") })),
+        ),
+    }
+}
+
+/// `POST /v1/tasks/{task_id}/cancel`：引擎表置 cancelling + journal up。
+/// **M1 不发总线 task_cancel 帧**（执行方收不到撤销指令——reconcile loop
+/// 与 Router send 接线在 M2，见上方接线点清单）。硬终态行撤销无意义 → 409。
+async fn tasks_cancel_post(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    UrlPath(task_id): UrlPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let Some(mesh) = state.mesh.as_ref().cloned() else {
+        return mesh_required();
+    };
+    let mut table = mesh.table.lock().unwrap();
+    // 先取值判定再动表（避免 match 持有借用期间 mutate 的 NLL 边缘问题）。
+    let current = table.get(&task_id).map(|r| r.state.as_str().to_string());
+    match current {
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("task {task_id} not found") })),
+            )
+        }
+        Some(st) => {
+            // cancelling/pending/running 走状态机；硬终态（succeeded/declined/
+            // cancelled/rolled_back/expired）撤销无意义 → 409。
+            if table
+                .get(&task_id)
+                .is_some_and(|r| r.state.is_hard_terminal())
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": format!("task {task_id} 已是硬终态（{st}），不可撤销"),
+                        "task_id": task_id,
+                        "state": st,
+                    })),
+                );
+            }
+        }
+    }
+    // 走引擎状态机正门（协议 §3 cancel 边：非硬终态 → cancelling），
+    // 而不是手工改字段——粘性/计数语义与投影单测对拍保持同源。
+    let frame = json!({ "topic": "task_cancel", "task_id": task_id });
+    let prev = table.get(&task_id).cloned();
+    taskengine::apply_event(&mut table, &frame);
+    let rec_json = serde_json::to_value(&table[&task_id]).unwrap_or(serde_json::Value::Null);
+    if let Err(e) = mesh
+        .store
+        .append(&TaskEvent::up(&task_id, mesh.next_rev(), rec_json))
+    {
+        rollback_row(&mut table, &task_id, prev);
+        tracing::error!(error = %e, task_id = %task_id, "mesh: 撤销事件落盘失败");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "task journal append failed" })),
+        );
+    }
+    let final_state = table
+        .get(&task_id)
+        .map(|r| r.state.as_str().to_string())
+        .unwrap_or_default();
+    drop(table);
+    mesh.maybe_snapshot();
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "task_id": task_id, "state": final_state })),
+    )
+}
+
+/// `DELETE /v1/tasks/{task_id}` 清扫：**仅终态可删**（设计 §2.2），非终态
+/// 409——活任务被删=引擎丢失期望态，必须走 cancel 收敛后再清扫。
+/// 先 journal `del` 落盘（fsync）再移出内存表；重启重放 del 自然对齐。
+async fn tasks_delete(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    UrlPath(task_id): UrlPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let Some(mesh) = state.mesh.as_ref().cloned() else {
+        return mesh_required();
+    };
+    let mut table = mesh.table.lock().unwrap();
+    // 先取值判定（同上，规避 match 借用跨 mutate）。
+    let entry = table
+        .get(&task_id)
+        .map(|r| (r.state.is_terminal(), r.state.as_str().to_string()));
+    match entry {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("task {task_id} not found") })),
+        ),
+        // 仅终态可删（设计 §2.2）：非终态 409——活任务被删=引擎丢失期望态，
+        // 必须先 cancel 并由 M2 tick 收敛到 cancelled 后再清扫。
+        Some((false, st)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("task {task_id} 非终态（state: {st}），仅终态任务可删除；先走 cancel"),
+                "task_id": task_id,
+                "state": st,
+            })),
+        ),
+        Some((true, _)) => {
+            if let Err(e) = mesh
+                .store
+                .append(&TaskEvent::del(&task_id, mesh.next_rev()))
+            {
+                tracing::error!(error = %e, task_id = %task_id, "mesh: 清扫事件落盘失败");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "task journal append failed" })),
+                );
+            }
+            table.remove(&task_id);
+            drop(table);
+            mesh.maybe_snapshot();
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "task_id": task_id, "deleted": true })),
+            )
+        }
+    }
 }
 
 // ---- v0.5 §4.5 薄档：一键熔断 lockdown --------------------------------------
@@ -2479,4 +2946,360 @@ fn unauthorized() -> (StatusCode, Json<serde_json::Value>) {
         StatusCode::UNAUTHORIZED,
         Json(json!({ "error": "invalid or missing X-Auth-Token" })),
     )
+}
+
+// ===========================================================================
+// v0.6 M1 写面单测（任务波验收：403 三门 / roundtrip 原文 / 409 / 终态门 /
+// features 默认钉死）。不打 tower 桩——本仓无 tower 直接依赖；起真监听
+// （axum::serve + 127.0.0.1:0）+ reqwest（既有依赖）走完整 HTTP 栈，
+// 路由表、extractor、鉴权头一并覆盖。
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+    use ed25519_compact::{KeyPair, Seed};
+
+    /// license.rs 内置开发公钥（DEV_PUBLIC_KEY_B64）对应的 fixture 私钥
+    /// （seed=0x00..0x1F，见 license.rs 头注释）；单测自签可过验的 license。
+    fn dev_keypair() -> KeyPair {
+        let seed_bytes: [u8; 32] = std::array::from_fn(|i| i as u8);
+        KeyPair::from_seed(Seed::from_slice(&seed_bytes).expect("32 字节 seed 恒合法"))
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("agentlink-m1-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 按 license.rs 规范拼 canonical 签名体（字典序 key=value、LF 连接、
+    /// 无尾换行）签发一枚未过期的 license.toml，返回文件路径。
+    fn write_valid_license(dir: &Path) -> PathBuf {
+        let kp = dev_keypair();
+        let expires = (time::OffsetDateTime::now_utc() + time::Duration::days(366))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let body =
+            format!("expires={expires}\nissued=2026-01-01T00:00:00Z\nnode_quota=10\ntier=starter");
+        let sig = kp.sk.sign(body.as_bytes(), None);
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig[..]);
+        let text = format!(
+            "tier = \"starter\"\nnode_quota = 10\nissued = \"2026-01-01T00:00:00Z\"\nexpires = \"{expires}\"\nsignature = \"{sig_b64}\"\n"
+        );
+        let path = dir.join("license.toml");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn mesh_test_cfg(dir: &Path, license: Option<PathBuf>) -> Config {
+        let mut cfg = Config::generate(Some("m1-test".to_string()), None, None);
+        cfg.data_dir = dir.to_path_buf();
+        cfg.mesh.enabled = license.is_some();
+        cfg.mesh.license_file = license;
+        cfg
+    }
+
+    fn state_for(cfg: Config, mesh: Option<Arc<MeshRuntime>>) -> SharedState {
+        let router = Arc::new(Router::new(&cfg));
+        let config_file = cfg.data_dir.join("agentlink.json");
+        let (peer_tx, _peer_rx) = mpsc::channel(1);
+        let mut st = AppState::new(
+            cfg,
+            config_file,
+            PeerTable::new(),
+            peer_tx,
+            router,
+            Arc::new(FileManager::new()),
+        );
+        st.mesh = mesh;
+        Arc::new(st)
+    }
+
+    /// 有效 license 的活 mesh 运行态（走真实 build_mesh 装配路径）。
+    fn live_mesh(dir: &Path) -> (Config, Arc<MeshRuntime>) {
+        let cfg = mesh_test_cfg(dir, Some(write_valid_license(dir)));
+        let mesh = build_mesh(&cfg, &cfg.data_dir.join("agentlink.json"))
+            .expect("有效 license 应装配成功");
+        (cfg, mesh)
+    }
+
+    struct Api {
+        base: String,
+        token: String,
+    }
+
+    impl Api {
+        async fn open(state: SharedState) -> Api {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let token = state.config.local_api.token.clone();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, router(state)).await;
+            });
+            Api {
+                base: format!("http://{addr}"),
+                token,
+            }
+        }
+        fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+            reqwest::Client::new()
+                .request(method, format!("{}{path}", self.base))
+                .header("x-auth-token", self.token.clone())
+        }
+        async fn call(&self, b: reqwest::RequestBuilder) -> (StatusCode, serde_json::Value) {
+            let resp = b.send().await.unwrap();
+            let status = resp.status();
+            (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+        }
+        async fn get(&self, path: &str) -> (StatusCode, serde_json::Value) {
+            self.call(self.req(reqwest::Method::GET, path)).await
+        }
+        async fn post(
+            &self,
+            path: &str,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            self.call(self.req(reqwest::Method::POST, path).json(&body))
+                .await
+        }
+        async fn delete(&self, path: &str) -> (StatusCode, serde_json::Value) {
+            self.call(self.req(reqwest::Method::DELETE, path)).await
+        }
+    }
+
+    /// 验收钉死：默认态（mesh 关=免费层）/health features 与 0.5.9 逐字符一致。
+    #[tokio::test]
+    async fn health_features_default_pins_059() {
+        let dir = tmp_dir("health");
+        let cfg = mesh_test_cfg(&dir, None);
+        let api = Api::open(state_for(cfg, None)).await;
+        let (status, body) = api.get("/v1/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["features"],
+            json!(["events", "redact", "tasks", "json-log", "lockdown", "hello"])
+        );
+        assert!(!body.to_string().contains("engine"));
+    }
+
+    /// mesh 生效时 features 追加 "engine"，前六项次序不变（只增不改）。
+    #[tokio::test]
+    async fn health_adds_engine_when_mesh_active() {
+        let dir = tmp_dir("health-engine");
+        let (cfg, mesh) = live_mesh(&dir);
+        let api = Api::open(state_for(cfg, Some(mesh))).await;
+        let (status, body) = api.get("/v1/health").await;
+        assert_eq!(status, StatusCode::OK);
+        let feats = body["features"].as_array().unwrap();
+        let expected = json!(["events", "redact", "tasks", "json-log", "lockdown", "hello"]);
+        assert_eq!(&feats[..6], expected.as_array().unwrap().as_slice());
+        assert_eq!(feats.len(), 7);
+        assert_eq!(feats[6], json!("engine"));
+    }
+
+    /// 403 三门：mesh 关 / license 缺失 / license 坏 → build_mesh=None；
+    /// 免费层态下写面四端点全 403 且文案精确；既有 GET /v1/tasks 不受影响。
+    #[tokio::test]
+    async fn write_surface_denied_without_mesh() {
+        let dir = tmp_dir("gate403");
+        let config_file = dir.join("agentlink.json");
+        // 门一：mesh.enabled=false（默认）
+        let cfg_off = mesh_test_cfg(&dir, None);
+        assert!(build_mesh(&cfg_off, &config_file).is_none());
+        // 门二：enabled 但 license_file 未设
+        let mut cfg_nolic = cfg_off.clone();
+        cfg_nolic.mesh.enabled = true;
+        assert!(build_mesh(&cfg_nolic, &config_file).is_none());
+        // 门三：license 文件结构坏（无 signature 字段）
+        std::fs::write(dir.join("license.toml"), "tier = \"starter\"\n").unwrap();
+        let cfg_bad = mesh_test_cfg(&dir, Some(dir.join("license.toml")));
+        assert!(build_mesh(&cfg_bad, &config_file).is_none());
+        // 篡改签（quota 越权抬升）同样拒
+        let good = std::fs::read_to_string(write_valid_license(&dir)).unwrap();
+        let tampered = good.replace("node_quota = 10", "node_quota = 50");
+        std::fs::write(dir.join("license.toml"), &tampered).unwrap();
+        let cfg_tampered = mesh_test_cfg(&dir, Some(dir.join("license.toml")));
+        assert!(build_mesh(&cfg_tampered, &config_file).is_none());
+        // 免费层态：写面四端点 403 + 拍板文案
+        let api = Api::open(state_for(cfg_off.clone(), None)).await;
+        let calls = [
+            api.post("/v1/tasks", json!({"task_id": "g1", "type": "shell"}))
+                .await,
+            api.get("/v1/tasks/g1").await,
+            api.post("/v1/tasks/g1/cancel", json!({})).await,
+            api.delete("/v1/tasks/g1").await,
+        ];
+        for (code, body) in calls {
+            assert_eq!(code, StatusCode::FORBIDDEN);
+            assert_eq!(body["error"], json!("mesh license required"));
+        }
+        // 零行为变化：既有 GET /v1/tasks 投影键不变
+        let (code, body) = api.get("/v1/tasks").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(body["ok"].is_boolean() && body["tasks"].is_array() && body["total"].is_number());
+    }
+
+    /// POST→GET roundtrip：spec 原文保留（未建模字段透传、未脱敏）、
+    /// 状态 pending、journal 可读回；缺 id 详情 404；无 topic 也能入库。
+    #[tokio::test]
+    async fn tasks_post_get_roundtrip_keeps_spec_verbatim() {
+        let dir = tmp_dir("roundtrip");
+        let (cfg, mesh) = live_mesh(&dir);
+        let api = Api::open(state_for(cfg, Some(mesh.clone()))).await;
+        let spec = json!({
+            "topic": "task_spec",
+            "task_id": "t-round",
+            "type": "shell",
+            "requires": ["linux", "shell"],
+            "deadline": "2099-12-31T23:59:59Z",
+            "payload": {"cmd": "echo 你好", "cwd": "/tmp"},
+            "budget": {"max_nodes": 3, "max_retries": 1},
+            "priority": 7,
+            "correlation": "corr-001",
+        });
+        let (code, body) = api.post("/v1/tasks", spec.clone()).await;
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["task_id"], json!("t-round"));
+        assert_eq!(body["state"], json!("pending"));
+        let (code, got) = api.get("/v1/tasks/t-round").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(got["task"]["state"], json!("pending"));
+        let saved = &got["task"]["spec"];
+        for key in [
+            "payload",
+            "requires",
+            "deadline",
+            "budget",
+            "priority",
+            "correlation",
+        ] {
+            assert_eq!(&saved[key], &spec[key], "spec 字段 {key} 必须原文保留");
+        }
+        assert_eq!(got["task"]["type"], json!("shell"));
+        // 重启底线：journal 立即可读回同一行
+        let recs = mesh.store.rebuild().unwrap();
+        assert!(recs.contains_key("t-round"));
+        // 无 topic 的 body：写面补 topic=task_spec 入库，仍成功
+        let (code, _) = api
+            .post("/v1/tasks", json!({"task_id": "t-notopic", "type": "http"}))
+            .await;
+        assert_eq!(code, StatusCode::ACCEPTED);
+        // 表内无此 id → 404
+        let (code, _) = api.get("/v1/tasks/nope").await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
+    /// 校验与冲突：缺 task_id/type → 400；非体 JSON → 400；
+    /// 同 task_id 非终态重复 POST → 409。
+    #[tokio::test]
+    async fn tasks_post_validation_and_conflict() {
+        let dir = tmp_dir("conflict");
+        let (cfg, mesh) = live_mesh(&dir);
+        let api = Api::open(state_for(cfg, Some(mesh))).await;
+        let (code, body) = api.post("/v1/tasks", json!({ "type": "shell" })).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(body["error"].is_string());
+        let (code, _) = api.post("/v1/tasks", json!({ "task_id": "x" })).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let (code, _) = api.post("/v1/tasks", json!("不是对象")).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let ok_spec = json!({ "task_id": "t-dup", "type": "shell" });
+        assert_eq!(
+            api.post("/v1/tasks", ok_spec.clone()).await.0,
+            StatusCode::ACCEPTED
+        );
+        let (code, body) = api.post("/v1/tasks", ok_spec.clone()).await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(body["state"], json!("pending"));
+        assert_eq!(body["task_id"], json!("t-dup"));
+    }
+
+    /// cancel/DELETE 语义：cancel 置 cancelling（M1 只落表不发总线帧）；
+    /// 非终态 DELETE 409；注入硬终态帧后 cancel→409、DELETE→200、GET→404，
+    /// rebuild 后行确实消失。
+    #[tokio::test]
+    async fn cancel_and_delete_terminal_gating() {
+        let dir = tmp_dir("cancel");
+        let (cfg, mesh) = live_mesh(&dir);
+        let api = Api::open(state_for(cfg, Some(mesh.clone()))).await;
+        assert_eq!(
+            api.post("/v1/tasks", json!({"task_id": "t-can", "type": "shell"}))
+                .await
+                .0,
+            StatusCode::ACCEPTED
+        );
+        // 非终态 DELETE → 409
+        let (code, body) = api.delete("/v1/tasks/t-can").await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(body["state"], json!("pending"));
+        // cancel → cancelling（cancelling 仍是非终态，M1 无 tick 收敛）
+        let (code, body) = api.post("/v1/tasks/t-can/cancel", json!({})).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["state"], json!("cancelling"));
+        let (code, _) = api.delete("/v1/tasks/t-can").await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        // 模拟 M2 事件收敛：直接灌一帧 task_succeeded（写面不暴露该路径）
+        {
+            let mut table = mesh.table.lock().unwrap();
+            taskengine::apply_event(
+                &mut table,
+                &json!({"topic": "task_succeeded", "task_id": "t-can", "seq": 9}),
+            );
+            let rec = serde_json::to_value(&table["t-can"]).unwrap();
+            mesh.store
+                .append(&TaskEvent::up("t-can", 100, rec))
+                .unwrap();
+        }
+        let (code, body) = api.get("/v1/tasks/t-can").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["task"]["state"], json!("succeeded"));
+        // 硬终态 cancel → 409
+        let (code, _) = api.post("/v1/tasks/t-can/cancel", json!({})).await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        // 不存在 id cancel → 404
+        let (code, _) = api.post("/v1/tasks/ghost/cancel", json!({})).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        // 终态 DELETE → 200，随后 404，重建后无行
+        let (code, body) = api.delete("/v1/tasks/t-can").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["deleted"], json!(true));
+        let (code, _) = api.get("/v1/tasks/t-can").await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let recs = mesh.store.rebuild().unwrap();
+        assert!(!recs.contains_key("t-can"));
+    }
+
+    /// 重启恢复：同一 data_dir 再次 build_mesh，表从 journal 灌回
+    /// （直接读 rec 口径），行字段完整。
+    #[tokio::test]
+    async fn mesh_restarts_from_journal() {
+        let dir = tmp_dir("restart");
+        let cfg = mesh_test_cfg(&dir, Some(write_valid_license(&dir)));
+        let config_file = dir.join("agentlink.json");
+        let mesh1 = build_mesh(&cfg, &config_file).unwrap();
+        let api = Api::open(state_for(cfg.clone(), Some(mesh1))).await;
+        assert_eq!(
+            api.post(
+                "/v1/tasks",
+                json!({"task_id": "t-persist", "type": "shell"})
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED
+        );
+        // 模拟进程重启：重新走一遍启动装配
+        let mesh2 = build_mesh(&cfg, &config_file).unwrap();
+        {
+            let t2 = mesh2.table.lock().unwrap();
+            let rec = t2.get("t-persist").expect("重启必须恢复任务行");
+            assert_eq!(rec.state, taskengine::TaskState::Pending);
+            assert_eq!(rec.task_type.as_deref(), Some("shell"));
+        }
+        let api2 = Api::open(state_for(cfg, Some(mesh2))).await;
+        let (code, got) = api2.get("/v1/tasks/t-persist").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(got["task"]["state"], json!("pending"));
+    }
 }

@@ -410,14 +410,22 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
     let peers = peer::PeerTable::new();
     let router = Arc::new(router::Router::new(&cfg));
     let files = Arc::new(file::FileManager::new());
-    let state = Arc::new(AppState::new(
+    let mut state_inner = AppState::new(
         cfg.clone(),
         config_file,
         peers,
         peer_tx,
         router.clone(),
         files,
-    ));
+    );
+    // v0.6 M1 mesh 启动装配（设计 §2.1/§3.2 生效矩阵）：
+    // - mesh.enabled=false（默认）→ build_mesh 直接返回 None，引擎态完全
+    //   不实例化，行为与 0.5.9 逐字符一致（写面 403、features 不加 engine）；
+    // - enabled=true → 验 license（失败只 tracing::error 并退化免费层，
+    //   绝不炸进程）→ TaskStore 打开 + rebuild 灌表（引擎休眠：只恢复表，
+    //   不起 reconcile loop——loop/总线派发/调度全在 M2/M3 接线）。
+    state_inner.mesh = api::build_mesh(&state_inner.config, &state_inner.config_file);
+    let state = Arc::new(state_inner);
     // Restore the user's "forget this node" list (ghost-peer cleanup,
     // paired with DELETE /v1/peers/{node_id}).
     let forgotten_path = cfg.data_dir.join("forgotten_peers.json");
