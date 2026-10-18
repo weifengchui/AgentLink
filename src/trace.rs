@@ -182,6 +182,7 @@ mod tests {
             json!({"topic": "task_spec", "correlation": "c1"}),
             None,
             reply_to.map(|s| s.to_string()),
+            None,
             Some("alice".to_string()),
             Some("bob".to_string()),
         );

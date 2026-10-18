@@ -176,6 +176,7 @@ mod tests {
             json!({ "probe": "p1" }),
             None,
             None,
+            None,
             Some("cli".to_string()),
             Some(HELLO_AGENT.to_string()),
         );
@@ -217,6 +218,7 @@ mod tests {
             action: "send".to_string(),
             seq,
             reply_to: None,
+            thread: None,
             trace_id: None,
             payload,
             blocked: None,
@@ -306,6 +308,7 @@ mod tests {
                 json!({ "content": "hello" }),
                 None,
                 None,
+                None,
                 Some("a1".to_string()),
                 Some("b1".to_string()),
             )
@@ -339,6 +342,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         r.send(ctrl).await.unwrap();
         assert_eq!(r.lockdown_stats().1, 1);
@@ -350,6 +354,7 @@ mod tests {
             "msg",
             "send",
             json!({ "content": "x" }),
+            None,
             None,
             None,
             None,
@@ -583,6 +588,11 @@ pub struct HistoryEntry {
     /// history lines written before v0.4.16 (serde default = None).
     #[serde(default)]
     pub reply_to: Option<String>,
+    /// 消息组（v0.5.8 R2）：同一主题多回合往来的显式线程键（Envelope.thread
+    /// 原样落账）。星图 buildTopics 优先按它归组，无则回退 reply_to 链根。
+    /// Absent in history lines written before v0.5.8 (serde default = None).
+    #[serde(default)]
+    pub thread: Option<String>,
     /// v0.5 §7.1: trace id of the message (absent for lines written by
     /// older nodes and for events without a message context).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1179,6 +1189,7 @@ impl Router {
             action: env.action,
             seq: 0,
             reply_to: env.reply_to,
+            thread: env.thread,
             trace_id: env.trace_id,
             payload: env.payload,
             blocked: None,
@@ -1650,6 +1661,7 @@ impl Router {
             payload,
             Some(30),
             Some(req.msg_id.clone()),
+            None,
             Some(HELLO_AGENT.to_string()),
             req.from_agent.clone(),
         );
@@ -2076,6 +2088,7 @@ impl Router {
             action: env.action.clone(),
             seq: 0,
             reply_to: env.reply_to.clone(),
+            thread: env.thread.clone(),
             trace_id: env.trace_id.clone(),
             // v0.5 §2: observer copy is sanitized; the delivered frame above
             // (routed from `env` directly) still carries the original payload.
@@ -2219,6 +2232,7 @@ impl Router {
             action: "file".to_string(),
             seq: 0,
             reply_to: None,
+            thread: None,
             trace_id: None,
             payload: self.redactor.redact_value(&serde_json::json!({
                 "file_name": file_name,

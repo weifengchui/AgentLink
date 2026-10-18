@@ -303,6 +303,9 @@ struct SendRequest {
     ttl_seconds: Option<u64>,
     #[serde(default)]
     reply_to: Option<String>,
+    /// 消息组（v0.5.8 R2）：显式线程键，同 thread 的消息在星图归为一个话题组。
+    #[serde(default)]
+    thread: Option<String>,
     /// Sender agent id (multiple agents may share this node).
     #[serde(default)]
     from_agent: Option<String>,
@@ -346,6 +349,7 @@ async fn send(
         payload,
         req.ttl_seconds,
         req.reply_to,
+        req.thread.filter(|t| !t.trim().is_empty()),
         req.from_agent,
         req.to_agent,
     );
@@ -1783,6 +1787,7 @@ th.srt:hover{color:#dbe2ea}
       <div class="card"><h2>发送消息 / 文件</h2>
                 <div class="row"><span class="lbl">目标</span><select id="to2"></select></div>
                 <div class="row"><span class="lbl">发件身份</span><select id="from2" onchange="try{localStorage.fromagent=this.value}catch(e){}"></select><span class="hint">本机注册的 agent；出站消息与文件的历史记录带上它，对话记录里发端才会显示双层胶囊。选「整机」则只显节点名。</span></div>
+        <div class="row"><span class="lbl">消息组</span><input id="grp2" placeholder="主题短名（可选，如 upgrade-v0.5.8；同组消息在星图归为一个话题）" style="flex:1"><span class="hint">留空则按 reply_to 链归组（旧行为不变）。</span></div>
         <div class="row"><textarea id="payload2" rows="2" placeholder='{"content":"你好"}　可只发附件；在框内 Ctrl+V 可直接贴图'></textarea></div>
         <div class="dz" id="dz2">📎 拖拽文件或文件夹到此　·　<button type="button" class="lk" onclick="el('file2').click()">选文件</button>　·　<button type="button" class="lk" onclick="el('dir2').click()">选目录（自动打包 zip）</button><input type="file" id="file2" class="hide-in" multiple><input type="file" id="dir2" class="hide-in" webkitdirectory multiple></div>
         <div class="row"><button class="primary" onclick="doSendAll('2')">发送</button><span id="attinfo2"></span></div>
@@ -2090,12 +2095,13 @@ async function doSendAll(sfx){
   const res=el('sendres'+sfx);
   const tgt=targetOf(val('to'+sfx)); if(!tgt.to){res.textContent='请选择目标';return;}
   const fam=sfx==='2'?(val('from2')||'').trim():'';  // 发件身份（第九轮 R1）
+  const grp=sfx==='2'?(val('grp2')||'').trim():'';   // 消息组（第十五轮 R2）
   const raw=val('payload'+sfx), atts=ATT[sfx]||[];
   if(!raw&&!atts.length){res.textContent='消息内容和附件都是空的';return;}
   const done=[];
   if(raw){let payload;try{payload=JSON.parse(raw);}catch{payload={content:raw};}
     if(atts.length&&!payload.file)payload.note='附件：'+atts.map(a=>a.name).join('、');
-    try{await j('/v1/send',{method:'POST',body:JSON.stringify({to:tgt.to,to_agent:tgt.to_agent,from_agent:fam||undefined,type:'text',action:'send',payload})});done.push('消息 ok');res.textContent='消息 ok，处理附件中…';}
+    try{await j('/v1/send',{method:'POST',body:JSON.stringify({to:tgt.to,to_agent:tgt.to_agent,from_agent:fam||undefined,thread:grp||undefined,type:'text',action:'send',payload})});done.push('消息 ok');res.textContent='消息 ok，处理附件中…';}
     catch(e){res.textContent='发送失败: '+(e.message||e);return;}}
   let okn=0;
   for(let i=0;i<atts.length;i++){const att=atts[i];const q=new URLSearchParams({to:tgt.to});if(tgt.to_agent)q.set('to_agent',tgt.to_agent);if(fam)q.set('from_agent',fam);
