@@ -72,6 +72,10 @@ pub struct Engine {
     batch_state: Arc<Mutex<HashMap<String, BatchState>>>,
     /// 本节点 machine tags（用于 exclude_tags 过滤）。
     local_tags: Vec<String>,
+    /// P0 出站 webhook 客户端（仅当配置了 url 和 events 时启用）。
+    webhook: Option<Arc<crate::api::WebhookClient>>,
+    /// 本节点 node_id（用于 webhook payload）。
+    node_id: String,
 }
 
 impl Engine {
@@ -88,6 +92,8 @@ impl Engine {
             0, // max_inflight：0=不限制，M3 后续由配额/护栏决定
         );
         let local_tags = state.config.tags.clone();
+        let webhook = crate::api::WebhookClient::new(&state.config.webhook);
+        let node_id = state.config.node_id.clone();
         let engine = Engine {
             mesh,
             router,
@@ -95,6 +101,8 @@ impl Engine {
             scheduler,
             batch_state: Arc::new(Mutex::new(HashMap::new())),
             local_tags,
+            webhook: webhook.map(Arc::new),
+            node_id,
         };
         tokio::spawn(async move {
             if let Err(e) = engine.run(shutdown_rx).await {
@@ -584,15 +592,37 @@ impl Engine {
     /// P3-3：记录 correlation 批次的任务终态，用于更新护栏状态。
     /// 由 consume_event 中状态变更为 terminal 时调用（见 tick/consume_event 后续接线）。
     pub fn on_task_terminal(&self, task_id: &str, state: TaskState) {
-        let spec = self.spec_of(task_id);
-        let Some(spec) = spec else { return };
-        let correlation = match spec.get("correlation").and_then(|v| v.as_str()) {
-            Some(c) => c,
-            None => return,
-        };
+        let Some(spec) = self.spec_of(task_id) else { return };
+        let correlation = spec.get("correlation").and_then(|v| v.as_str()).map(|c| c.to_string());
 
+        // P0 出站 webhook：任务失败/超期时通知外部（不依赖 correlation）
+        if matches!(state, TaskState::Failed | TaskState::Expired) {
+            if let Some(wh) = &self.webhook {
+                let wh = wh.clone();
+                let task_id_owned = task_id.to_string();
+                let state_str = state.as_str().to_string();
+                let correlation_for_hook = correlation.as_deref().map(|c| c.to_string());
+                let node_id = self.node_id.clone();
+                tokio::spawn(async move {
+                    wh.fire(
+                        "task_failed".to_string(),
+                        node_id,
+                        serde_json::json!({
+                            "task_id": task_id_owned,
+                            "state": state_str,
+                            "correlation": correlation_for_hook,
+                            "spec": spec,
+                        }),
+                    )
+                    .await;
+                });
+            }
+        }
+
+        // 批次护栏：只有有 correlation 时才参与批次状态机
+        let Some(correlation) = correlation else { return };
         let mut batch = self.batch_state.lock().unwrap();
-        let st = batch.entry(correlation.to_string()).or_default();
+        let st = batch.entry(correlation.clone()).or_default();
 
         match state {
             TaskState::Succeeded => {
@@ -650,7 +680,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AuthConfig, Config, EngineConfig, MeshConfig, Role};
+    use crate::config::{AuthConfig, Config, EngineConfig, MeshConfig, WebhookConfig};
     use crate::router::Router;
     use crate::taskengine::{self, TaskRecord, TaskState};
     use serde_json::json;
@@ -687,6 +717,7 @@ mod tests {
                 },
             },
             auth: AuthConfig::default(),
+            webhook: WebhookConfig::default(),
         };
         let peers = crate::peer::PeerTable::new();
         let (peer_tx, _) = tokio::sync::mpsc::channel(256);
@@ -724,6 +755,8 @@ mod tests {
             scheduler: Scheduler::new(cfg.mesh.engine.max_concurrent_per_node, 0),
             batch_state: Arc::new(std::sync::Mutex::new(HashMap::new())),
             local_tags: cfg.tags.clone(),
+            webhook: crate::api::WebhookClient::new(&cfg.webhook).map(Arc::new),
+            node_id: cfg.node_id.clone(),
         };
         (state, mesh, engine)
     }

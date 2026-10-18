@@ -53,6 +53,10 @@ pub struct Config {
     /// 视为 Admin 角色，行为与 0.5.9 完全一致（零破坏）。
     #[serde(default)]
     pub auth: AuthConfig,
+    /// 出站 webhook 配置（v0.6 P0）。用于任务失败/节点离线/审计告警等
+    /// 事件的外部通知。老配置缺此段 = 不启用 webhook，零破坏。
+    #[serde(default)]
+    pub webhook: WebhookConfig,
 }
 
 /// Mesh 总开关与 license/引擎调参入口。缺省即免费层：引擎不 spawn、
@@ -222,6 +226,39 @@ pub struct DeliveryConfig {
     /// many seconds are auto-removed (0 disables the cleanup).
     #[serde(default = "default_agent_stale_ttl")]
     pub agent_stale_ttl_seconds: u64,
+}
+
+/// 出站 webhook 配置（v0.6 P0）。用于任务失败/节点离线/审计告警等
+/// 事件的外部通知。所有字段缺省时 webhook 不启用。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    /// webhook 目标 URL（如 http://192.168.1.50:9000/webhooks/agentlink）。
+    /// 空字符串表示不启用 webhook。
+    #[serde(default)]
+    pub url: String,
+    /// 触发 webhook 的事件类型，逗号分隔（如 "task_failed,node_offline,audit_alert"）。
+    /// 空字符串表示不启用任何事件。
+    #[serde(default)]
+    pub events: String,
+    /// HTTP 请求超时（秒），缺省 5 秒。
+    #[serde(default = "default_webhook_timeout_seconds")]
+    pub timeout_seconds: u64,
+    /// 最大重试次数，缺省 3 次。
+    #[serde(default = "default_webhook_max_retries")]
+    pub max_retries: u32,
+    /// 重试间隔（秒），缺省 10 秒。
+    #[serde(default = "default_webhook_retry_interval_seconds")]
+    pub retry_interval_seconds: u64,
+}
+
+fn default_webhook_timeout_seconds() -> u64 {
+    5
+}
+fn default_webhook_max_retries() -> u32 {
+    3
+}
+fn default_webhook_retry_interval_seconds() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -576,6 +613,7 @@ impl Config {
             },
             mesh: MeshConfig::default(),
             auth: AuthConfig::default(),
+            webhook: WebhookConfig::default(),
         }
     }
 

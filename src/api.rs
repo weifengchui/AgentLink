@@ -26,7 +26,7 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::config::{Config, Role};
+use crate::config::{Config, Role, WebhookConfig};
 use crate::conn;
 use crate::file::FileManager;
 use crate::license::{self, LicenseInfo};
@@ -559,6 +559,77 @@ async fn metrics_get(
         )
         .body(Body::from(out))
         .unwrap()
+}
+
+/// 出站 webhook 客户端（v0.6 P0）。用于向外部端点发送事件通知。
+/// 所有发送都是异步的（tokio::spawn），不阻塞调用方。
+#[allow(dead_code)]
+pub struct WebhookClient {
+    http: reqwest::Client,
+    config: WebhookConfig,
+}
+
+#[allow(dead_code)]
+impl WebhookClient {
+    pub fn new(config: &WebhookConfig) -> Option<Self> {
+        if config.url.is_empty() || config.events.is_empty() {
+            tracing::warn!(url = %config.url, events = %config.events, "webhook: 未配置 url 或 events，跳过");
+            return None;
+        }
+        tracing::info!(url = %config.url, events = %config.events, "webhook: 客户端已创建");
+        Some(Self {
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(config.timeout_seconds))
+                .build()
+                .ok()?,
+            config: config.clone(),
+        })
+    }
+
+    /// 判断给定事件类型是否应触发 webhook。
+    pub fn should_fire(&self, event: &str) -> bool {
+        self.config
+            .events
+            .split(',')
+            .map(|e| e.trim())
+            .any(|e| !e.is_empty() && e == event)
+    }
+
+    /// 异步发送 webhook（不等待响应结果，失败只记日志）。
+    pub async fn fire(&self, event: String, node_id: String, payload: serde_json::Value) {
+        if !self.should_fire(&event) {
+            return;
+        }
+        let body = serde_json::json!({
+            "event": event,
+            "node_id": node_id,
+            "ts": crate::store::now_wall(),
+            "payload": payload,
+        });
+        let client = self.http.clone();
+        let url = self.config.url.clone();
+        let max_retries = self.config.max_retries;
+        let retry_interval = self.config.retry_interval_seconds;
+        tokio::spawn(async move {
+            let mut last_err = None;
+            for attempt in 0..=max_retries {
+                match client.post(&url).json(&body).send().await {
+                    Ok(resp) if resp.status().is_success() => return,
+                    Ok(resp) => {
+                        last_err = Some(format!("HTTP {}", resp.status()));
+                    }
+                    Err(e) => last_err = Some(e.to_string()),
+                }
+                if attempt < max_retries {
+                    tokio::time::sleep(std::time::Duration::from_secs(retry_interval)).await;
+                }
+            }
+            tracing::warn!(
+                event = %event, url = %url, error = ?last_err,
+                "webhook: 发送失败，已达最大重试次数"
+            );
+        });
+    }
 }
 
 /// Node status. Requires a valid local API token.
