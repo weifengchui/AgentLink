@@ -37,8 +37,10 @@
 
 ## 六、兜底与备份
 - 看门狗 cron `agentlink-watchdog`（fd502509df0a，*/5m，no_agent）：查节点/桥/webhook/积压，异常自动拉起并报告，健康零输出
-- 记忆备份 cron `memory-backup`（本文件配套，*/60m）：MEMORY.md+roster.md+本手册 hash 变化才快照，留 30 份于 /home/yxf/.agentlink/backups/doc/
+- 巡检 cron `agentlink-message-watch`（d97d55f2aa8d，*/5m，LLM+terminal/file 工具集）：按「处置规程」三段式消费收件箱，产物 ~/.agentlink/handled.jsonl（250+件台账）；手工收件仅兜底
+- 文档快照 cron `memory-doc-snapshot`（a7941ac52a71，*/60m，no_agent）：MEMORY.md+roster.md+本手册 hash 变化才快照，留 30 份于 /home/yxf/.agentlink/backups/doc/，三件任一缺失/空立刻发声
 - 教训（工具坑）：memory replace 会顶掉整条 entry，改局部须全文合并重写；HOME 在 wake 会话被重定向，桥文件一律绝对路径；本手册即防丢镜像，重要记忆变更后应落文档
+- 重要信息落档顺序（10-18 机主确认）：先落本手册/名册 → 跑 doc_snapshot 立即快照 → contents API 同步 GitHub 镜像 → 最后压缩回写记忆（记忆是缓存，文档是正本）
 
 ## 七、互备与 API 新坑（10-15 晚实测）
 - 网格互备：本 RUNBOOK 已 send-file 存证 .50/.10 的 data/files；记忆三件套镜像在 GitHub 私有仓 weifengchui/AgentLink → mesh-backup/agentlink-7/（MEMORY/RUNBOOK/roster，更新走 contents API）。
