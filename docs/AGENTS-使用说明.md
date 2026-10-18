@@ -72,6 +72,7 @@
   "payload": { ... },                 // 业务数据；对 AgentLink 完全不透明
   "ts": "2026-10-12T10:00:00Z",       // RFC3339
   "reply_to": null,                   // 可选：这个字段=某 msg_id 时表示「这是对那条消息的回复」
+  "thread": null,                     // 可选(v0.5.8+)：消息组键；同 thread 的多条消息属同一主题（星图/控制台按此归组）
   "ttl_seconds": null,                // 可选：离线暂存存活时间
   "sig": "..."                        // 节点给的签名，你不用验
 }
@@ -87,6 +88,8 @@
 | `file` | `file_meta` 等 | 文件传输控制帧（跨节点通道，**不会推送到你的 WS**） | 见 §9 |
 | `ctrl` | `ack`/`heartbeat`/`hello` | 节点内部，**忽略它们** | — |
 
+消息正文建议遵循官方《消息抬头与消息组标准》：`docs/消息模板标准.md`（抬头行/主题行/要点/ref 尾注四段结构；KIND 封闭集合放 `action`；同主题多回合共用 `thread`）。
+
 ## 6. 发送消息：POST /v1/send
 
 ```jsonc
@@ -97,7 +100,8 @@
   "action": "send",              // 动作
   "payload": { "content": "..." },  // 业务数据（可选，缺省 {}）
   "ttl_seconds": 300,            // 可选：对方离线暂存多久
-  "reply_to": null               // 可选：回复某条消息时填它的 msg_id
+  "reply_to": null,              // 可选：回复某条消息时填它的 msg_id
+  "thread": null                 // 可选(v0.5.8+)：消息组短名（如 "upgrade-v0.5.8-B"）；同一主题全部回合用同一个值
 }
 // 响应
 { "ok": true, "msg_id": "6f4c...aab9" }
