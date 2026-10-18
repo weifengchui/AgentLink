@@ -954,6 +954,17 @@ pub struct Router {
     started: Instant,
 }
 
+/// 路由层 Prometheus 指标。
+#[derive(Debug, Clone, Default)]
+pub struct RouterMetrics {
+    pub peers_online: usize,
+    pub pending_acks: usize,
+    pub offline_queue_len: usize,
+    pub local_pending_count: usize,
+    pub inbox_len: usize,
+    pub blocked_count: u64,
+}
+
 impl Router {
     pub fn new(cfg: &Config) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -1919,6 +1930,18 @@ impl Router {
     /// Queue depths persisted on disk (for /web and operators).
     pub fn durable(&self) -> bool {
         self.cfg.delivery.persist
+    }
+
+    /// 路由层 Prometheus 指标快照（供 /v1/metrics 端点消费）。
+    pub fn router_metrics(&self) -> RouterMetrics {
+        RouterMetrics {
+            peers_online: self.registry.len(),
+            pending_acks: self.pending.lock().unwrap().len(),
+            offline_queue_len: self.offline.try_lock().map(|m| m.values().map(|q| q.len()).sum()).unwrap_or(0),
+            local_pending_count: self.local_pending.lock().unwrap().len(),
+            inbox_len: self.inbox.try_lock().map(|i| i.len()).unwrap_or(0),
+            blocked_count: self.blocked_count(),
+        }
     }
 
     // ---- agent registry (M7) ------------------------------------------------

@@ -332,6 +332,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/open-folder", post(open_folder))
         .route("/v1/config", get(config_get).put(config_put))
         .route("/v1/mesh/status", get(mesh_status_get))
+        .route("/v1/metrics", get(metrics_get))
         .route("/web", get(web_page))
         .route("/v1/web", get(web_page))
         .route("/v1/starmap", get(starmap_page))
@@ -433,6 +434,125 @@ async fn mesh_status_get(
             "engine": engine_stats,
         })),
     )
+}
+
+/// M3 P3-4 / P0：Prometheus 指标端点（文本格式，供 Prometheus 抓取）。
+/// Requires a valid local API token.
+async fn metrics_get(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return unauthorized().into_response();
+    }
+
+    let router_m = state.router.router_metrics();
+
+    // Mesh 层任务指标（仅 mesh 启用时可用）。
+    let (tasks_total, tasks_running, tasks_pending, tasks_succeeded, tasks_failed,
+         tasks_declined, tasks_cancelled, scheduled_nodes, node_quota) =
+        match &state.mesh {
+            Some(mesh) => {
+                let table = mesh.table.lock().unwrap();
+                let total = table.len() as u64;
+                let mut running = 0u64;
+                let mut pending = 0u64;
+                let mut succeeded = 0u64;
+                let mut failed = 0u64;
+                let mut declined = 0u64;
+                let mut cancelled = 0u64;
+                for rec in table.values() {
+                    match rec.state {
+                        TaskState::Running => running += 1,
+                        TaskState::Pending => pending += 1,
+                        TaskState::Succeeded => succeeded += 1,
+                        TaskState::Failed => failed += 1,
+                        TaskState::Declined => declined += 1,
+                        TaskState::Cancelled => cancelled += 1,
+                        _ => {}
+                    }
+                }
+                drop(table);
+                let scheduled_nodes = mesh.scheduled_nodes.lock().unwrap().len() as u64;
+                let node_quota = mesh.license.node_quota as u64;
+                (total, running, pending, succeeded, failed, declined, cancelled,
+                 scheduled_nodes, node_quota)
+            }
+            None => (0, 0, 0, 0, 0, 0, 0, 0, 0),
+        };
+
+    let mut out = String::new();
+
+    // ---- 路由层指标 ----
+    out.push_str("# HELP agentlink_peers_online Number of online mesh peers.\n");
+    out.push_str("# TYPE agentlink_peers_online gauge\n");
+    out.push_str(&format!("agentlink_peers_online {}\n", router_m.peers_online));
+
+    out.push_str("# HELP agentlink_pending_acks Number of messages waiting for ACK.\n");
+    out.push_str("# TYPE agentlink_pending_acks gauge\n");
+    out.push_str(&format!("agentlink_pending_acks {}\n", router_m.pending_acks));
+
+    out.push_str("# HELP agentlink_offline_queue_len Number of messages in offline queues.\n");
+    out.push_str("# TYPE agentlink_offline_queue_len gauge\n");
+    out.push_str(&format!("agentlink_offline_queue_len {}\n", router_m.offline_queue_len));
+
+    out.push_str("# HELP agentlink_local_pending_count Number of locally pending messages.\n");
+    out.push_str("# TYPE agentlink_local_pending_count gauge\n");
+    out.push_str(&format!("agentlink_local_pending_count {}\n", router_m.local_pending_count));
+
+    out.push_str("# HELP agentlink_inbox_len Number of messages in local inbox.\n");
+    out.push_str("# TYPE agentlink_inbox_len gauge\n");
+    out.push_str(&format!("agentlink_inbox_len {}\n", router_m.inbox_len));
+
+    out.push_str("# HELP agentlink_blocked_count Total number of lockdown-blocked frames.\n");
+    out.push_str("# TYPE agentlink_blocked_count counter\n");
+    out.push_str(&format!("agentlink_blocked_count {}\n", router_m.blocked_count));
+
+    // ---- Mesh/引擎层任务指标 ----
+    out.push_str("# HELP agentlink_tasks_total Total number of tasks in engine table.\n");
+    out.push_str("# TYPE agentlink_tasks_total gauge\n");
+    out.push_str(&format!("agentlink_tasks_total {}\n", tasks_total));
+
+    out.push_str("# HELP agentlink_tasks_running Number of tasks in running state.\n");
+    out.push_str("# TYPE agentlink_tasks_running gauge\n");
+    out.push_str(&format!("agentlink_tasks_running {}\n", tasks_running));
+
+    out.push_str("# HELP agentlink_tasks_pending Number of tasks in pending state.\n");
+    out.push_str("# TYPE agentlink_tasks_pending gauge\n");
+    out.push_str(&format!("agentlink_tasks_pending {}\n", tasks_pending));
+
+    out.push_str("# HELP agentlink_tasks_succeeded Number of tasks in succeeded state.\n");
+    out.push_str("# TYPE agentlink_tasks_succeeded gauge\n");
+    out.push_str(&format!("agentlink_tasks_succeeded {}\n", tasks_succeeded));
+
+    out.push_str("# HELP agentlink_tasks_failed Number of tasks in failed state.\n");
+    out.push_str("# TYPE agentlink_tasks_failed gauge\n");
+    out.push_str(&format!("agentlink_tasks_failed {}\n", tasks_failed));
+
+    out.push_str("# HELP agentlink_tasks_declined Number of tasks in declined state.\n");
+    out.push_str("# TYPE agentlink_tasks_declined gauge\n");
+    out.push_str(&format!("agentlink_tasks_declined {}\n", tasks_declined));
+
+    out.push_str("# HELP agentlink_tasks_cancelled Number of tasks in cancelled state.\n");
+    out.push_str("# TYPE agentlink_tasks_cancelled gauge\n");
+    out.push_str(&format!("agentlink_tasks_cancelled {}\n", tasks_cancelled));
+
+    out.push_str("# HELP agentlink_scheduled_nodes Number of nodes scheduled by Mesh (quota used).\n");
+    out.push_str("# TYPE agentlink_scheduled_nodes gauge\n");
+    out.push_str(&format!("agentlink_scheduled_nodes {}\n", scheduled_nodes));
+
+    out.push_str("# HELP agentlink_node_quota License node quota (max schedulable nodes).\n");
+    out.push_str("# TYPE agentlink_node_quota gauge\n");
+    out.push_str(&format!("agentlink_node_quota {}\n", node_quota));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(Body::from(out))
+        .unwrap()
 }
 
 /// Node status. Requires a valid local API token.
