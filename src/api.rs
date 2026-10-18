@@ -4,7 +4,7 @@
 //! A single listener serves both; `/v1/*` requires the local API token while
 //! `/peer/ws` authenticates via the cluster token during the handshake.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,7 +33,7 @@ use crate::license::{self, LicenseInfo};
 use crate::peer::{DiscoveredPeer, PeerTable};
 use crate::proto::{constant_time_eq, Envelope};
 use crate::router::Router;
-use crate::taskengine::{self, TaskRecord, TaskTable};
+use crate::taskengine::{self, TaskRecord, TaskState, TaskTable};
 use crate::taskstore::{TaskEvent, TaskStore};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -156,18 +156,20 @@ pub struct MeshRuntime {
     /// 快照节流计数器（见 [`MESH_SNAPSHOT_EVERY`]）。
     pub appends_since_snapshot: AtomicU64,
     /// 验签通过的 license（quota 接线消费预留给 M3，设计 §3.2）。
-    #[allow(dead_code)] // M3 配额闭环（P3-4）接线前的休眠字段
     pub license: LicenseInfo,
+    /// M3 P3-4：已被 Mesh 调度的不重复 node_id 集合（用于 license node_quota 统计）。
+    pub scheduled_nodes: Mutex<HashSet<String>>,
 }
 
 impl MeshRuntime {
-    fn next_rev(&self) -> u64 {
+    /// 下一条 journal 事件的修订号（单调自增）。
+    pub fn next_rev(&self) -> u64 {
         self.rev.fetch_add(1, Ordering::Relaxed)
     }
 
     /// 节流快照：每积满阈值落一次 state.json 并 compact journal；失败只
     /// log——journal 有逐条 fsync，快照丢了不丢数据，下轮再试。
-    fn maybe_snapshot(&self) {
+    pub fn maybe_snapshot(&self) {
         let n = self.appends_since_snapshot.fetch_add(1, Ordering::Relaxed) + 1;
         if n >= MESH_SNAPSHOT_EVERY {
             self.appends_since_snapshot.store(0, Ordering::Relaxed);
@@ -258,6 +260,7 @@ pub fn build_mesh(cfg: &Config, config_file: &Path) -> Option<Arc<MeshRuntime>> 
         rev: AtomicU64::new(1),
         appends_since_snapshot: AtomicU64::new(0),
         license,
+        scheduled_nodes: Mutex::new(HashSet::new()),
     }))
 }
 
@@ -328,6 +331,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/files/:file_name", get(file_download))
         .route("/v1/open-folder", post(open_folder))
         .route("/v1/config", get(config_get).put(config_put))
+        .route("/v1/mesh/status", get(mesh_status_get))
         .route("/web", get(web_page))
         .route("/v1/web", get(web_page))
         .route("/v1/starmap", get(starmap_page))
@@ -364,6 +368,71 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
         // "lockdown" (v0.5 §4.5): 一键熔断端点存在。
         "features": features,
     }))
+}
+
+/// M3 P3-4：AgentMesh 运维面——显示 license 配额/用量、引擎状态。
+/// Requires a valid local API token.
+async fn mesh_status_get(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let mesh_enabled = state.mesh.is_some();
+    let (license_info, engine_stats) = match &state.mesh {
+        Some(mesh) => {
+            let table = mesh.table.lock().unwrap();
+            let total = table.len();
+            let by_state: Vec<(String, u64)> = table.values().fold(Vec::new(), |mut acc, rec| {
+                let s = rec.state.as_str().to_string();
+                if let Some((_, n)) = acc.iter_mut().find(|(st, _)| st == &s) {
+                    *n += 1;
+                } else {
+                    acc.push((s, 1));
+                }
+                acc
+            });
+            let running = table
+                .values()
+                .filter(|r| r.state == TaskState::Running)
+                .count();
+            let pending = table
+                .values()
+                .filter(|r| r.state == TaskState::Pending)
+                .count();
+            drop(table);
+            let scheduled_nodes = mesh.scheduled_nodes.lock().unwrap().len();
+            let quota = mesh.license.node_quota as usize;
+            (
+                Some(json!({
+                    "tier": mesh.license.tier.as_str(),
+                    "node_quota": mesh.license.node_quota,
+                    "expires": mesh.license.expires.to_string(),
+                    "scheduled_nodes": scheduled_nodes,
+                    "quota_used": scheduled_nodes,
+                    "quota_remaining": quota.saturating_sub(scheduled_nodes),
+                    "quota_exceeded": scheduled_nodes > quota,
+                })),
+                Some(json!({
+                    "tasks_total": total,
+                    "tasks_running": running,
+                    "tasks_pending": pending,
+                    "by_state": by_state,
+                })),
+            )
+        }
+        None => (None, None),
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "mesh_enabled": mesh_enabled,
+            "license": license_info,
+            "engine": engine_stats,
+        })),
+    )
 }
 
 /// Node status. Requires a valid local API token.
@@ -683,6 +752,10 @@ async fn send_file_upload(
 
 /// Resolve `to` into a `node_id` or `"*"`.
 fn resolve_target(state: &AppState, to: &str) -> Result<String, String> {
+    // 本机自身 node_id 始终可达（即使不符合 12 位十六进制格式）。
+    if to == state.config.node_id {
+        return Ok(to.to_string());
+    }
     if to == "*" {
         return Ok("*".to_string());
     }

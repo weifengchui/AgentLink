@@ -15,8 +15,10 @@ mod logging;
 mod mdns;
 mod peer;
 mod proto;
+mod reconcile;
 mod redact;
 mod router;
+mod scheduler;
 mod store;
 mod taskengine;
 mod taskstore;
@@ -439,6 +441,13 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // M2 P2-2：mesh 生效时 spawn reconcile loop engine task；默认态（mesh=None）不 spawn，
+    // 行为与 0.5.9 逐字符一致（P2-2 验收：mesh_off_no_engine_task）。
+    let engine_handle = state
+        .mesh
+        .as_ref()
+        .map(|_| reconcile::Engine::spawn(state.clone(), router.clone(), shutdown_rx.clone()));
+
     let discovery = if cfg.discovery.enabled {
         Some(tokio::spawn(discovery::run(
             cfg.clone(),
@@ -524,6 +533,9 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
         }
         if let Some(mdns) = mdns_task {
             let _ = mdns.await;
+        }
+        if let Some(engine) = engine_handle {
+            let _ = engine.await;
         }
         let _ = manager.await;
         let _ = maintenance.await;

@@ -149,10 +149,14 @@ pub struct TaskRecord {
     /// 最近一次被采纳的 task_spec seq（识别"重投 spec"用）。
     #[serde(default)]
     pub last_spec_seq: Option<u64>,
+    /// 下次重试时刻（unix 秒，失败后由 reconcile 设置；重投后清空）。
+    /// M2 P2-3 backoff 重投依据；None 表示不计重试或已达上限。
+    #[serde(default)]
+    pub next_retry_at: Option<i64>,
 }
 
 impl TaskRecord {
-    fn new(task_id: &str, ts: Option<&str>) -> Self {
+    pub fn new(task_id: &str, ts: Option<&str>) -> Self {
         TaskRecord {
             task_id: task_id.to_string(),
             state: TaskState::Pending,
@@ -171,6 +175,7 @@ impl TaskRecord {
             created_ts: ts.map(str::to_string),
             last_ts: ts.map(str::to_string),
             last_spec_seq: None,
+            next_retry_at: None,
             message_count: 0,
             blocked_count: 0,
         }

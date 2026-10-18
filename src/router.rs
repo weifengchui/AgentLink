@@ -1452,6 +1452,13 @@ impl Router {
         Ok(env.msg_id)
     }
 
+    /// 订阅总线事件广播（M2 reconcile loop 消费原文 Envelope 用）。
+    /// 返回的 receiver 与 `Router::send` 出口及 peer WS 投递路径同源，
+    /// 事件为未脱敏的原始 Envelope，供引擎按 `payload.task_id` 匹配表行。
+    pub fn events_subscribe(&self) -> broadcast::Receiver<Envelope> {
+        self.events.subscribe()
+    }
+
     /// Re-stamp an aged envelope's timestamp + signature before outbound
     /// send: messages that sat in the offline/pending queues across a
     /// restart or reconnect would otherwise be rejected by the strict-mode
@@ -1694,6 +1701,11 @@ impl Router {
     }
 
     // ---- maintenance --------------------------------------------------------
+
+    /// 本节点 node_id（供 M2 reconcile loop 派发 task_spec 时标识发送方）。
+    pub fn node_id(&self) -> &str {
+        &self.cfg.node_id
+    }
 
     pub fn spawn_maintenance(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
@@ -1975,6 +1987,21 @@ impl Router {
                 .cmp(&(b.node_id.as_str(), b.agent_id.as_str()))
         });
         out
+    }
+
+    /// 查找 `agent_id` 所在节点（本机优先，再舰队在线节点）。
+    /// 供 M2 reconcile loop 把 `task_spec` 派发到目标执行方所在节点。
+    pub fn find_agent_node(&self, agent_id: &str) -> Option<String> {
+        if let Some(rec) = self.agents.lock().unwrap().get(agent_id) {
+            return Some(rec.node_id.clone());
+        }
+        let remote = self.fleet_agents.lock().unwrap();
+        for list in remote.values() {
+            if let Some(rec) = list.iter().find(|r| r.agent_id == agent_id && r.online) {
+                return Some(rec.node_id.clone());
+            }
+        }
+        None
     }
 
     /// A local WS subscriber connected (its `client` = agent id).
