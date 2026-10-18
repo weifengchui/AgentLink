@@ -9,8 +9,8 @@ mod config;
 mod conn;
 mod discovery;
 mod file;
-mod logging;
 mod license;
+mod logging;
 #[cfg(feature = "mdns")]
 mod mdns;
 mod peer;

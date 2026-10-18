@@ -45,6 +45,45 @@ pub struct Config {
     pub delivery: DeliveryConfig,
     #[serde(default)]
     pub log: LogConfig,
+    /// AgentMesh 任务引擎配置（docs/task引擎内核化设计-2026-10-18.md §5）。
+    /// 老 agentlink.json 缺整段 = 免费层（enabled=false，全默认），零破坏。
+    #[serde(default)]
+    pub mesh: MeshConfig,
+}
+
+/// Mesh 总开关与 license/引擎调参入口。缺省即免费层：引擎不 spawn、
+/// 写面 403，行为与 0.5.9 完全一致。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MeshConfig {
+    /// 总开关。缺省 false（serde 零值），显式声明 `"enabled": true` 才进 Mesh 态。
+    #[serde(default)]
+    pub enabled: bool,
+    /// license.toml 路径；未设置 -> `None`（节点按免费层运行，启动打 error 日志）。
+    #[serde(default)]
+    pub license_file: Option<PathBuf>,
+    /// reconcile 引擎的调参项（拍板记录第 4 条：显式声明才有的语义全在这）。
+    #[serde(default)]
+    pub engine: EngineConfig,
+}
+
+/// 任务引擎内核循环参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineConfig {
+    /// 重试预算。缺省 **0**——拍板记录第 4 条：只有显式声明才重试。
+    #[serde(default)]
+    pub max_retries: u32,
+    /// failed→pending 重投的固定退避间隔（秒）。拍板：固定间隔，不做指数退避。
+    #[serde(default = "default_engine_backoff_secs")]
+    pub backoff_secs: u64,
+    /// drift/declined 只告警不自动换机重派（守执行方唯一状态权威，拍板第 4 条）。
+    #[serde(default = "default_true")]
+    pub drift_alert_only: bool,
+    /// reconcile loop 的 tick 周期（毫秒）。200ms 是 P99 调度延迟 <500ms 验收门的推论。
+    #[serde(default = "default_engine_tick_ms")]
+    pub tick_ms: u64,
+    /// 每节点并发任务额度上限（调度打分时按不重复 node_id 记账）。
+    #[serde(default = "default_engine_max_concurrent")]
+    pub max_concurrent_per_node: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +341,17 @@ fn default_agent_stale_ttl() -> u64 {
     3600
 }
 
+// Mesh 引擎参数默认值（拍板记录第 2/4 条）。
+fn default_engine_backoff_secs() -> u64 {
+    30
+}
+fn default_engine_tick_ms() -> u64 {
+    200
+}
+fn default_engine_max_concurrent() -> usize {
+    2
+}
+
 impl Default for HistoryConfig {
     fn default() -> Self {
         HistoryConfig {
@@ -391,6 +441,18 @@ impl Default for LogConfig {
     }
 }
 
+impl Default for EngineConfig {
+    fn default() -> Self {
+        EngineConfig {
+            max_retries: 0, // 显式声明才重试（拍板第 4 条）
+            backoff_secs: default_engine_backoff_secs(),
+            drift_alert_only: true, // drift/declined 只告警（拍板第 4 条）
+            tick_ms: default_engine_tick_ms(),
+            max_concurrent_per_node: default_engine_max_concurrent(),
+        }
+    }
+}
+
 // ---- impl -------------------------------------------------------------------
 
 impl Config {
@@ -446,6 +508,7 @@ impl Config {
                 format: "text".to_string(),
                 file: String::new(),
             },
+            mesh: MeshConfig::default(),
         }
     }
 
@@ -552,4 +615,120 @@ fn default_node_name() -> String {
         .unwrap_or_else(|_| "host".to_string());
     let host = host.split('.').next().unwrap_or("host").to_string();
     format!("agent-{host}")
+}
+
+// ---- tests ------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 现网 0.5.9 形态的老 agentlink.json：完全没有 `mesh` 段。
+    /// 要求反序列化成功且 mesh 全默认（enabled=false = 免费层，零行为变化）。
+    #[test]
+    fn mesh_section_absent_defaults_off() {
+        let legacy = r#"{
+            "v": 1,
+            "node_id": "a1b2c3d4e5f6",
+            "name": "192.168.1.7",
+            "listen_port": 8765,
+            "data_dir": "C:/Users/x/AppData/Local/AgentLink/data",
+            "tags": ["win", "hermes"],
+            "history": { "enabled": true, "len": 500, "file": "history.jsonl",
+                         "max_file_mb": 1024, "archive_days": 7 },
+            "redact": { "enabled": true },
+            "web": { "auto_open": false },
+            "discovery": { "enabled": true, "methods": ["udp_broadcast"],
+                           "broadcast_port": 8766, "static_peers": [] },
+            "security": { "mode": "strict", "cluster_token": "change-me" },
+            "local_api": { "host": "0.0.0.0", "token": "aaaa-bbbb-cccc-dddd" },
+            "files": { "max_file_size": 104857600, "chunk_size": 65536,
+                       "recv_dir": "files", "max_concurrent": 1 },
+            "delivery": { "ack_timeout_seconds": 5, "max_retries": 5,
+                          "offline_ttl_seconds": 300, "dedup_cache_size": 2048,
+                          "persist": true },
+            "log": { "level": "info", "format": "text", "file": "" }
+        }"#;
+        let cfg: Config = serde_json::from_str(legacy).expect("老配置（无 mesh 段）必须解析成功");
+        assert!(!cfg.mesh.enabled);
+        assert_eq!(cfg.mesh.license_file, None);
+        assert_eq!(cfg.mesh.engine.max_retries, 0);
+        assert_eq!(cfg.mesh.engine.backoff_secs, 30);
+        assert!(cfg.mesh.engine.drift_alert_only);
+        assert_eq!(cfg.mesh.engine.tick_ms, 200);
+        assert_eq!(cfg.mesh.engine.max_concurrent_per_node, 2);
+        // v 号不动（P1-3 验收：不发配置版本）
+        assert_eq!(cfg.v, 1);
+    }
+
+    /// mesh 段只写一部分字段：逐项缺省值必须生效（含 mesh 有段但 engine 缺、
+    /// engine 只写一个字段的两种形态）。
+    #[test]
+    fn mesh_partial_fields_fall_back_to_defaults() {
+        // 形态 A：有 mesh.enabled，无 license_file / engine。
+        let a: Config =
+            serde_json::from_str(r#"{"node_id":"n","name":"h","mesh":{"enabled":true}}"#).unwrap();
+        assert!(a.mesh.enabled);
+        assert_eq!(a.mesh.license_file, None);
+        assert_eq!(a.mesh.engine.max_retries, 0);
+        assert_eq!(a.mesh.engine.backoff_secs, 30);
+        assert!(a.mesh.engine.drift_alert_only);
+        assert_eq!(a.mesh.engine.tick_ms, 200);
+        assert_eq!(a.mesh.engine.max_concurrent_per_node, 2);
+
+        // 形态 B：engine 只显式声明 max_retries 与 backoff_secs（拍板：显式声明才重试）。
+        let b: Config = serde_json::from_str(
+            r#"{"node_id":"n","name":"h","mesh":{"engine":{"max_retries":3,"backoff_secs":60}}}"#,
+        )
+        .unwrap();
+        assert!(!b.mesh.enabled); // 没写 enabled 仍是免费层
+        assert_eq!(b.mesh.engine.max_retries, 3);
+        assert_eq!(b.mesh.engine.backoff_secs, 60);
+        assert!(b.mesh.engine.drift_alert_only);
+        assert_eq!(b.mesh.engine.tick_ms, 200);
+
+        // 形态 C：license_file 显式给出。
+        let c: Config = serde_json::from_str(
+            r#"{"node_id":"n","name":"h","mesh":{"enabled":true,"license_file":"license.toml"}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.mesh.license_file, Some(PathBuf::from("license.toml")));
+    }
+
+    /// 非法值必须拒解（不能静默吞掉）：enabled 写成字符串、engine 字段类型错、
+    /// max_concurrent_per_node 负数，三种都要报错。
+    #[test]
+    fn mesh_invalid_values_are_rejected() {
+        let e1 = serde_json::from_str::<Config>(
+            r#"{"node_id":"n","name":"h","mesh":{"enabled":"yes"}}"#,
+        );
+        assert!(e1.is_err(), "enabled 非布尔必须拒解");
+        let e2 = serde_json::from_str::<Config>(
+            r#"{"node_id":"n","name":"h","mesh":{"engine":{"tick_ms":"fast"}}}"#,
+        );
+        assert!(e2.is_err(), "tick_ms 非数字必须拒解");
+        let e3 = serde_json::from_str::<Config>(
+            r#"{"node_id":"n","name":"h","mesh":{"engine":{"max_concurrent_per_node":-1}}}"#,
+        );
+        assert!(e3.is_err(), "usize 负数必须拒解");
+    }
+
+    /// generate() 出的新配置默认就在免费层，且 save/load 往返一致。
+    #[test]
+    fn mesh_roundtrip_and_generate_defaults() {
+        let cfg = Config::generate(Some("t".into()), Some("tok".into()), Some("strict".into()));
+        assert!(!cfg.mesh.enabled);
+        let dir = std::env::temp_dir().join(format!("agentlink-cfg-test-{}", new_short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agentlink.json");
+        let mut cfg2 = cfg.clone();
+        cfg2.mesh.enabled = true;
+        cfg2.mesh.engine.max_retries = 2;
+        cfg2.save(&path).unwrap();
+        let back = Config::load(&path).unwrap();
+        assert!(back.mesh.enabled);
+        assert_eq!(back.mesh.engine.max_retries, 2);
+        assert_eq!(back.mesh.engine.backoff_secs, 30);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
