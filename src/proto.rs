@@ -136,6 +136,14 @@ pub struct Envelope {
     pub ts: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// Thread id (v0.5.8 消息组): explicit topic key shared by every message
+    /// of one conversation thread (e.g. `upgrade-v0.5.8-<node>`). Additive
+    /// metadata with the same compatibility rules as `reply_to`/`trace_id`:
+    /// serde default on read, and legacy nodes re-serialize envelopes from
+    /// their own struct, so forwarding through an *un*upgraded node drops the
+    /// field (expected — upgrade the orchestrating side first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
     /// Trace id (v0.5 §7.1): either supplied by the sending agent or
     /// injected by the kernel so downstream agents keep the chain. Additive
     /// metadata — the envelope HMAC covers only `from|msg_id|ts`, never this
@@ -163,6 +171,7 @@ impl Envelope {
             payload: serde_json::Value::Null,
             ts: now_rfc3339(),
             reply_to: None,
+            thread: None,
             trace_id: None,
             ttl_seconds: None,
             sig: None,
@@ -179,6 +188,7 @@ impl Envelope {
         payload: Value,
         ttl_seconds: Option<u64>,
         reply_to: Option<String>,
+        thread: Option<String>,
         from_agent: Option<String>,
         to_agent: Option<String>,
     ) -> Self {
@@ -194,6 +204,7 @@ impl Envelope {
             payload,
             ts: now_rfc3339(),
             reply_to,
+            thread,
             trace_id: None,
             ttl_seconds,
             sig: None,
@@ -212,6 +223,7 @@ impl Envelope {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -223,6 +235,7 @@ impl Envelope {
             "event",
             action,
             json!({ "node_id": peer_id, "name": peer_name }),
+            None,
             None,
             None,
             None,
@@ -245,6 +258,7 @@ impl Envelope {
             "ctrl",
             "agents_update",
             payload,
+            None,
             None,
             None,
             from_agent,

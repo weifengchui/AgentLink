@@ -74,6 +74,9 @@ pub struct ApplyArgs {
     /// 发起方 agent id（默认 `cli`；执行方回报会发给它）
     #[arg(long, default_value = "cli")]
     from_agent: String,
+    /// 消息组线程键（v0.5.8 R2）：同 thread 的多回合消息在星图归为一个话题组
+    #[arg(long)]
+    thread: Option<String>,
     /// 只打印将要 POST 的 /v1/send 请求体，不实际发送
     #[arg(long)]
     dry_run: bool,
@@ -542,6 +545,7 @@ pub async fn apply(
         "to_agent": opts.to_agent,
         "type": "text",
         "action": "send",
+        "thread": opts.thread.as_deref(),
         "payload": spec,
     });
 

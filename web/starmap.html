@@ -728,8 +728,14 @@ function msgOf(e){const abs=Date.parse(e.ts)||0,nid=(typeof e.node==="string"&&e
 function buildTopics(ents){const byId={};for(const e of ents)byId[e.msg_id]=e;
  const rootOf=e=>{let cur=e,g=0;while(cur&&cur.reply_to&&byId[cur.reply_to]&&g++<500)cur=byId[cur.reply_to];return cur;};
  const groups={};
- for(const e of ents){const r=rootOf(e),rid=(r&&r.msg_id)||e.reply_to||e.msg_id;
-  let tp=groups[rid];if(!tp){const nm0=r?payText(r):("话题 "+String(rid).slice(0,8));
+ for(const e of ents){
+  /* R2（10-18 第十五轮）消息组：显式 thread 键优先归组（同 thread=同一张卡）；
+     无 thread 回退 reply_to 链根（旧行为不变）。组键加 t: 前缀 +
+     encodeURIComponent，避免与 msg_id 相撞、attribute 注入安全。 */
+  const thr=String(e.thread||"").trim();let rid,nm0;
+  if(thr){rid="t:"+encodeURIComponent(thr);nm0=thr;}
+  else{const r=rootOf(e);rid=(r&&r.msg_id)||e.reply_to||e.msg_id;nm0=r?payText(r):("话题 "+String(rid).slice(0,8));}
+  let tp=groups[rid];if(!tp){
    tp=groups[rid]=T(rid,String(nm0).replace(/\s+/g," ").slice(0,26),PAL[hashK(rid)%PAL.length],[]);}
   tp.msgs.push(msgOf(e));}
  TOPICS=Object.values(groups);for(const tp of TOPICS)tp.msgs.sort((x,y)=>x.abs-y.abs);}
