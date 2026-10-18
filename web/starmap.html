@@ -85,6 +85,9 @@ font-family:ui-monospace,Consolas,monospace;z-index:2}
 .agt .flash.fire{animation:fire .9s ease-out}
 /* ---------- links ---------- */
 .lk{fill:none;stroke-linecap:round;opacity:0;pointer-events:none;transition:opacity .35s ease}
+/* R3（10-18 第十五轮）：持久亮线——新消息的链路以 .live 持续显示 LIVE_MS(60s) 或至滑出窗口，
+   与粒子动画解耦；到期静默撤。放在 .on/.hl/.lit 之前：悬停高亮与到达闪光仍可覆盖它。 */
+.lk.live{opacity:.8;stroke-width:2.1px;filter:drop-shadow(0 0 4px rgba(160,210,255,.45))}
 .lk.on{opacity:.62}
 .lk.hl{opacity:1;stroke-width:2.6px;filter:drop-shadow(0 0 5px rgba(160,210,255,.65))}
 .lk.temp{opacity:.5}
@@ -436,6 +439,7 @@ function renderLinks(){
  for(const e of liveAnims){if(!e.ln||e.ln.parentNode!==map){
   const n=map.querySelector(`[data-k="${CSS.escape(e.key)}"]`);
   if(n){e.rebind(n);n.classList.add("lit");}}}
+ paintLive(); /* R3：innerHTML 全量重建后给在期新消息链路补回 .live */
  applyLanes();renderBadges();renderHud();}
 function lightLink(key){const p=map.querySelector(`[data-k="${CSS.escape(key)}"]`);if(!p)return;
  p.classList.add("lit");setTimeout(()=>p.classList.remove("lit"),1200);}
@@ -754,6 +758,8 @@ async function poll(){if(polling){pollAgain=true;return;}polling=true;
    单轮新增 >60 视为突发（历史回填/高频风暴），不飞粒子——主线程不再被拖住 */
   if(fresh.length>60){for(let i=0;i<Math.min(fresh.length,16);i++)deliver(fresh[i][1].to);}
   else{let budget=8;for(const [tp,m] of fresh){if(budget-->0)flyIn(tp,m);else deliver(m.to);}}
+  /* R3（10-18 第十五轮）：粒子预算/突发降级只影响动画；亮线另走保活集合，同帧补齐 */
+  markFreshLive();
  }catch(e){setErr(String(e.message||e));}
  finally{flushLateLit();restoreHov();polling=false;if(pollAgain){pollAgain=false;poll();}}}
 function worldSig(){let s="";for(const m in MACH)s+=m+"|"+MACH[m].lab+"|"+MACH[m].ip+"|"+MACH[m].agents.join(",")+";";return s;}
@@ -767,6 +773,11 @@ async function syncWorld(){const sg=worldSig();if(sg===WSIG)return;WSIG=sg;
   if(hovAgt)hovPrev={k:hovAgt,isSta:false,an:dwAnchor[hovAgt]?{x:dwAnchor[hovAgt].x,y:dwAnchor[hovAgt].y}:null};
   else if(hovSta){const kk=a2k([hovSta,"@node"]);hovPrev={k:kk,isSta:true,an:dwAnchor[kk]?{x:dwAnchor[kk].x,y:dwAnchor[kk].y}:null};}
   stageEl.innerHTML="";
+  /* R3-a（10-18 第十五轮）：svg#map 就住在 stage 里——整体清场把它连同连线宿主一起抹了，
+     此后 renderLinks/flyIn 全写进游离树：DOM 里 0 条 .lk、悬停有卡片没连线、HUD 照常计数，
+     只有刷新重载 HTML 才找回 svg——正是"连线偶发不出现、刷新才恢复"的主根因（名单一变必踩）。
+     清场后立刻把 svg 放回 stage（buildWorld 随后 appendChild，svg 仍在最底层）。 */
+  stageEl.appendChild(map);
   for(const o of[dwraps,deckOpen,hideTimers,opentomb,dwAnchor,agtEl,staEl])for(const k in o)delete o[k];
   hovAgt=hovSta=gTopic=gOwnerK=pinC=null;cancelLiveAnims(false);if(VT)closeViewer();}
  initPos();buildWorld();placeWorld();}
@@ -808,6 +819,34 @@ function deliver(k){const el=agtEl[k];if(!el)return;const b=el.querySelector(".b
 /* R-fix：名单重建（非静默取消）攒下的迟到闪光——重建与 renderLinks 之后统一补放，消息不再"无声吞线" */
 function flushLateLit(){if(!lateLit.length)return;const q=lateLit;lateLit=[];
  for(const e of q){lightLink(e.key);deliver(e.to);}}
+/* ---------- R3（10-18 第十五轮）：持久亮线——连线可见性与粒子动画解耦 ----------
+   原病根：一条新消息的连线唯一可见载体是 1.7s temp 线 + 1.2s .lit 闪光，KNOWN 只做粒子去重
+   却顺带决定"这轮还认不认它是新消息"——后台标签页积压、单轮突发>60（只 ping 不飞）、名单重建
+   吞线这三类场景里，闪光与 temp 线要么根本没机会渲染、要么渲染在游离/不可见树上，用户从来看
+   不到线，只能刷新（清 KNOWN）重放。现在改为：窗口内每条新消息（90s 回看）进 LIVEM 保活集合，
+   其链路以 .live 类持续显示 60s 或至滑出窗口/端点隐身，到期由 3s 心跳 sweep 静默撤。
+   亮线只是给 renderLinks 已画好的永久 path 加类——合并入帧、无逐条动画，突发>60 也照补。
+   标记门控"页面可见且未暂停"：隐藏期间 poll 照常更新 KNOWN/徽章（粒子去重语义不变），但
+   不白闪；回前台 visibilitychange 立刻补一轮 poll，把"近90s 内未亮过"的消息统一补亮线，
+   不重飞粒子。KNOWN 语义保持不变（仅粒子去重），线可见性不再依赖它。 */
+const LIVEM=new Set(),LIVEK=new Map(),LITSEEN=new Set();
+const LIVE_MS=60000,LIT_BACK=90000;
+let liveTickT=null;
+function liveDisp(m){return !epHid(m.f)&&!epHid(m.to)&&!ghost(m.f)&&!ghost(m.to);}
+function markLive(m,tp){LITSEEN.add(m.id);LIVEM.add(m.id);LIVEK.set(m.id,{k:m.f+"=>"+m.to+"#"+tp.id,ts:m.abs});}
+function paintLive(){const ks=new Set();for(const id of LIVEM){const v=LIVEK.get(id);if(v)ks.add(v.k);}
+ for(const l of map.querySelectorAll(".lk"))l.classList.toggle("live",ks.has(l.getAttribute("data-k")));}
+function sweepLive(){liveTickT=null;const now=Date.now(),cut=wBounds()[0];
+ for(const[id,v]of[...LIVEK])if(now-v.ts>LIVE_MS||v.ts>now+60000){LIVEK.delete(id);LIVEM.delete(id);}
+ for(const tp of TOPICS)for(const m of tp.msgs)if(LIVEM.has(m.id)&&(m.abs<cut||!liveDisp(m)))LIVEM.delete(m.id);
+ paintLive();
+ if(LIVEK.size)liveTickT=setTimeout(sweepLive,3000);}
+function markFreshLive(){ /* poll 尾部调用：可见且未暂停才标记（隐藏积压留待回前台补） */
+ if(paused||document.visibilityState!=="visible")return;
+ const lo=Math.max(Date.now()-LIT_BACK,wBounds()[0]);
+ for(const tp of TOPICS)for(const m of tp.msgs)if(m.abs>=lo&&!LITSEEN.has(m.id)&&liveDisp(m))markLive(m,tp);
+ paintLive();
+ if(!liveTickT&&LIVEK.size)liveTickT=setTimeout(sweepLive,3000);}
 function flyIn(tp,msg){const f=msg.f,to=msg.to;
  const key=f+"=>"+to+"#"+tp.id;
  let ln=map.querySelector(`[data-k="${CSS.escape(key)}"]`);
@@ -938,8 +977,11 @@ function connectWS(){if(!TOKEN){setTimeout(connectWS,2000);return;}
  sk.onclose=()=>{WSOK=false;if(ws===sk)ws=null;renderHud();setTimeout(connectWS,wsRetry);wsRetry=Math.min(wsRetry*2,30000);};}
 addEventListener("message",e=>{if(e.data&&e.data.al==="poke")pokePoll();});
 boot().then(connectWS);setInterval(poll,5000);
+/* R3-c（10-18 第十五轮）：回前台立刻补一轮 poll——markFreshLive 给"近90s 内未亮过"的消息
+   补持久亮线（不重飞粒子，KNOWN 语义不变）；后台积压期间被 KNOWN 吞掉的线从此找得回来。 */
+addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")poll();});
 /* 诊断快照：外部检查器可读（不影响任何行为；WS 状态机排障用） */
-window.__al={get wsok(){return WSOK},get live(){return true},/* R12：时段模式废除，恒为实时 */get polling(){return polling},get tok4(){return (TOKEN||"").slice(0,4)}};
+window.__al={get wsok(){return WSOK},get live(){return true},/* R12：时段模式废除，恒为实时 */get polling(){return polling},get tok4(){return (TOKEN||"").slice(0,4)},get livem(){return LIVEM.size},get seen(){return LITSEEN.size},get known(){return KNOWN.size}};
 
 </script>
 </body>
