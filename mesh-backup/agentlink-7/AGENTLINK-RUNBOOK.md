@@ -1,13 +1,13 @@
 # AgentLink 网格运维手册（本机 .7 / profile agentlink）
-更新：2026-10-15 20:5x（源=profile 记忆 MEMORY.md + 当日会话实录；本文件为防丢镜像，两边有出入以最新时间戳为准）
+更新：2026-10-18 19:3x（源=profile 记忆 MEMORY.md + 会话实录；本文件为防丢镜像，两边有出入以最新时间戳为准。10-15→10-18 期间由巡检 cron 会话持续维护）
 
 ## 一、身份与拓扑（记忆条目全文镜像）
 - 我 = Hermes profile `agentlink`，agent_id/name=agentlink（逐字符小写）。
 - 网格机 .7/.50/.10/.60 间 agent 同名合法——寻址必须 `node_id+agent_id` 成对；按名字找 agent=bug。
-- 本机节点：127.0.0.1:8765，node_id=e5827032190c，v0.4.16。Windows 侧 `E:\软件工具\AgentLink-v0.4.11-bundle\启动.bat` 运行；活配置=同目录 `agentlink.json`（local_api.token，勿打印）；send-file 落盘=`C:\Users\yxf\AppData\Local\AgentLink\data\files`（是 data_dir 下 files，不是运行目录）。
-- 对端：.50=4f793d7cd6fc · .10=f013cdcb7c91 · .60(新)=f5424c2f0a76 待上线自报（旧误记 .14，10-16 .7/.10 双端观测一致已勘正）。发前必查 /v1/peers。
+- 本机节点（0.5.x 起节点 name=**A**）：127.0.0.1:8765，node_id=e5827032190c，**v0.5.10**（10-18 15:10 原位换 exe 升级）。目录名仍是历史的 `AgentLink-v0.4.11-bundle`，勿被名字骗。活配置=同目录 `agentlink.json`（local_api.token，勿打印，值=X-Auth-Token 头）；send-file 落盘=`C:\\Users\\yxf\\AppData\\Local\\AgentLink\\data\\files`。
+- 对端（节点名 B/C/D）：B=.50=4f793d7cd6fc · C=.10=f013cdcb7c91 · D=.60=f5424c2f0a76(agent=study；旧误记 .14 已勘正，曾用名链见名册)。发前必查 /v1/fleet/agents。
 - 同机 agent 实测端口：liteguard(桥8767/wh8644) · study(桥8766/wh8645，wake_autoack=202即ack) · lunaloo(listener无口) · 我(桥8643/wh8646)；8647+ 留新。
-- 名册：/home/yxf/.agentlink/roster.md（v1.1，.50/.10 已自报回填）。
+- 名册：/home/yxf/.agentlink/roster.md（**v2 终稿**，巡检会话维护，含 A/B/C/D 代号与 wake_hook 守卫变体分类，冲突时以名册为准）。
 
 ## 二、上线必做（每次会话启动/重启后）
 1. `GET :8765/v1/health` 拿 node_id；失败→看门狗应已自动拉，手动：`cmd.exe /c start "E:\软件工具\AgentLink-v0.4.11-bundle\启动.bat"`（bat 防重、不 re-init、身份安全）
