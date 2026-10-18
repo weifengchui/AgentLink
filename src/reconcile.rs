@@ -650,7 +650,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, EngineConfig, MeshConfig};
+    use crate::config::{AuthConfig, Config, EngineConfig, MeshConfig, Role};
     use crate::router::Router;
     use crate::taskengine::{self, TaskRecord, TaskState};
     use serde_json::json;
@@ -686,6 +686,7 @@ mod tests {
                     max_concurrent_per_node: 2,
                 },
             },
+            auth: AuthConfig::default(),
         };
         let peers = crate::peer::PeerTable::new();
         let (peer_tx, _) = tokio::sync::mpsc::channel(256);

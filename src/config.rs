@@ -49,6 +49,10 @@ pub struct Config {
     /// 老 agentlink.json 缺整段 = 免费层（enabled=false，全默认），零破坏。
     #[serde(default)]
     pub mesh: MeshConfig,
+    /// RBAC 角色/token 映射（v0.6 P0）。老配置缺此段时，local_api.token
+    /// 视为 Admin 角色，行为与 0.5.9 完全一致（零破坏）。
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 /// Mesh 总开关与 license/引擎调参入口。缺省即免费层：引擎不 spawn、
@@ -119,8 +123,70 @@ pub struct SecurityConfig {
 pub struct LocalApiConfig {
     #[serde(default = "default_local_host")]
     pub host: String,
+    /// 主 API 令牌。若 `auth.tokens` 未配置，此令牌视为 Admin 角色。
     #[serde(default = "default_placeholder_token")]
     pub token: String,
+}
+
+/// RBAC 角色（v0.6 P0）。按特权从高到低排序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// 管理员：所有端点（含配置、mesh 状态、指标）。
+    #[default]
+    Admin,
+    /// 运维：读写任务/代理，查看状态，但不改配置。
+    Operator,
+    /// 只读：GET 端点。
+    Viewer,
+    /// 执行方：仅发送/接收任务帧（POST /v1/send 等）。
+    Executor,
+}
+
+impl Role {
+    /// 是否允许访问给定端点。
+    pub fn allows(self, endpoint: &str) -> bool {
+        match self {
+            Role::Admin => true,
+            Role::Operator => !matches!(
+                endpoint,
+                "/v1/config" | "/v1/mesh/status" | "/v1/metrics" | "/v1/lockdown"
+            ),
+            Role::Viewer => matches!(
+                endpoint,
+                "/v1/health"
+                    | "/v1/status"
+                    | "/v1/peers"
+                    | "/v1/tasks"
+                    | "/v1/tasks/"
+                    | "/v1/events"
+                    | "/v1/history"
+                    | "/v1/agents"
+                    | "/v1/fleet/agents"
+                    | "/v1/metrics"
+            ),
+            Role::Executor => matches!(
+                endpoint,
+                "/v1/send" | "/v1/send-file" | "/v1/send-file-upload" | "/v1/ack-inbox"
+            ),
+        }
+    }
+}
+
+/// RBAC 配置（v0.6 P0）。token -> 角色映射。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// 令牌到角色的映射。未在本表中的令牌视为无访问权限。
+    #[serde(default)]
+    pub tokens: std::collections::HashMap<String, Role>,
+    /// 未在 `tokens` 中但通过 `local_api.token` 传入的令牌，缺省角色。
+    /// 缺省 Admin 以保持与 0.5.9 行为一致。
+    #[serde(default = "default_auth_fallback_role")]
+    pub fallback_role: Role,
+}
+
+fn default_auth_fallback_role() -> Role {
+    Role::Admin
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,6 +575,7 @@ impl Config {
                 file: String::new(),
             },
             mesh: MeshConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 

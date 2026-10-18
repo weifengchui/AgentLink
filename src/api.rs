@@ -26,7 +26,7 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::config::Config;
+use crate::config::{Config, Role};
 use crate::conn;
 use crate::file::FileManager;
 use crate::license::{self, LicenseInfo};
@@ -377,8 +377,11 @@ async fn mesh_status_get(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/mesh/status") {
+        return forbidden();
     }
     let mesh_enabled = state.mesh.is_some();
     let (license_info, engine_stats) = match &state.mesh {
@@ -442,8 +445,11 @@ async fn metrics_get(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Response {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized().into_response();
+    };
+    if !role.allows("/v1/metrics") {
+        return forbidden().into_response();
     }
 
     let router_m = state.router.router_metrics();
@@ -557,8 +563,11 @@ async fn metrics_get(
 
 /// Node status. Requires a valid local API token.
 async fn status(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/status") {
+        return forbidden();
     }
 
     let peers = state.peers.snapshot();
@@ -591,8 +600,11 @@ async fn status(State(state): State<SharedState>, headers: HeaderMap) -> impl In
 
 /// List known peers and their online state.
 async fn peers(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/peers") {
+        return forbidden();
     }
     (
         StatusCode::OK,
@@ -618,8 +630,11 @@ async fn peers_forget(
     headers: HeaderMap,
     UrlPath(node_id): UrlPath<String>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/peers/:node_id/forget") {
+        return forbidden();
     }
     let removed = state.peers.forget(&node_id);
     let ids = persist_forgotten(&state);
@@ -635,8 +650,11 @@ async fn peers_unforget(
     headers: HeaderMap,
     UrlPath(node_id): UrlPath<String>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/peers/:node_id/unforget") {
+        return forbidden();
     }
     state.peers.unforget(&node_id);
     let ids = persist_forgotten(&state);
@@ -681,8 +699,11 @@ async fn send(
     headers: HeaderMap,
     JsonAny(req): JsonAny<SendRequest>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/send") {
+        return forbidden();
     }
     let to = match resolve_target(&state, &req.to) {
         Ok(t) => t,
@@ -739,8 +760,11 @@ async fn send_file(
     headers: HeaderMap,
     JsonAny(req): JsonAny<SendFileRequest>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/send-file") {
+        return forbidden();
     }
     let to = match resolve_target(&state, &req.to) {
         Ok(t) => t,
@@ -788,8 +812,11 @@ async fn send_file_upload(
     Query(params): Query<UploadParams>,
     body: Bytes,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/send-file-upload") {
+        return forbidden();
     }
     if body.len() > state.config.files.max_file_size as usize {
         return (
@@ -903,8 +930,11 @@ async fn ack_inbox(
     headers: HeaderMap,
     JsonAny(req): JsonAny<AckInboxRequest>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/ack-inbox") {
+        return forbidden();
     }
     let acked = state.router.ack_local(&req.msg_id);
     (StatusCode::OK, Json(json!({ "ok": true, "acked": acked })))
@@ -927,8 +957,11 @@ async fn agents_post(
     headers: HeaderMap,
     JsonAny(req): JsonAny<RegisterAgentRequest>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/agents") {
+        return forbidden();
     }
     let id = req.agent_id.trim();
     let valid = !id.is_empty()
@@ -955,8 +988,11 @@ async fn agents_delete(
     headers: HeaderMap,
     JsonAny(req): JsonAny<RegisterAgentRequest>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/agents") {
+        return forbidden();
     }
     let removed = state.router.unregister_agent(req.agent_id.trim());
     (
@@ -967,8 +1003,11 @@ async fn agents_delete(
 
 /// List agents registered on this node.
 async fn agents_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/agents") {
+        return forbidden();
     }
     (
         StatusCode::OK,
@@ -992,8 +1031,11 @@ async fn fleet_agents(
     headers: HeaderMap,
     Query(q): Query<FleetAgentsQuery>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/fleet/agents") {
+        return forbidden();
     }
     let mut names: HashMap<String, String> = HashMap::new();
     let mut addrs: HashMap<String, String> = HashMap::new();
@@ -1063,8 +1105,11 @@ async fn fleet_agents(
 
 /// Recent bus traffic (ring buffer) for the human view.
 async fn history_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/history") {
+        return forbidden();
     }
     (
         StatusCode::OK,
@@ -1102,8 +1147,11 @@ async fn events_get(
     headers: HeaderMap,
     Query(q): Query<EventsQuery>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/events") {
+        return forbidden();
     }
     let since = q.since.unwrap_or(0);
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
@@ -1182,8 +1230,11 @@ async fn tasks_get(
     headers: HeaderMap,
     Query(q): Query<TasksQuery>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/tasks") {
+        return forbidden();
     }
     let states: Option<Vec<String>> = q.state.map(|s| {
         s.split(',')
@@ -1236,8 +1287,11 @@ async fn tasks_post(
     headers: HeaderMap,
     JsonAny(body): JsonAny<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/tasks") {
+        return forbidden();
     }
     let Some(mesh) = state.mesh.as_ref().cloned() else {
         return mesh_required();
@@ -1363,8 +1417,11 @@ async fn tasks_get_one(
     headers: HeaderMap,
     UrlPath(task_id): UrlPath<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/tasks/:task_id") {
+        return forbidden();
     }
     let Some(mesh) = state.mesh.as_ref() else {
         return mesh_required();
@@ -1393,8 +1450,11 @@ async fn tasks_cancel_post(
     headers: HeaderMap,
     UrlPath(task_id): UrlPath<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/tasks/:task_id/cancel") {
+        return forbidden();
     }
     let Some(mesh) = state.mesh.as_ref().cloned() else {
         return mesh_required();
@@ -1464,8 +1524,11 @@ async fn tasks_delete(
     headers: HeaderMap,
     UrlPath(task_id): UrlPath<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/tasks/:task_id") {
+        return forbidden();
     }
     let Some(mesh) = state.mesh.as_ref().cloned() else {
         return mesh_required();
@@ -1536,8 +1599,11 @@ fn lockdown_json(on: bool, out: u64, inn: u64) -> Json<serde_json::Value> {
 /// `GET /v1/lockdown` — current fuse state + cumulative blocked counts.
 /// Requires the local API (management) token, like every admin surface here.
 async fn lockdown_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return (StatusCode::UNAUTHORIZED, lockdown_json(false, 0, 0));
+    };
+    if !role.allows("/v1/lockdown") {
+        return (StatusCode::FORBIDDEN, lockdown_json(false, 0, 0));
     }
     let (on, out, inn) = state.router.lockdown_stats();
     (StatusCode::OK, lockdown_json(on, out, inn))
@@ -1558,8 +1624,11 @@ async fn lockdown_post(
     headers: HeaderMap,
     JsonAny(req): JsonAny<LockdownRequest>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return (StatusCode::UNAUTHORIZED, lockdown_json(false, 0, 0));
+    };
+    if !role.allows("/v1/lockdown") {
+        return (StatusCode::FORBIDDEN, lockdown_json(false, 0, 0));
     }
     state.router.set_lockdown(req.on);
     let (on, out, inn) = state.router.lockdown_stats();
@@ -1572,8 +1641,11 @@ async fn history_stats_get(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/history/stats") {
+        return forbidden();
     }
     let h = &state.config.history;
     if !h.enabled || h.file.is_empty() || h.file == "-" {
@@ -1635,8 +1707,11 @@ async fn history_search_get(
     headers: HeaderMap,
     Query(qs): Query<HistorySearchQuery>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized().into_response();
+    };
+    if !role.allows("/v1/history/search") {
+        return forbidden().into_response();
     }
     let h = &state.config.history;
     if !h.enabled || h.file.is_empty() || h.file == "-" {
@@ -1673,8 +1748,11 @@ async fn history_search_get(
 
 /// Identity colors for the console (see `store::COLORS_FILE`).
 async fn colors_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/colors") {
+        return forbidden();
     }
     let dir = state.config.data_dir.clone();
     let m = tokio::task::spawn_blocking(move || crate::store::load_colors(&dir))
@@ -1691,8 +1769,11 @@ async fn colors_put(
     headers: HeaderMap,
     JsonAny(body): JsonAny<serde_json::Value>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/colors") {
+        return forbidden();
     }
     let Some(map) = body.get("colors").and_then(|c| c.as_object()) else {
         return (
@@ -1758,8 +1839,11 @@ async fn history_export_get(
     headers: HeaderMap,
     Query(q): Query<HistoryExportQuery>,
 ) -> Response {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized().into_response();
+    };
+    if !role.allows("/v1/history/export") {
+        return forbidden().into_response();
     }
     let h = &state.config.history;
     if !h.enabled || h.file.is_empty() || h.file == "-" {
@@ -1890,8 +1974,11 @@ async fn file_download(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Response {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized().into_response();
+    };
+    if !role.allows("/v1/files/:file_name") {
+        return forbidden().into_response();
     }
     let Some(name) = crate::file::sanitize_name(&file_name) else {
         return (
@@ -1953,8 +2040,11 @@ async fn open_folder(
         )
             .into_response();
     }
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized().into_response();
+    };
+    if !role.allows("/v1/open-folder") {
+        return forbidden().into_response();
     }
     let Some(name) = crate::file::sanitize_name(&req.file) else {
         return (
@@ -2057,8 +2147,11 @@ fn mask_secret(s: &str) -> String {
 
 /// Read the effective configuration (secrets masked).
 async fn config_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/config") {
+        return forbidden();
     }
     let c = &state.config;
     (
@@ -2110,8 +2203,11 @@ async fn config_put(
     headers: HeaderMap,
     JsonAny(req): JsonAny<ConfigUpdateRequest>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
+    let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
+    };
+    if !role.allows("/v1/config") {
+        return forbidden();
     }
     let name = req
         .name
@@ -3126,11 +3222,39 @@ where
     }
 }
 
+/// 鉴权并返回调用者角色（v0.6 P0 RBAC）。
+/// - 未提供 token 或 token 不匹配 -> None (401)
+/// - 匹配 `local_api.token` 但不在 `auth.tokens` 中 -> fallback_role (缺省 Admin，兼容 0.5.9)
+/// - 在 `auth.tokens` 中 -> 对应角色
+fn authorized_role(state: &AppState, headers: &HeaderMap) -> Option<Role> {
+    let token = headers.get("x-auth-token").and_then(|v| v.to_str().ok())?;
+    let auth = &state.config.auth;
+
+    // 优先匹配显式配置的 token -> 角色
+    if let Some(role) = auth.tokens.get(token) {
+        return Some(*role);
+    }
+
+    // 回退：local_api.token 视为 fallback_role（缺省 Admin，兼容 0.5.9）
+    if constant_time_eq(token.as_bytes(), state.config.local_api.token.as_bytes()) {
+        return Some(auth.fallback_role);
+    }
+
+    None
+}
+
+/// 兼容 0.5.x 的 bool 鉴权：任意有效 token 即通过（角色缺省 Admin）。
+#[allow(dead_code)]
 fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    let expected = state.config.local_api.token.as_bytes();
-    match headers.get("x-auth-token").and_then(|v| v.to_str().ok()) {
-        Some(got) => constant_time_eq(got.as_bytes(), expected),
-        None => false,
+    authorized_role(state, headers).is_some()
+}
+
+/// 检查角色是否允许访问给定端点；不允许返回 403。
+#[allow(dead_code)]
+fn require_role(role: Option<Role>, endpoint: &str) -> Result<Role, ()> {
+    match role {
+        Some(r) if r.allows(endpoint) => Ok(r),
+        _ => Err(()),
     }
 }
 
@@ -3138,6 +3262,14 @@ fn unauthorized() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::UNAUTHORIZED,
         Json(json!({ "error": "invalid or missing X-Auth-Token" })),
+    )
+}
+
+#[allow(dead_code)]
+fn forbidden() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "insufficient role for this endpoint" })),
     )
 }
 
