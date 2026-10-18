@@ -903,41 +903,109 @@ document.getElementById("bFs").onclick=()=>{
  let p=null;try{p=tgt.requestFullscreen()}catch(e){p=Promise.reject(e)}
  if(p&&p.catch)p.catch(()=>{try{document.body.requestFullscreen().catch(()=>{})}catch(e){}});
 };
-document.getElementById("bSnap").onclick=snapshot;
-let recorder=null,recTimer=null;
-document.getElementById("bRec").onclick=e=>{
- if(recorder){recorder.stop();recorder=null;clearInterval(recTimer);e.target.classList.remove("on");e.target.textContent="录屏";return;}
- const cv=document.createElement("canvas");cv.width=W;cv.height=H;
- const stream=cv.captureStream(30);recorder=new MediaRecorder(stream,{mimeType:"video/webm"});
- const chunks=[];recorder.ondataavailable=ev=>chunks.push(ev.data);
- recorder.onstop=()=>{const a=document.createElement("a");a.download="agentlink-star-"+Date.now()+".webm";
-  a.href=URL.createObjectURL(new Blob(chunks,{type:"video/webm"}));a.click();};
- recorder.start();e.target.classList.add("on");e.target.textContent="停止";
- const g=cv.getContext("2d");
- recTimer=setInterval(()=>{snapshotTo(g);
-  for(const el of document.querySelectorAll(".ph")){const r=el.getBoundingClientRect();
-   g.beginPath();g.arc(r.left+5,r.top+5,5,0,7);g.fillStyle=el.style.color;
-   g.shadowColor=el.style.color;g.shadowBlur=16;g.fill();g.shadowBlur=0;}},33);
- setTimeout(()=>{if(recorder)e.target.click();},12000);};
-function snapshot(){const cv=document.createElement("canvas");cv.width=W;cv.height=H;const g=cv.getContext("2d");
- snapshotTo(g);
- const a=document.createElement("a");a.download="agentlink-star-"+Date.now()+".png";a.href=cv.toDataURL("image/png");a.click();}
-function snapshotTo(g){
- g.fillStyle="#04070d";g.fillRect(0,0,W,H);
- for(const m in MACH){const c=MACH[m];const s=STA[m];
-  hexPath(g,s.x,s.y,66);g.strokeStyle=c.col;g.globalAlpha=.8;g.lineWidth=2;g.stroke();g.globalAlpha=.07;
-  g.fillStyle=c.col;g.fill();g.globalAlpha=1;
-  g.fillStyle="#cfe3ff";g.font="13px Consolas";g.textAlign="center";g.fillText(c.lab+" "+c.ip,s.x,s.y-88);}
- for(const k in agtEl){const p=agPos(k);g.beginPath();g.arc(p.x,p.y,10,0,7);
-  g.fillStyle=MACH[k.split("|")[0]].col;g.shadowColor=g.fillStyle;g.shadowBlur=14;g.fill();g.shadowBlur=0;
-  g.fillStyle="#fff";g.font="10px Consolas";g.fillText(recvCount(k),p.x+16,p.y-10);}
- for(const l of LINKS){const p1=agPos(l.f),p2=agPos(l.t);
-  const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2,dx=p2.x-p1.x,dy=p2.y-p1.y,L2=Math.hypot(dx,dy)||1,b=bowOf(l.key);
-  g.beginPath();g.moveTo(p1.x,p1.y);g.quadraticCurveTo(mx+(-dy/L2)*b,my+(dx/L2)*b,p2.x,p2.y);
-  g.strokeStyle=l.color;g.globalAlpha=.4;g.lineWidth=1.2;g.stroke();g.globalAlpha=1;}
- g.textAlign="left";}
-function hexPath(g,x,y,r){g.beginPath();for(let i=0;i<6;i++){const a=Math.PI/3*i-Math.PI/2;
- const px=x+Math.cos(a)*r,py=y+Math.sin(a)*r;i?g.lineTo(px,py):g.moveTo(px,py);}g.closePath();}
+document.getElementById("bSnap").onclick=()=>capShot().catch(e=>setErr("截图失败："+(e&&e.message||e)));
+/* ---------- R1（10-18 第十六轮）：所见即所得截图/录屏 ----------
+   旧实现是从数据模型重绘的简化示意（大六边形+散点），与真实界面完全不符——整段废弃。
+   管线：documentElement 深克隆 → 烘焙（:root 变量内联到克隆根——foreignObject 文档里 :root
+   命中的是 svg 不是 html，必须显式带上；页面 <style> 原样拷入；canvas 烘焙成同尺寸 img；
+   表单现值；CSS 动画用负 delay+paused 定格在当下相位，录制中每帧重算因此有连贯动画感）→
+   XMLSerializer 装入 SVG foreignObject → blob URL → Image.decode → canvas。
+   截图 = 单帧 2x 超采样出 PNG；录屏 = 常驻离屏 canvas captureStream(15fps)，每帧喂新画面，
+   录的同时真页面动画整体冻结（避免拍到的相位与用户看到的错位），再点「停止」出 webm；
+   450 帧（≈30s）硬上限自动收。弹窗/顶栏/底栏在 body 子树里，天然入画。 */
+let capSeq=0,capBusy=false,capRec=null,capTimer=null,capFrames=0,capPaused=[];
+const capcv=document.createElement("canvas");let capctx=capcv.getContext("2d");
+function bakeForm(el){if(el.tagName==="INPUT"){if(el.type==="checkbox"||el.type==="radio"){if(el.checked)el.setAttribute("checked","")}else el.setAttribute("value",el.value)}
+ else if(el.tagName==="TEXTAREA")el.textContent=el.value;
+ else if(el.tagName==="SELECT"){const o=el.options[el.selectedIndex];el.innerHTML="";if(o){const s=document.createElement("span");s.textContent=o.textContent;el.appendChild(s)}}}
+function rootVarsCss(){let t="";const cs=getComputedStyle(document.documentElement);
+ for(const k of cs){if(k.startsWith("--")){const v=cs.getPropertyValue(k).trim();if(v)t+=k+":"+v+";"}}return t}
+async function captureImg(dw,dh){
+const cap=String(++capSeq);
+const live=document.documentElement;
+const els=live.querySelectorAll("*");
+const clone=live.cloneNode(true);
+// 定格流程：先算出带 CSS 动画的真页面元素下标，再把 data-anim-cap 标记同步打到
+// 克隆树的同下标元素（cels 在删 script 前取，与 els 一一同构）。全程同步执行，真页面
+// 不留痕迹；克隆带标记进序列化，注入的 paused 规则只命中带标记元素。
+const animByEl=new Map();const idxMarked=[];
+for(let i=0;i<els.length;i++){const an=els[i].getAnimations&&els[i].getAnimations();
+ if(an&&an.length){animByEl.set(els[i],an[0]);idxMarked.push(i)}}
+const cels=Array.from(clone.querySelectorAll("*")); // 删 script 前先取：与 els 同下标同构
+for(const n of Array.from(clone.querySelectorAll("script,link,iframe,base")))n.remove();
+for(const i of idxMarked){if(cels[i])cels[i].setAttribute("data-anim-cap",cap)}
+clone.setAttribute("data-anim-root",cap);
+clone.style.cssText=rootVarsCss()+";margin:0;width:"+dw+"px;height:"+dh+"px;background:#04070d";
+for(const b of clone.querySelectorAll("body"))b.style.cssText+=";margin:0;width:"+dw+"px;height:"+dh+"px;overflow:hidden;background:#04070d";
+// 动画定格：冻结点 = 墙钟 − startTime（动画被 pause 后 currentTime 仍随墙钟走，不能直接取 currentTime），
+// 负 animation-delay 写进克隆元素的内联样式；注入规则统一 paused。
+const cmarked=Array.from(clone.querySelectorAll("[data-anim-cap]"));
+for(let j=0;j<cmarked.length;j++){const an=animByEl.get(els[idxMarked[j]]);if(!an)continue;
+ let ct=Number(an.currentTime);
+ if(!isFinite(ct)){const st=Number(an.startTime);ct=isFinite(st)?(document.timeline.currentTime||0)-st:0}
+ if(!isFinite(ct))ct=0;
+ cmarked[j].style.animationDelay=(-ct/1000)+"s"}
+if(idxMarked.length){const fr=document.createElement("style");
+ fr.textContent=`[data-anim-root="${cap}"] [data-anim-cap="${cap}"]{animation-play-state:paused!important}`;
+ clone.appendChild(fr)}
+ for(const st of Array.from(document.querySelectorAll("style"))){const st2=document.createElement("style");
+  st2.textContent=st.textContent.replace(/backdrop-filter\s*:[^;}]+/g,"none");clone.appendChild(st2)}
+ const srcCvs=live.querySelectorAll("canvas"),dstCvs=clone.querySelectorAll("canvas");
+ for(let i=0;i<dstCvs.length;i++){const s=srcCvs[i];if(!s)continue;const r=s.getBoundingClientRect();
+  let url="";try{url=s.toDataURL("image/png")}catch(e){}
+  const im=clone.createElement("img");if(url)im.src=url;
+  im.setAttribute("style","position:fixed;left:"+r.left+"px;top:"+r.top+"px;width:"+r.width+"px;height:"+r.height+"px");
+  dstCvs[i].replaceWith(im)}
+ for(const el of clone.querySelectorAll("input,textarea,select"))bakeForm(el);
+ const xml=new XMLSerializer().serializeToString(clone);
+ const body=/<html(\s[^>]*)?>/.test(xml)?xml.replace(/<html(\s[^>]*)?>/,m=>/xmlns=/.test(m)?m:m.replace("<html",'<html xmlns="http://www.w3.org/1999/xhtml"')):"<html>"+xml+"</html>";
+ const svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+dw+'" height="'+dh+'" viewBox="0 0 '+dw+' '+dh+'"><foreignObject x="0" y="0" width="100%" height="100%">'+body+"</foreignObject></svg>";
+ // 注意：本引擎系（含 Chrome 新版）会把 blob: URL 的 SVG 图判为跨源、画进 canvas 即中毒，
+ // toBlob/toDataURL 报 SecurityError；data: URL 载体不受影响。必须走 data URL。
+ try{const img=new Image();img.src="data:image/svg+xml;charset=utf-8,"+encodeURIComponent(svg);await img.decode();return img}
+ catch(e){throw new Error("画面解码失败："+(e&&e.message||e))}}
+function capDims(){return[Math.max(2,stageEl.clientWidth||innerWidth),Math.max(2,stageEl.clientHeight||innerHeight)]}
+async function capPauseAll(){for(const a of document.getAnimations()){try{if(a.play)a.pause()}catch(e){}}}
+function capResumeAll(){for(const a of capPaused){try{a.play()}catch(e){}}capPaused=[]}
+async function capFrame(){if(capBusy)return;capBusy=true;
+ try{const d=capDims();const img=await captureImg(d[0],d[1]);
+  const cw=Math.round(d[0]*devicePixelRatio),chh=Math.round(d[1]*devicePixelRatio);
+  if(capcv.width!==cw||capcv.height!==chh){capcv.width=cw;capcv.height=chh;capctx=capcv.getContext("2d")}
+  capctx.drawImage(img,0,0,cw,chh)}
+ finally{capBusy=false}}
+async function capShot(){if(capBusy){setErr("录制进行中，请先停止录屏再截图");return}
+ const d=capDims();const img=await captureImg(d[0],d[1]);
+ const cv=document.createElement("canvas");cv.width=d[0]*2;cv.height=d[1]*2;
+ cv.getContext("2d").drawImage(img,0,0,cv.width,cv.height);
+ const blob=await new Promise(res=>cv.toBlob(res,"image/png"));
+ if(!blob){setErr("截图生成失败");return}
+ const a=document.createElement("a");a.download="agentlink-star-"+Date.now()+".png";
+ a.href=URL.createObjectURL(blob);a.click();setTimeout(()=>URL.revokeObjectURL(a.href),8000);setErr("")}
+function capMime(){if(typeof MediaRecorder==="undefined"||!MediaRecorder.isTypeSupported)return"";
+ for(const m of["video/webm;codecs=vp9","video/webm;codecs=vp8","video/webm"])
+  if(MediaRecorder.isTypeSupported(m))return m;return""}
+function capRecStop(){if(capTimer){clearInterval(capTimer);capTimer=null}
+ const rs=capRec;capRec=null;capFrames=0;capResumeAll();
+ const btn=document.getElementById("bRec");btn.classList.remove("on");btn.textContent="录屏";
+ if(rs&&rs.state!=="inactive"){try{rs.stop()}catch(e){}}}
+document.getElementById("bRec").onclick=async e=>{const btn=e.currentTarget;
+ if(capRec){capRecStop();return}
+ if(capBusy)return;
+ await capPauseAll();
+ try{await capFrame()}catch(err){capResumeAll();setErr("录屏启动失败："+(err&&err.message||err));return}
+ capPaused=Array.from(document.getAnimations());for(const a of capPaused){try{if(a.play)a.pause()}catch(e){}}
+ let stream=null;try{stream=capcv.captureStream(15)}catch(err){capResumeAll();setErr(String(err.message||err));return}
+ const mime=capMime();let rec=null;try{rec=mime?new MediaRecorder(stream,{mimeType:mime}):new MediaRecorder(stream)}
+ catch(err){capResumeAll();setErr(String(err.message||err));return}
+ const chunks=[];
+ rec.ondataavailable=ev=>{if(ev.data&&ev.data.size)chunks.push(ev.data)};
+ rec.onstop=()=>{const a=document.createElement("a");a.download="agentlink-star-"+Date.now()+".webm";
+  a.href=URL.createObjectURL(new Blob(chunks,{type:"video/webm"}));a.click();setTimeout(()=>URL.revokeObjectURL(a.href),8000)};
+ capRec=rec;capFrames=0;try{rec.start(1000)}catch(err){capRec=null;capResumeAll();setErr(String(err.message||err));return}
+ btn.classList.add("on");btn.textContent="停止";setErr("");
+ capTimer=setInterval(()=>{if(!capRec)return;
+  if(++capFrames>450){capRecStop();return} // 450 帧 ≈ 30s 硬上限
+  capFrame().catch(()=>{})},66)};
 /* ---------- boot ---------- */
 let W0=0,H0=0;
 /* R2（10-17 第十轮）：偏左根因=解析时 innerWidth 可能是 iframe 首帧(300x150)或隐藏态(0)，
