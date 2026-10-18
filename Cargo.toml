@@ -37,6 +37,7 @@ local-ip-address = "0.6"
 # native-tls/openssl），保持 x86_64-pc-windows-gnu 交叉编译友好。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 mdns-sd = { version = "0.11", optional = true }
+ed25519-compact = "2"
 
 [profile.release]
 lto = true

@@ -10,6 +10,7 @@ mod conn;
 mod discovery;
 mod file;
 mod logging;
+mod license;
 #[cfg(feature = "mdns")]
 mod mdns;
 mod peer;
@@ -17,6 +18,8 @@ mod proto;
 mod redact;
 mod router;
 mod store;
+mod taskengine;
+mod taskstore;
 mod trace;
 mod wizard;
 
