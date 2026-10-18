@@ -57,6 +57,9 @@ pub struct Config {
     /// 事件的外部通知。老配置缺此段 = 不启用 webhook，零破坏。
     #[serde(default)]
     pub webhook: WebhookConfig,
+    /// mTLS 配置（v0.6 P1）。LAN 默认关闭，一键开启后节点间连接使用双向 TLS。
+    #[serde(default)]
+    pub mtls: MtlsConfig,
 }
 
 /// Mesh 总开关与 license/引擎调参入口。缺省即免费层：引擎不 spawn、
@@ -259,6 +262,46 @@ fn default_webhook_max_retries() -> u32 {
 }
 fn default_webhook_retry_interval_seconds() -> u64 {
     10
+}
+
+/// mTLS 配置（v0.6 P1）。LAN 默认关闭，一键开启后节点间连接使用
+/// 双向 TLS 认证。内置 CA 一键签发节点证书，支持 24h 轮转。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MtlsConfig {
+    /// 是否启用 mTLS。缺省 false（LAN 明文），显式 true 后启用双向 TLS。
+    #[serde(default)]
+    pub enabled: bool,
+    /// CA 证书路径（PEM 格式）。缺省自动生成到 data_dir/mtls/ca.pem。
+    #[serde(default)]
+    pub ca_cert: Option<std::path::PathBuf>,
+    /// CA 私钥路径（PEM 格式）。缺省自动生成到 data_dir/mtls/ca.key。
+    #[serde(default)]
+    pub ca_key: Option<std::path::PathBuf>,
+    /// 证书有效期（天），缺省 1 天（24h 轮转）。
+    #[serde(default = "default_mtls_cert_ttl_days")]
+    pub cert_ttl_days: u32,
+    /// 证书轮转间隔（秒），缺省 21600s（6h），提前于 ttl 过期前重新签发。
+    #[serde(default = "default_mtls_rotate_interval")]
+    pub cert_rotate_interval_seconds: u64,
+}
+
+impl Default for MtlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ca_cert: None,
+            ca_key: None,
+            cert_ttl_days: default_mtls_cert_ttl_days(),
+            cert_rotate_interval_seconds: default_mtls_rotate_interval(),
+        }
+    }
+}
+
+fn default_mtls_cert_ttl_days() -> u32 {
+    1
+}
+fn default_mtls_rotate_interval() -> u64 {
+    21600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -614,6 +657,7 @@ impl Config {
             mesh: MeshConfig::default(),
             auth: AuthConfig::default(),
             webhook: WebhookConfig::default(),
+            mtls: MtlsConfig::default(),
         }
     }
 
@@ -764,6 +808,46 @@ mod tests {
         assert_eq!(cfg.mesh.engine.max_concurrent_per_node, 2);
         // v 号不动（P1-3 验收：不发配置版本）
         assert_eq!(cfg.v, 1);
+        // 老配置没有 mtls 段：必须全默认（关闭，零行为变化）。
+        assert!(!cfg.mtls.enabled);
+        assert_eq!(cfg.mtls.ca_cert, None);
+        assert_eq!(cfg.mtls.cert_ttl_days, 1);
+        assert_eq!(cfg.mtls.cert_rotate_interval_seconds, 21600);
+    }
+
+    /// mTLS 段缺省/部分字段：默认关闭，逐项回落到默认值。
+    #[test]
+    fn mtls_section_defaults_and_partial_fields() {
+        // 完全没有 mtls 段。
+        let absent: Config = serde_json::from_str(r#"{"node_id":"n","name":"h"}"#).unwrap();
+        assert!(!absent.mtls.enabled);
+        assert_eq!(absent.mtls.cert_ttl_days, 1);
+        assert_eq!(absent.mtls.cert_rotate_interval_seconds, 21600);
+
+        // 只写 enabled，其余回落默认。
+        let partial: Config =
+            serde_json::from_str(r#"{"node_id":"n","name":"h","mtls":{"enabled":true}}"#).unwrap();
+        assert!(partial.mtls.enabled);
+        assert_eq!(partial.mtls.cert_ttl_days, 1);
+        assert_eq!(partial.mtls.cert_rotate_interval_seconds, 21600);
+
+        // 显式自定义 ttl/窗口 + 自定义 CA 路径。
+        let custom: Config = serde_json::from_str(
+            r#"{"node_id":"n","name":"h","mtls":{"ca_cert":"k/root.pem","ca_key":"k/root.key",
+                "cert_ttl_days":2,"cert_rotate_interval_seconds":3600}}"#,
+        )
+        .unwrap();
+        assert!(!custom.mtls.enabled);
+        assert_eq!(custom.mtls.cert_ttl_days, 2);
+        assert_eq!(custom.mtls.cert_rotate_interval_seconds, 3600);
+        assert_eq!(custom.mtls.ca_cert, Some(PathBuf::from("k/root.pem")));
+        assert_eq!(custom.mtls.ca_key, Some(PathBuf::from("k/root.key")));
+
+        // 默认构造（Config::generate 走这里）与 serde 默认一致。
+        let d = MtlsConfig::default();
+        assert!(!d.enabled);
+        assert_eq!(d.cert_ttl_days, 1);
+        assert_eq!(d.cert_rotate_interval_seconds, 21600);
     }
 
     /// mesh 段只写一部分字段：逐项缺省值必须生效（含 mesh 有段但 engine 缺、

@@ -38,6 +38,9 @@ local-ip-address = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 mdns-sd = { version = "0.11", optional = true }
 ed25519-compact = "2"
+# mTLS 证书生成（v0.6 P1）：纯 Rust，无 C 依赖，保持单二进制。
+# 默认 `pem` feature 即可（CA 自签 + CA 签发节点证书），无需 x509-parser。
+rcgen = "0.11"
 
 [profile.release]
 lto = true

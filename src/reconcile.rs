@@ -718,6 +718,7 @@ mod tests {
             },
             auth: AuthConfig::default(),
             webhook: WebhookConfig::default(),
+            mtls: Default::default(),
         };
         let peers = crate::peer::PeerTable::new();
         let (peer_tx, _) = tokio::sync::mpsc::channel(256);

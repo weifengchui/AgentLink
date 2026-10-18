@@ -13,6 +13,7 @@ mod license;
 mod logging;
 #[cfg(feature = "mdns")]
 mod mdns;
+mod mtls;
 mod peer;
 mod proto;
 mod reconcile;
@@ -148,6 +149,22 @@ enum Command {
     Hello {
         #[command(flatten)]
         opts: cli::HelloArgs,
+    },
+    /// mTLS 一键启用 / 查看 / 轮转（v0.6 P1）。
+    /// 生成内置 CA 并签发本机节点证书；`--enable` 写入 mtls.enabled=true。
+    Mtls {
+        /// 生成/加载证书并把 `mtls.enabled` 置为 true（一键开启）。
+        #[arg(long)]
+        enable: bool,
+        /// 关闭 mtls（写回 `mtls.enabled=false`，不删除证书文件）。
+        #[arg(long)]
+        disable: bool,
+        /// 打印 CA/节点证书路径、指纹与到期时间。
+        #[arg(long)]
+        show: bool,
+        /// 立即轮转节点证书（CA 与全网信任不变）。
+        #[arg(long)]
+        rotate: bool,
     },
 }
 
@@ -331,6 +348,12 @@ async fn main() -> Result<()> {
         Some(Command::Hello { opts }) => {
             cli::hello(opts, cli.url.as_deref(), cli.token.as_deref(), &cli.config).await
         }
+        Some(Command::Mtls {
+            enable,
+            disable,
+            show,
+            rotate,
+        }) => mtls_cmd(&cli.config, enable, disable, show, rotate),
         None => {
             // v0.5 收官：裸启动 + 无配置 + 交互终端 → 自动进入首次向导
             // （Windows 双击 exe 的新机器旅程，不需要先读任何文档）。
@@ -405,8 +428,107 @@ async fn setup_flow(config_path: &Path, log_format: Option<String>, yes: bool) -
     }
 }
 
+/// `agentlink mtls`：一键启用/查看/轮转内置 CA 与本机节点证书（v0.6 P1）。
+fn mtls_cmd(
+    config_path: &Path,
+    enable: bool,
+    disable: bool,
+    show: bool,
+    rotate: bool,
+) -> Result<()> {
+    if enable && disable {
+        bail!("--enable 与 --disable 不能同时使用");
+    }
+    // `--show` 是默认行为（无任何标志时也打印状态），仅为显式表达保留。
+    let _ = show;
+    let mut cfg = load_config(config_path, false)?;
+    std::fs::create_dir_all(&cfg.data_dir)
+        .with_context(|| format!("failed to create data dir {}", cfg.data_dir.display()))?;
+
+    let mut manager = mtls::MtlsManager::load_or_create(&cfg.mtls, &cfg.data_dir)?;
+    if rotate {
+        manager.rotate_node_cert()?;
+        println!("已轮转节点证书（CA 不变）");
+    }
+
+    if enable && !cfg.mtls.enabled {
+        cfg.mtls.enabled = true;
+        cfg.save(config_path)?;
+    } else if disable && cfg.mtls.enabled {
+        cfg.mtls.enabled = false;
+        cfg.save(config_path)?;
+    }
+
+    // 未指定任何动作标志时等价于 --show。
+    print_mtls_status(&cfg, &manager, config_path)?;
+    Ok(())
+}
+
+/// 打印 mTLS 当前状态与证书信息。
+fn print_mtls_status(cfg: &Config, manager: &mtls::MtlsManager, config_path: &Path) -> Result<()> {
+    let paths = manager.paths();
+    println!(
+        "mTLS: {}",
+        if cfg.mtls.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!("  config:      {}", config_path.display());
+    println!(
+        "  CA cert:     {}  sha256={}",
+        paths.ca_cert.display(),
+        manager.ca_fingerprint()?
+    );
+    println!("  CA key:      {}", paths.ca_key.display());
+    println!(
+        "  node cert:   {}  sha256={}",
+        paths.node_cert.display(),
+        manager.node_fingerprint()?
+    );
+    println!("  node key:    {}", paths.node_key.display());
+    println!("  node expiry: {}", format_unix(manager.node_expiry_unix()));
+    println!(
+        "  ttl:         {} 天（轮转窗口 {}s）",
+        cfg.mtls.cert_ttl_days, cfg.mtls.cert_rotate_interval_seconds
+    );
+    if !cfg.mtls.enabled {
+        println!("\n开启: agentlink mtls --enable");
+    }
+    Ok(())
+}
+
+/// 把 Unix 秒格式化成 RFC3339（失败则回显原始秒）。
+fn format_unix(unix: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix)
+        .ok()
+        .and_then(|t| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| unix.to_string())
+}
+
 async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
     let bind = format!("{}:{}", cfg.local_api.host, cfg.listen_port);
+
+    // v0.6 P1 mTLS：开启时确保内置 CA 与本机节点证书就绪（一键签发/轮转）。
+    // 证书是节点间 TLS 传输（第二波接线）的前置；此处失败只告警不阻断启动。
+    if cfg.mtls.enabled {
+        match mtls::MtlsManager::load_or_create(&cfg.mtls, &cfg.data_dir) {
+            Ok(m) => tracing::info!(
+                ca_path = %m.paths().ca_cert.display(),
+                ca_fingerprint = %m.ca_fingerprint().unwrap_or_default(),
+                node_expiry_unix = m.node_expiry_unix(),
+                "mtls: certificates ready"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                "mtls: certificate setup failed; continuing without peer mTLS"
+            ),
+        }
+    }
 
     let (peer_tx, peer_rx) = tokio::sync::mpsc::channel(256);
     let peers = peer::PeerTable::new();
