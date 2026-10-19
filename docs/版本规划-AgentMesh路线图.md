@@ -33,7 +33,7 @@
 - 可选 mTLS：内置 CA 一键签发+24h 轮转 + **CA 自动分发**（权威节点经已认证链路零拷贝下发，成员热启用；冲突保护）+ **强制 require 模式**（`mtls.require`，拒绝一切明文对等链路）（rustls+rcgen，LAN 默认关闭、一键开启）【§4.1】
 - 新节点准入：bootstrap token + 硬件指纹双验证（已交付：对等/文件通道同一闸门、fail-closed、单因素显式裁剪；`agentlink admission` CLI + `join --admission`）【§4.1】
 - Lease 心跳 + 阈值差异上报（CPU±5% 才发 Full Status）【§5.1】——已交付（2026-10-19，`docs/lease差异上报-验证-2026-10-19.md`：`ctrl/lease` 加性帧 + 首拍/阈值跨越发 Full + 裸心跳节流 + hello 补推；缺省关零流量）
-- 出站 webhook（OnTaskFailed/OnNodeOffline/OnAuditAlert），wake-kit 收敛为标准实现【§8.2】
+- 出站 webhook（OnTaskFailed/OnNodeOffline/OnAuditAlert），wake-kit 收敛为标准实现【§8.2】——部分交付（2026-10-18，`251805a`：`WebhookClient` url/events/重试客户端，`reconcile::on_task_terminal` 在 task_failed/task_expired 终态触发。**未覆盖（列入 v0.6 P2）**：① OnNodeOffline/OnAuditAlert 触发点未接线（全库仅任务终态一处 `fire()`）；② wake-kit 收敛未动——v0.4.x 侧车 `wake_hook.py`+`wake.json`（桥收信后 HMAC 唤醒本机 agent 会话）仍现役于实战舰队，需由内核 webhook 统一替代（补充签名 secret 字段与消息投递事件）后退役
 - Prometheus `/metrics`（queue_depth、task_duration、node_utilization）【§7.1】
 - GitOps：watch 仓库 tasks/ 目录自动 apply【§8.3】——已交付（2026-10-19，`docs/gitops目录驱动-验证-2026-10-19.md`：sha256 差分轮询 + 与 POST /v1/tasks 同一内核口径 `reconcile::apply_task_spec`；缺省关、mesh 缺席自拒）
 - 预热池形式化：常驻桥 = agent warmpool，任务到达即注上下文，冷启动 <200ms【§5.3】
