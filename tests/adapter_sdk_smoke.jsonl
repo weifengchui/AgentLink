@@ -1,0 +1,10 @@
+{"scenario": "S1 declined_missing_cap", "pass": true, "detail": ""}
+{"scenario": "S2 accepted_progress_succeeded", "pass": true, "detail": {"topics": ["task_accepted", "task_progress", "task_progress", "task_succeeded"]}}
+{"scenario": "S3 idempotent_replay", "pass": true, "detail": {"runs": 1}}
+{"scenario": "S4 cancel_running", "pass": true, "detail": {"cancel_calls": 1}}
+{"scenario": "S5 retryable_then_success", "pass": true, "detail": ""}
+{"scenario": "S6 declined_deadline", "pass": true, "detail": ""}
+{"scenario": "S7 host_command_mapping", "pass": true, "detail": {"cc": ["claude", "-p", "列出目录\n\n任务参数：\n{\n  \"echo\": \"x\"\n}"], "oc": ["opencode", "run"]}}
+{"scenario": "S8 hermes_wake_replyTo_succeeded", "pass": true, "detail": {"sig_ok": true, "wakes": 1}}
+{"scenario": "S9a hermes_unreachable_failed_retryable", "pass": true, "detail": {"error": "wake 失败: <urlopen error [Errno 111] Connection refused>"}}
+{"scenario": "S9b hermes_timeout_failed_retryable", "pass": true, "detail": {"error": "session 回信超时(2s)"}}

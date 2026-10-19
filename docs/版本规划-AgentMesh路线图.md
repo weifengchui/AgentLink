@@ -28,7 +28,7 @@
 目标：任务引擎进内核，**别人的舰队**能跑起来。
 
 - **任务引擎内核化**：声明式 CRUD + reconcile loop + bin-packing 调度（优先级/重试/超时/断点续传）【§2.1、§2.2 Scheduler、§5.2 增量调度】
-- Adapter SDK：Hermes / Claude Code / OpenCode → 标准 Task Stream 协议；现役 hermes_bridge 转为第一参考实现【§2.3、Phase2】
+- Adapter SDK：Hermes / Claude Code / OpenCode → 标准 Task Stream 协议；现役 hermes_bridge 转为第一参考实现【§2.3、Phase2】——已交付（2026-10-19，`docs/adapter-sdk-设计-2026-10-19.md`：`sdk/` 参考实现正本（TaskAdapter 状态机 + requires/deadline 预检 + (task_id,seq) 幂等 + budget 重发 + cancel/rollback 终态）+ 三宿主参考实现（hermes 唤醒式承接现役桥数据流 / claude_code / opencode CLI 非交互）；桥本体不动、零内核改动；冒烟 10/10 隔离端口 18983）
 - RBAC：人 token 与 agent token 分轨；Admin/Operator/Viewer/Executor 四角色【§4.2 前半】
 - 可选 mTLS：内置 CA 一键签发+24h 轮转 + **CA 自动分发**（权威节点经已认证链路零拷贝下发，成员热启用；冲突保护）+ **强制 require 模式**（`mtls.require`，拒绝一切明文对等链路）（rustls+rcgen，LAN 默认关闭、一键开启）【§4.1】
 - 新节点准入：bootstrap token + 硬件指纹双验证（已交付：对等/文件通道同一闸门、fail-closed、单因素显式裁剪；`agentlink admission` CLI + `join --admission`）【§4.1】
