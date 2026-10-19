@@ -172,6 +172,50 @@ pub struct EngineConfig {
     /// 每节点并发任务额度上限（调度打分时按不重复 node_id 记账）。
     #[serde(default = "default_engine_max_concurrent")]
     pub max_concurrent_per_node: usize,
+    /// 熔断隔离（v0.6 P1）：异常节点自动置 unschedulable（冷却后自动恢复）。
+    /// 缺省关闭——调度行为零变化。
+    #[serde(default)]
+    pub circuit: CircuitConfig,
+}
+
+/// 熔断隔离参数（v0.6 P1）。窗口内 task-status failed 帧按执行节点归账，
+/// 达到 `failures` 次即置 unschedulable 标签 `cooldown_secs` 秒（自动恢复）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 触发阈值：窗口内失败次数。
+    #[serde(default = "default_circuit_failures")]
+    pub failures: u32,
+    /// 计数窗口（秒）。
+    #[serde(default = "default_circuit_window_secs")]
+    pub window_secs: u64,
+    /// 熔断冷却时长（秒）；到期自动恢复调度资格。
+    #[serde(default = "default_circuit_cooldown_secs")]
+    pub cooldown_secs: u64,
+}
+
+fn default_circuit_failures() -> u32 {
+    3
+}
+
+fn default_circuit_window_secs() -> u64 {
+    600
+}
+
+fn default_circuit_cooldown_secs() -> u64 {
+    300
+}
+
+impl Default for CircuitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            failures: default_circuit_failures(),
+            window_secs: default_circuit_window_secs(),
+            cooldown_secs: default_circuit_cooldown_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -754,6 +798,7 @@ impl Default for EngineConfig {
             drift_alert_only: true, // drift/declined 只告警（拍板第 4 条）
             tick_ms: default_engine_tick_ms(),
             max_concurrent_per_node: default_engine_max_concurrent(),
+            circuit: CircuitConfig::default(),
         }
     }
 }

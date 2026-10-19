@@ -5,6 +5,7 @@
 
 mod admission;
 mod api;
+mod circuit;
 mod cli;
 mod config;
 mod conn;

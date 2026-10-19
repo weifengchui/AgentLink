@@ -37,7 +37,7 @@
 - Prometheus `/metrics`（queue_depth、task_duration、node_utilization）【§7.1】
 - GitOps：watch 仓库 tasks/ 目录自动 apply【§8.3】——已交付（2026-10-19，`docs/gitops目录驱动-验证-2026-10-19.md`：sha256 差分轮询 + 与 POST /v1/tasks 同一内核口径 `reconcile::apply_task_spec`；缺省关、mesh 缺席自拒）
 - 预热池形式化：常驻桥 = agent warmpool，任务到达即注上下文，冷启动 <200ms【§5.3】
-- 熔断隔离：异常节点自动置 unschedulable 标签【§4.5 taint 等价物】
+- 熔断隔离：异常节点自动置 unschedulable 标签【§4.5 taint 等价物】——已交付（2026-10-19，`docs/熔断隔离-验证-2026-10-19.md`：`engine.circuit` 加性缺省关；首次转入 Failed 按执行节点归账、滑窗阈值触发、dispatch 选点硬过滤、冷却到期惰性恢复；`/v1/mesh/status` 出 taints 视图）
 - CLI 完全体：--dry-run、补全、`top nodes` 色标【§3.3】
 
 验收门：20 机并发 200 任务 0 丢失 0 崩溃；P99 调度延迟 <500ms；外部用户 5 分钟装完并跑通多机任务。

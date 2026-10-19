@@ -177,6 +177,10 @@ pub struct MeshRuntime {
     pub license: LicenseInfo,
     /// M3 P3-4：已被 Mesh 调度的不重复 node_id 集合（用于 license node_quota 统计）。
     pub scheduled_nodes: Mutex<HashSet<String>>,
+    /// v0.6 P1 熔断隔离：异常节点 unschedulable 记账（窗口内 failed 归账 + 自动恢复）。
+    /// 缺省关闭态为空 map、零记录——观察面（/v1/mesh/status 的 circuit_taints）
+    /// 也保持空数组。std Mutex：临界区内同步操作、不跨 .await（与 table 同规）。
+    pub circuit: Mutex<crate::circuit::Circuit>,
 }
 
 impl MeshRuntime {
@@ -279,6 +283,7 @@ pub fn build_mesh(cfg: &Config, config_file: &Path) -> Option<Arc<MeshRuntime>> 
         appends_since_snapshot: AtomicU64::new(0),
         license,
         scheduled_nodes: Mutex::new(HashSet::new()),
+        circuit: std::sync::Mutex::new(crate::circuit::Circuit::new()),
     }))
 }
 
@@ -436,6 +441,12 @@ async fn mesh_status_get(
             drop(table);
             let scheduled_nodes = mesh.scheduled_nodes.lock().unwrap().len();
             let quota = mesh.license.node_quota as usize;
+            // v0.6 P1 熔断隔离视图（enabled=false 或无熔断 → 空数组）。
+            let circuit_taints = mesh
+                .circuit
+                .lock()
+                .unwrap()
+                .active(std::time::Instant::now());
             (
                 Some(json!({
                     "tier": mesh.license.tier.as_str(),
@@ -451,6 +462,7 @@ async fn mesh_status_get(
                     "tasks_running": running,
                     "tasks_pending": pending,
                     "by_state": by_state,
+                    "circuit_taints": circuit_taints,
                 })),
             )
         }

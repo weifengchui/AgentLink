@@ -180,6 +180,8 @@ pub struct Engine {
     webhook: Option<Arc<crate::api::WebhookClient>>,
     /// 本节点 node_id（用于 webhook payload）。
     node_id: String,
+    /// v0.6 P1 熔断隔离参数（enabled/阈值/窗口/冷却快照；运行态在 mesh.circuit）。
+    circuit_cfg: crate::config::CircuitConfig,
 }
 
 impl Engine {
@@ -198,6 +200,7 @@ impl Engine {
         let local_tags = state.config.tags.clone();
         let webhook = crate::api::WebhookClient::new(&state.config.webhook);
         let node_id = state.config.node_id.clone();
+        let circuit_cfg = state.config.mesh.engine.circuit.clone();
         let engine = Engine {
             mesh,
             router,
@@ -207,6 +210,7 @@ impl Engine {
             local_tags,
             webhook: webhook.map(Arc::new),
             node_id,
+            circuit_cfg,
         };
         tokio::spawn(async move {
             if let Err(e) = engine.run(shutdown_rx).await {
@@ -339,6 +343,20 @@ impl Engine {
                     if st.is_terminal() {
                         self.on_task_terminal(&task_id, st);
                     }
+                }
+                // v0.6 P1 熔断归账：只在**首次转入 Failed**（Transitioned）时
+                // 记账一次——重投递/更新类帧（Updated，如在线执行方未取件的
+                // 信箱重投）不再归账，否则重复帧会反复给熔断续期、永不恢复。
+                // 引擎自身重试（from_agent="engine"）不计入。
+                if matches!(
+                    &outcome,
+                    ApplyOutcome::Transitioned {
+                        to: TaskState::Failed,
+                        ..
+                    }
+                ) && env.from_agent.as_deref() != Some("engine")
+                {
+                    self.record_circuit_failure(env);
                 }
                 tracing::info!(task_id = %task_id, outcome = ?outcome, "engine: 事件收敛落表");
             }
@@ -490,8 +508,29 @@ impl Engine {
           // 确保本节点在负载表中（即使没有 running 任务）
         loads.entry(self.router.node_id().to_string()).or_insert(0);
 
-        // fleet agents（本机 + 远端在线）
-        let agents: Vec<crate::router::AgentRecord> = self.router.fleet_agents();
+        // fleet agents（本机 + 远端在线）；熔断隔离（v0.6 P1）：
+        // unschedulable 节点不接新活（冷却到期自动回池，惰性过期见 circuit.rs）。
+        let now = std::time::Instant::now();
+        let agents: Vec<crate::router::AgentRecord> = self
+            .router
+            .fleet_agents()
+            .into_iter()
+            .filter(|a| {
+                let blocked = self
+                    .mesh
+                    .circuit
+                    .lock()
+                    .unwrap()
+                    .is_tainted(&a.node_id, now);
+                if blocked {
+                    tracing::debug!(
+                        node = %a.node_id,
+                        "engine: 熔断节点不参与派发（unschedulable）"
+                    );
+                }
+                !blocked
+            })
+            .collect();
 
         // 已调度的 in-flight 数（running 任务总数）
         let inflight: usize = loads.values().sum();
@@ -754,6 +793,31 @@ impl Engine {
         }
     }
 
+    /// v0.6 P1 熔断归账：task_failed 帧记到执行节点名下（from_agent
+    /// 所在节点，缺省取 envelope from）。达到阈值即置 unschedulable
+    /// （冷却后自动恢复，见 `src/circuit.rs`）。
+    fn record_circuit_failure(&self, env: &Envelope) {
+        let culprit = env
+            .from_agent
+            .as_deref()
+            .and_then(|a| self.router.find_agent_node(a))
+            .unwrap_or_else(|| env.from.clone());
+        let mut circuit = self.mesh.circuit.lock().unwrap();
+        match circuit.record_failure(&self.circuit_cfg, &culprit, std::time::Instant::now()) {
+            crate::circuit::FailureVerdict::Tainted(secs) => {
+                tracing::warn!(
+                    node = %culprit,
+                    cooldown_secs = secs,
+                    "engine: 节点熔断——窗口内失败达阈值，已置 unschedulable（冷却后自动恢复）"
+                );
+            }
+            crate::circuit::FailureVerdict::Counted(n) => {
+                tracing::debug!(node = %culprit, failures = n, "engine: 熔断窗口计数+1");
+            }
+            _ => {}
+        }
+    }
+
     /// 标记任务已分配（写入 to_agent + journal，防止重复调度）。
     fn mark_assigned(&self, task_id: &str, to_agent: &str) -> Result<()> {
         let mut table = self.mesh.table.lock().unwrap();
@@ -827,6 +891,7 @@ mod tests {
                     drift_alert_only: true,
                     tick_ms: 200,
                     max_concurrent_per_node: 2,
+                    circuit: Default::default(),
                 },
             },
             auth: AuthConfig::default(),
@@ -859,6 +924,7 @@ mod tests {
                 expires: time::OffsetDateTime::now_utc() + time::Duration::days(365),
             },
             scheduled_nodes: std::sync::Mutex::new(std::collections::HashSet::new()),
+            circuit: std::sync::Mutex::new(crate::circuit::Circuit::new()),
         });
         state_inner.mesh = Some(mesh.clone());
         let state = Arc::new(state_inner);
@@ -871,6 +937,7 @@ mod tests {
             local_tags: cfg.tags.clone(),
             webhook: crate::api::WebhookClient::new(&cfg.webhook).map(Arc::new),
             node_id: cfg.node_id.clone(),
+            circuit_cfg: cfg.mesh.engine.circuit.clone(),
         };
         (state, mesh, engine)
     }
@@ -925,6 +992,91 @@ mod tests {
         acc.payload = json!({"topic": "task_accepted", "task_id": "t1", "seq": 2});
         engine.consume_event(&acc).unwrap();
         assert_eq!(mesh.table.lock().unwrap()["t1"].state, TaskState::Running);
+    }
+
+    /// v0.6 P1：熔断节点不参与派发 + 冷却到期自动回池。
+    #[tokio::test]
+    async fn circuit_taint_blocks_dispatch_then_recovers() {
+        let (_state, mesh, mut engine) = test_mesh();
+        engine.circuit_cfg = crate::config::CircuitConfig {
+            enabled: true,
+            cooldown_secs: 1,
+            ..crate::config::CircuitConfig::default()
+        };
+
+        // 两个远端在线 agent：w2@n2 / w3@n3。
+        let mk = |agent_id: &str, node: &str| crate::router::AgentRecord {
+            agent_id: agent_id.to_string(),
+            name: None,
+            capabilities: vec!["text".to_string()],
+            online: true,
+            node_id: node.to_string(),
+            last_seen: 0,
+        };
+        engine.router.on_agents_update("n2", vec![mk("w2", "n2")]);
+        engine.router.on_agents_update("n3", vec![mk("w3", "n3")]);
+
+        // 一个 pending 无 assignee 的任务。
+        {
+            let mut table = mesh.table.lock().unwrap();
+            let mut rec = TaskRecord::new("tc", None);
+            rec.state = TaskState::Pending;
+            rec.spec = Some(json!({"task_id": "tc", "type": "text"}));
+            rec.seq = 1;
+            table.insert("tc".into(), rec);
+        }
+
+        // n2 窗口内连败 3 次（执行方 w2 → 归账 n2）。
+        let fail = Envelope::business(
+            "n2",
+            "n1",
+            "text",
+            "task",
+            json!({"topic": "task_status", "task_id": "ghost", "state": "failed"}),
+            None,
+            None,
+            None,
+            Some("w2".into()),
+            None,
+        );
+        engine.record_circuit_failure(&fail);
+        engine.record_circuit_failure(&fail);
+        engine.record_circuit_failure(&fail);
+        assert!(
+            mesh.circuit
+                .lock()
+                .unwrap()
+                .is_tainted("n2", std::time::Instant::now()),
+            "3 次失败后 n2 应被熔断"
+        );
+
+        // 派发：n2 被熔断排除 → 唯一可选 n3（w3）。spec 无 to_agent 时
+        // 定向派发本就会走离线/缺路径，这里只看 node 选择证据
+        //（scheduled_nodes 在定向发送前记入，不受发送失败影响）。
+        let _ = engine.dispatch_pending(0).await;
+        assert!(
+            mesh.scheduled_nodes.lock().unwrap().contains("n3"),
+            "熔断节点不得接新活（应只选中 n3）"
+        );
+
+        // 冷却到期（1s）→ n2 自动回池：重置任务再派发、同分节点序 n2<n3 即回 n2。
+        {
+            let mut table = mesh.table.lock().unwrap();
+            let rec = table.get_mut("tc").unwrap();
+            rec.state = TaskState::Pending;
+            rec.to_agent = None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(!mesh
+            .circuit
+            .lock()
+            .unwrap()
+            .is_tainted("n2", std::time::Instant::now()));
+        let _ = engine.dispatch_pending(0).await;
+        assert!(
+            mesh.scheduled_nodes.lock().unwrap().contains("n2"),
+            "冷却到期后 n2 恢复调度资格（同分按 node_id 字典序优先）"
+        );
     }
 
     #[tokio::test]
