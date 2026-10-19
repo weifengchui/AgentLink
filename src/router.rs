@@ -973,7 +973,8 @@ impl Router {
     pub fn new(cfg: &Config) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let persist = cfg.delivery.persist;
-        let journal = store::Journal::open(&cfg.data_dir, persist);
+        let journal =
+            store::Journal::open_with_sync(&cfg.data_dir, persist, cfg.delivery.journal_sync_ms);
         let agent_ttl = cfg.delivery.agent_stale_ttl_seconds as i64;
         let now_wall = store::now_wall();
 

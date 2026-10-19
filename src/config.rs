@@ -439,6 +439,13 @@ pub struct DeliveryConfig {
     /// many seconds are auto-removed (0 disables the cleanup).
     #[serde(default = "default_agent_stale_ttl")]
     pub agent_stale_ttl_seconds: u64,
+    /// Journal fsync 策略（v0.7 性能项）。`0`（缺省）= 每条记录 flush+fsync
+    /// （掉电零丢，v0.5 起的既有语义，行为不变）；`>0` = 批量 fsync 窗口
+    /// （毫秒）：append 只把数据推进 OS 页缓存，后台线程每窗口至多 sync 一次，
+    /// **掉电最多丢最后一个窗口**，换取突发派发时 P99 调度延迟从秒级回到
+    /// 200ms 级（见 docs/journal-groupcommit-验证-2026-10-19.md）。
+    #[serde(default)]
+    pub journal_sync_ms: u64,
 }
 
 /// 出站 webhook 配置（v0.6 P0）。用于任务失败/节点离线/审计告警等
@@ -841,6 +848,7 @@ impl Default for DeliveryConfig {
             dedup_cache_size: default_dedup_cache(),
             persist: true,
             agent_stale_ttl_seconds: default_agent_stale_ttl(),
+            journal_sync_ms: 0,
         }
     }
 }
@@ -921,6 +929,7 @@ impl Config {
                 dedup_cache_size: 2048,
                 persist: true,
                 agent_stale_ttl_seconds: default_agent_stale_ttl(),
+                journal_sync_ms: 0,
             },
             log: LogConfig {
                 level: "info".to_string(),

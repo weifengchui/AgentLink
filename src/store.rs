@@ -6,7 +6,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -89,22 +90,68 @@ impl Rec {
 
 /// Append-only journal with fsync-on-record, plus periodic compaction
 /// (rewrite from live in-memory state via temp file + atomic rename).
+///
+/// v0.7 性能项：`sync_ms > 0` 时切到**批量 fsync**（group commit）——
+/// append 只 flush 到 OS 页缓存，后台线程每窗口至多 `sync_all` 一次；
+/// 掉电最多丢最后一个窗口，但突发派发不再逐条 fsync（P99 秒级 → 200ms 级）。
+/// `sync_ms == 0` 保持既有逐条 fsync 语义（掉电零丢）。
 pub struct Journal {
     path: PathBuf,
     enabled: bool,
-    writer: Mutex<Option<BufWriter<File>>>,
+    writer: Arc<Mutex<Option<BufWriter<File>>>>,
+    /// 0 = 每条 fsync；>0 = 批量窗口毫秒。
+    sync_ms: u64,
+    /// 批处理模式下有「已 flush 未 fsync」的记录待刷。
+    dirty: Arc<AtomicBool>,
+    /// 后台 sync 线程存活标志（Journal Drop 时退出）。
+    alive: Arc<AtomicBool>,
 }
 
 impl Journal {
+    /// 零窗口简写（=逐条 fsync）；运行期统一走 [`Journal::open_with_sync`]。
+    #[allow(dead_code)]
     pub fn open(data_dir: &Path, enabled: bool) -> Self {
+        Self::open_with_sync(data_dir, enabled, 0)
+    }
+
+    /// `sync_ms == 0` 与 [`Journal::open`] 等价（逐条 fsync）。
+    pub fn open_with_sync(data_dir: &Path, enabled: bool, sync_ms: u64) -> Self {
+        let writer: Arc<Mutex<Option<BufWriter<File>>>> = Arc::new(Mutex::new(None));
+        let dirty = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        if enabled && sync_ms > 0 {
+            let w = Arc::clone(&writer);
+            let d = Arc::clone(&dirty);
+            let a = Arc::clone(&alive);
+            let window = std::time::Duration::from_millis(sync_ms.max(1));
+            let _ = std::thread::Builder::new()
+                .name("journal-sync".into())
+                .spawn(move || {
+                    while a.load(Ordering::Relaxed) {
+                        std::thread::sleep(window);
+                        if d.swap(false, Ordering::Relaxed) {
+                            if let Ok(mut g) = w.lock() {
+                                if let Some(wr) = g.as_mut() {
+                                    let _ = wr.flush();
+                                    let _ = wr.get_mut().sync_all();
+                                }
+                            }
+                        }
+                    }
+                });
+        }
         Journal {
             path: data_dir.join("journal.jsonl"),
             enabled,
-            writer: Mutex::new(None),
+            writer,
+            sync_ms,
+            dirty,
+            alive,
         }
     }
 
-    /// Append one record; flush + fsync so a power cut cannot lose it.
+    /// Append one record. `sync_ms == 0`：flush + fsync，掉电零丢（既有语义）。
+    /// `sync_ms > 0`：flush 到 OS 页缓存后标记 dirty，由后台线程按窗口 fsync。
     /// On write error we drop the handle and log — the bus stays up.
     pub fn record(&self, r: &Rec) {
         if !self.enabled {
@@ -125,14 +172,36 @@ impl Journal {
         let res = w
             .write_all(line.as_bytes())
             .and_then(|_| w.write_all(b"\n"))
-            .and_then(|_| w.flush())
-            .and_then(|_| w.get_mut().sync_all());
+            .and_then(|_| w.flush());
         if let Err(e) = res {
             tracing::error!(error = %e, path = %self.path.display(), "journal: write failed");
             *guard = None; // reopen on next record
+            return;
+        }
+        if self.sync_ms == 0 {
+            if let Err(e) = w.get_mut().sync_all() {
+                tracing::error!(error = %e, path = %self.path.display(), "journal: fsync failed");
+            }
+        } else {
+            self.dirty.store(true, Ordering::Relaxed);
         }
     }
+}
 
+impl Drop for Journal {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
+        // 收尾：把批处理模式下未 fsync 的记录落盘（进程退出不丢）。
+        if let Ok(mut g) = self.writer.lock() {
+            if let Some(w) = g.as_mut() {
+                let _ = w.flush();
+                let _ = w.get_mut().sync_all();
+            }
+        }
+    }
+}
+
+impl Journal {
     fn open_writer(path: &Path) -> Option<BufWriter<File>> {
         OpenOptions::new()
             .create(true)
@@ -753,4 +822,63 @@ fn tail_lines(path: &Path, n: usize) -> Vec<String> {
         lines.drain(0..lines.len() - n);
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("agentlink-store-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn journal_batch_mode_writes_all_records_and_flushes_on_drop() {
+        let dir = scratch("batch");
+        {
+            let j = Journal::open_with_sync(&dir, true, 20);
+            for i in 0..50 {
+                j.record(&Rec::add_id("inbox", &format!("m-{i:03}")));
+            }
+            // 批处理模式 append 即 flush 到 OS 页缓存：进程存活期间可读全量
+            // （fsync 只是掉电语义，不影响文件可见性）。
+            let alive = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
+            assert_eq!(alive.lines().count(), 50, "append 后 50 行应立即可见");
+        }
+        // Drop 后文件完整（后台线程 + 收尾 flush 不丢行）。
+        let text = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 50);
+        assert!(text.contains("m-000") && text.contains("m-049"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_zero_window_keeps_per_record_sync_semantics() {
+        let dir = scratch("sync");
+        let j = Journal::open_with_sync(&dir, true, 0);
+        for i in 0..5 {
+            j.record(&Rec::add_id("offline", &format!("s-{i}")));
+        }
+        let text = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 5, "零窗口=逐条落盘，随时可读");
+        drop(j);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_disabled_writes_nothing() {
+        let dir = scratch("off");
+        let j = Journal::open_with_sync(&dir, false, 20);
+        j.record(&Rec::add_id("inbox", "x"));
+        drop(j);
+        assert!(
+            !dir.join("journal.jsonl").exists(),
+            "persist=false 不创建 journal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -101,7 +101,9 @@ def node_cfg(i):
         "local_api": {"host": "127.0.0.1", "token": TOKEN},
         "delivery": {"ack_timeout_seconds": 5, "max_retries": 5,
                      "offline_ttl_seconds": 600, "dedup_cache_size": 4096,
-                     "persist": os.environ.get("ACCEPT_PERSIST", "0") == "1"},
+                     "persist": os.environ.get("ACCEPT_PERSIST", "0") == "1",
+                     "journal_sync_ms": int(os.environ.get("ACCEPT_SYNC_MS", "50"))
+                     if os.environ.get("ACCEPT_PERSIST", "0") == "1" else 0},
         "log": {"level": "warn", "format": "text", "file": ""},
         "mesh": {"enabled": True, "license_file": "license.toml",
                  "engine": {"max_retries": 0, "tick_ms": 200,

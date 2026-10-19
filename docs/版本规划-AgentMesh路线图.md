@@ -47,6 +47,7 @@
 目标：团队付费意愿的功能与合规。
 
 - spine/relay 中继拓扑 + 静态种子清单（破全网格连接数与广播风暴）
+- journal group commit：`delivery.journal_sync_ms`（缺省 0=逐条 fsync 掉电零丢；>0=批量窗口，掉电最多丢一窗，突发派发 P99 从 ~2s 回到 395ms）——已交付（2026-10-19，`docs/journal-groupcommit-验证-2026-10-19.md`：批量线程 + Drop 收尾强刷；单测 +3=126；验收仿真 persist=true+50ms 5/5，P99 395ms）
 - ABAC 策略引擎（label × node 属性 allow/deny，如 finance-data 禁入低安全级节点）+ namespace 多租户【§4.2】
 - 不可变审计日志（hash 链 append-only）+ 导出 ELK/文件【§4.4】
 - 消息护栏中间件：PII / API Key / prompt-injection 特征过滤；topic 默认 Deny All 作用域隔离【§4.3】
