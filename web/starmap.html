@@ -135,6 +135,20 @@ display:flex;justify-content:space-between}
 .gcard.empty{opacity:.55;pointer-events:none}
 /* ---------- message viewer (big card) ---------- */
 #mask{position:fixed;inset:0;background:rgba(2,4,8,.72);backdrop-filter:blur(3px);z-index:48;display:none}
+/* R17（10-19）：任务流式视图——逐字渲染任务终态结果（WS 通道已有，补 /web 侧）。 */
+#stream{position:fixed;right:14px;bottom:14px;width:min(430px,46vw);max-height:46vh;display:flex;flex-direction:column;
+background:rgba(9,14,22,.92);border:1px solid var(--edge);border-radius:10px;z-index:47;font-size:calc(12px*var(--fs))}
+#st-hd{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--edge)}
+#st-hd .t{color:var(--cyan);letter-spacing:.12em}
+#st-hd input{flex:1;min-width:0;background:rgba(11,17,27,.7);border:1px solid var(--edge);border-radius:6px;
+color:#dce7f5;padding:4px 8px;font-family:ui-monospace,Consolas,monospace}
+#st-hd .btn{padding:4px 10px}
+#st-hd .s{color:#7f93ad;font-family:ui-monospace,Consolas,monospace}
+#st-out{margin:0;padding:10px;overflow:auto;white-space:pre-wrap;word-break:break-word;
+color:#cfe0f5;font-family:ui-monospace,Consolas,monospace;line-height:1.55;flex:1}
+#st-out .cur{color:var(--cyan)}
+#st-out .ok{color:#57e0a0}
+#st-out .bad{color:#ff7d8a}
 #viewer{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%) scale(.92);z-index:50;
 display:none;width:min(920px,92vw);height:min(600px,80vh);background:#0b1320;
 border:1.5px solid var(--vc,#38d6e6);border-radius:16px;overflow:hidden;
@@ -229,6 +243,16 @@ background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
   </div>
 </div>
 <div id="mask"></div>
+<div id="stream" data-al-stream="panel">
+  <div id="st-hd">
+    <span class="t">任务流式视图</span>
+    <input id="st-tid" placeholder="task_id" autocomplete="off">
+    <button type="button" id="st-sub" class="btn">订阅</button>
+    <button type="button" id="st-clr" class="btn">清空</button>
+    <span id="st-st" class="s">待命</span>
+  </div>
+  <pre id="st-out" data-al-stream="out"></pre>
+</div>
 <div id="legend"></div>
 <div id="viewer">
   <div id="vlist"></div>
@@ -1040,13 +1064,65 @@ addEventListener("resize",posGNav); /* R2：窗口尺寸变了，‹ › 的外�
    事件，含定向消息），任一事件 400ms 合并触发一次 poll；断线指数退避 2s→30s 重连；
    5s 兜底轮询保留：WS 不可用时退回"轮询5s"（HUD 推送灯可见状态）。主控制台发信成功或点
    「刷新」会 postMessage {al:'poke'}，出站单播也秒级上屏。手工时段模式下动画冻结、数据照常刷新。 */
+/* AL-STREAM-BEGIN —— 任务流式视图纯逻辑（可被 node 提取做单测；勿改名） */
+function alStreamInit(tid){return {tid:tid||"",seq:null,topic:"",lines:[],buf:"",shown:"",done:false,failed:false};}
+function alStreamResultText(result){
+ if(result==null)return "";
+ if(typeof result==="string")return result;
+ try{return JSON.stringify(result);}catch(e){return String(result);}
+}
+function alStreamReduce(state,env){
+ const p=(env&&env.payload)||{},tid=p.task_id||"";
+ if(!state||!tid||tid!==state.tid||!p.topic)return {state:state,changed:false};
+ if(p.seq!=null&&state.seq!=null&&p.seq<=state.seq)return {state:state,changed:false};
+ const st=Object.assign({},state,{lines:state.lines.slice()});
+ if(p.seq!=null)st.seq=p.seq;
+ st.topic=p.topic;
+ if(p.topic==="task_accepted")st.lines.push("✓ 已认领");
+ else if(p.topic==="task_progress")st.lines.push("· "+(p.stage||p.state||"进度")+(p.seq!=null?" #"+p.seq:""));
+ else if(p.topic==="task_succeeded"){st.done=true;st.lines.push("✔ 成功");st.buf=alStreamResultText(p.result);}
+ else if(p.topic==="task_failed"){st.done=true;st.failed=true;st.lines.push("✘ 失败: "+(p.error||""));}
+ else if(p.topic==="task_declined"){st.done=true;st.failed=true;st.lines.push("⊘ 拒绝: "+(p.reason||""));}
+ else if(p.topic==="task_cancelled"){st.done=true;st.lines.push("⊘ 已取消");}
+ else if(p.topic==="task_rolled_back"){st.done=true;st.lines.push("⊘ 已回滚");}
+ else return {state:state,changed:false};
+ return {state:st,changed:true};
+}
+/* 逐字推进：shown 每拍最多长出 chars 个字符，永不超出 target。 */
+function alStreamStep(shown,target,chars){
+ const t=target||"",s=shown||"",n=chars>0?chars:1;
+ return s.length>=t.length?t:t.slice(0,Math.min(t.length,s.length+n));
+}
+/* AL-STREAM-END */
+/* ---- 流式视图接线（面板/渲染/逐字节拍/观察者 WS 喂数） ---- */
+let STREAM=null;
+const stOut=document.getElementById("st-out"),stSt=document.getElementById("st-st"),
+      stTid=document.getElementById("st-tid");
+function stRender(){
+ if(!STREAM){stOut.innerHTML="";stSt.textContent="待命";return;}
+ const cls=STREAM.failed?"bad":(STREAM.done?"ok":"");
+ const body=STREAM.lines.map(esc).join("\n");
+ const cursor=(STREAM.buf&&STREAM.shown.length<STREAM.buf.length)?'<span class="cur">▍</span>':"";
+ stOut.innerHTML=(body?body+"\n":"")+'<span class="'+cls+'">'+esc(STREAM.shown)+cursor+'</span>';
+ stOut.scrollTop=stOut.scrollHeight;
+ stSt.textContent=(STREAM.done?(STREAM.failed?"已结束·失败":"已结束"):"流式中")+" · seq="+(STREAM.seq==null?"-":STREAM.seq);
+}
+function stTick(){if(STREAM&&STREAM.shown.length<STREAM.buf.length){STREAM.shown=alStreamStep(STREAM.shown,STREAM.buf,2);stRender();}}
+document.getElementById("st-sub").onclick=()=>{STREAM=alStreamInit(stTid.value.trim());stRender();};
+document.getElementById("st-clr").onclick=()=>{STREAM=null;stRender();};
+setInterval(stTick,24);
+window.__alStream={init:alStreamInit,reduce:alStreamReduce,step:alStreamStep,text:alStreamResultText};
+
 let ws=null,wsRetry=2000,pokeT=null;
 function pokePoll(){if(pokeT)return;pokeT=setTimeout(()=>{pokeT=null;poll();},400);}
 function connectWS(){if(!TOKEN){setTimeout(connectWS,2000);return;}
  let sk=null;try{sk=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/v1/ws?token="+encodeURIComponent(TOKEN))}catch(e){return;}
  ws=sk;
  sk.onopen=()=>{WSOK=true;wsRetry=2000;renderHud();};
- sk.onmessage=()=>pokePoll();
+ sk.onmessage=(e)=>{pokePoll();
+  /* 流式视图：复用本观察者连接（无 client = 可见本机全部事件含定向帧）。 */
+  if(STREAM){let env=null;try{env=JSON.parse(e.data);}catch(err){}
+   if(env){const r=alStreamReduce(STREAM,env);if(r.changed){STREAM=r.state;stRender();}}}};
  sk.onerror=()=>{try{sk.close();}catch(e){}};
  sk.onclose=()=>{WSOK=false;if(ws===sk)ws=null;renderHud();setTimeout(connectWS,wsRetry);wsRetry=Math.min(wsRetry*2,30000);};}
 addEventListener("message",e=>{if(e.data&&e.data.al==="poke")pokePoll();});

@@ -1,0 +1,5 @@
+{"scenario": "A1 /web 面板标记 + 纯逻辑 + 接线齐备", "pass": true, "detail": {"panel": true, "out": true, "fn_reduce": true, "fn_step": true, "entry": true, "wired": true, "observer_feed": true}}
+{"scenario": "A2 全页 <script> node --check 通过", "pass": true, "detail": {"stderr": ""}}
+{"scenario": "A3 纯逻辑单测（页面真实函数）", "pass": true, "detail": {"total": 14, "bad": []}}
+{"scenario": "A4a 观察者 WS 收到任务全帧且 seq 递增", "pass": true, "detail": {"topics": ["task_spec", "task_accepted", "task_progress", "task_progress", "task_progress", "task_succeeded"], "seqs": [1, null, 1, 2, 3, null]}}
+{"scenario": "A4b 页面函数收敛终态并逐字打满", "pass": true, "detail": {"seq": 3, "lines": 5, "chars": 38}}
