@@ -46,7 +46,7 @@
 
 目标：团队付费意愿的功能与合规。
 
-- spine/relay 中继拓扑 + 静态种子清单（破全网格连接数与广播风暴）
+- spine/relay 中继拓扑 + 静态种子清单（破全网格连接数与广播风暴）——第一波已交付（2026-10-19，`docs/spine-relay-验证-2026-10-19.md`：`relay{enabled,spine,max_hops=2}` 加性缺省关；叶子经 `discovery.static_peers` 连 spine、非直连目标改投 spine；spine 验签+去重+`hops` 加性字段（超限丢弃）+透明转发（保 `from`）+逐跳 ACK/逐跳重试 + 广播扩散 + `agents_update` 中继；未知目标丢弃不与离线队列混用；单测 5 + 冒烟 7/7（三节点 A-R-B）零回归；第二波：多级 spine 级联、节点目录同步、控制面帧验签）
 - journal group commit：`delivery.journal_sync_ms`（缺省 0=逐条 fsync 掉电零丢；>0=批量窗口，掉电最多丢一窗，突发派发 P99 从 ~2s 回到 395ms）——已交付（2026-10-19，`docs/journal-groupcommit-验证-2026-10-19.md`：批量线程 + Drop 收尾强刷；单测 +3=126；验收仿真 persist=true+50ms 5/5，P99 395ms）
 - ABAC 策略引擎（label × node 属性 allow/deny，如 finance-data 禁入低安全级节点）+ namespace 多租户【§4.2】
 - 不可变审计日志（hash 链 append-only）+ 导出 ELK/文件【§4.4】

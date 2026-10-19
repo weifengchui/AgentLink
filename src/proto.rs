@@ -228,6 +228,12 @@ pub struct Envelope {
     pub trace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_seconds: Option<u64>,
+    /// 中继跳数（v0.7 spine/relay）：由中继节点逐跳 +1，超过 `relay.max_hops`
+    /// 即丢弃（防环）。加性字段——旧节点 serde default 忽略、转发时按其自身
+    /// 结构重序列化会丢弃（与 trace_id/thread 同兼容规则）；签名不覆盖本字段
+    /// （同 trace_id 口径）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hops: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
 }
@@ -250,6 +256,7 @@ impl Envelope {
             thread: None,
             trace_id: None,
             ttl_seconds: None,
+            hops: None,
             sig: None,
         }
     }
@@ -276,6 +283,7 @@ impl Envelope {
             thread: None,
             trace_id: None,
             ttl_seconds: None,
+            hops: None,
             sig: None,
         }
     }
@@ -309,6 +317,7 @@ impl Envelope {
             thread,
             trace_id: None,
             ttl_seconds,
+            hops: None,
             sig: None,
         }
     }

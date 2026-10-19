@@ -1,0 +1,7 @@
+{"scenario": "S0 星型组网（R 见 2 peer；A 只见 R）", "pass": true, "detail": {"a_peers": ["b1b1b1b1b1b1"]}}
+{"scenario": "S1 A→B 定向经 R 中继（from 保持 / hops=1）", "pass": true, "detail": {"hops": 1, "from": "a1a1a1a1a1a1", "b_history": true}}
+{"scenario": "S2 B→A 回向（双向路由）", "pass": true, "detail": {"hops": 1}}
+{"scenario": "S3 广播中继（R 本地投递 + 转发 B）", "pass": true, "detail": {"r": true, "b": true}}
+{"scenario": "S4 未知目标丢弃不排队（三节点不崩）", "pass": true, "detail": {"alive": true, "send_ok": true}}
+{"scenario": "S5 agent 表中继（A 可见 B 的 agent）", "pass": true, "detail": {}}
+{"scenario": "S6 直连（A→R）正常、不经中继", "pass": true, "detail": {"hops": null}}

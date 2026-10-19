@@ -956,6 +956,8 @@ pub struct Router {
     /// `audit_alert` / `agent_message` 等消息面事件由此送出；`cfg.webhook`
     /// 与引擎共用同一配置，任务面事件仍由 reconcile::Engine 发出）。
     webhook: Option<Arc<crate::api::WebhookClient>>,
+    /// v0.7 spine/relay 中继参数（enabled / spine / max_hops 快照）。
+    relay: crate::config::RelayConfig,
 }
 
 /// 路由层 Prometheus 指标。
@@ -1073,6 +1075,7 @@ impl Router {
             blocked_in: AtomicU64::new(0),
             started: Instant::now(),
             webhook: crate::api::WebhookClient::new(&cfg.webhook).map(Arc::new),
+            relay: cfg.relay.clone(),
         }
     }
 
@@ -1507,9 +1510,164 @@ impl Router {
                     self.enqueue_offline(&env).await;
                 }
             }
-            None => self.enqueue_offline(&env).await,
+            None => {
+                // v0.7 spine/relay：目标非直连且配置了上游 spine → 交其转发
+                // （下一跳=spine，pending 也按 spine 记账：逐跳 ACK，端到端
+                // 由每跳各自重试+接收端 dedup 兜底）。
+                let via_spine = !self.relay.spine.is_empty()
+                    && self.relay.spine != env.to
+                    && self
+                        .registry
+                        .get(&self.relay.spine)
+                        .map(|s| (s.node_id.clone(), s))
+                        .is_some();
+                if via_spine {
+                    let spine_id = self.relay.spine.clone();
+                    if let Some(sink) = self.registry.get(&spine_id) {
+                        if self.send_raw(&sink, &env).await {
+                            crate::trace::log_event(
+                                tracing::Level::DEBUG,
+                                "message.relay",
+                                &self.cfg.node_id,
+                                &trace_id,
+                                Some(&env),
+                            );
+                            self.register_pending_at(&env, &spine_id, 0);
+                            return Ok(env.msg_id);
+                        }
+                    }
+                }
+                self.enqueue_offline(&env).await
+            }
         }
         Ok(env.msg_id)
+    }
+
+    /// v0.7 spine/relay：中继转发。仅由 `conn` 在「目标为第三方」或
+    /// 「广播且本节点是 spine」时调用。
+    ///
+    /// 单跳中继语义：
+    /// - 定向（`to`=第三方 node_id）：验签 + 去重 + hops 上限校验后，向目标
+    ///   直连投递（`send_raw` 保留原 `from`，strict 下由共享 token 重签时间戳），
+    ///   并在本跳记账 pending（本跳逐跳重试）；目标未知则丢弃并告警。
+    /// - 广播（`to="*"`）：向除入站连接外的所有直连 peer 扩散 + 本地投递。
+    ///
+    /// 入站连接已由 `conn` 逐跳回 ACK（叶片等待的是 spine 的收件确认）。
+    pub async fn handle_transit(&self, env: &mut Envelope, ingress: Option<&str>) -> bool {
+        if !self.relay.enabled {
+            tracing::debug!(
+                msg_id = %env.msg_id,
+                to = %env.to,
+                "router: frame not addressed to us, dropped (relay disabled)"
+            );
+            return false;
+        }
+        if !self.verify_incoming(env) {
+            tracing::warn!(msg_id = %env.msg_id, from = %env.from, "router: transit rejected (signature or timestamp)");
+            self.notify(
+                "audit_alert",
+                serde_json::json!({
+                    "kind": "transit_rejected",
+                    "msg_id": env.msg_id,
+                    "from": env.from,
+                }),
+            );
+            return false;
+        }
+        // 环保护：hops 逐跳累加，超过上限丢弃（防环；接收端 dedup 兜重复）。
+        let hops = env.hops.unwrap_or(0).saturating_add(1);
+        if hops > self.relay.max_hops.max(1) {
+            tracing::warn!(
+                msg_id = %env.msg_id,
+                to = %env.to,
+                hops,
+                "router: transit dropped (hop limit)"
+            );
+            return false;
+        }
+        let fresh = {
+            let mut d = self.dedup.lock().unwrap();
+            d.record(&env.msg_id)
+        };
+        if !fresh {
+            tracing::debug!(msg_id = %env.msg_id, "router: transit duplicate dropped");
+            return false;
+        }
+        env.hops = Some(hops);
+
+        if env.to == "*" || env.to.is_empty() {
+            self.relay_broadcast(env, ingress).await;
+            return true;
+        }
+
+        let trace_id = crate::trace::dash(&env.trace_id);
+        self.record_history(env, "in", &env.to);
+        match self.registry.get(&env.to) {
+            Some(sink) => {
+                if self.send_raw(&sink, env).await {
+                    crate::trace::log_event(
+                        tracing::Level::DEBUG,
+                        "message.relay",
+                        &self.cfg.node_id,
+                        &trace_id,
+                        Some(env),
+                    );
+                    self.register_pending(env, 0);
+                } else {
+                    tracing::warn!(msg_id = %env.msg_id, to = %env.to, "router: transit send failed");
+                    return false;
+                }
+            }
+            None => {
+                tracing::warn!(
+                    msg_id = %env.msg_id,
+                    to = %env.to,
+                    "router: transit target not a direct peer, dropped（未知路由不与离线队列混用）"
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 广播中继：除入站连接外全部直连 peer 各发一份 + 本地投递。
+    async fn relay_broadcast(&self, env: &Envelope, ingress: Option<&str>) {
+        let trace_id = crate::trace::dash(&env.trace_id);
+        self.record_history(env, "in", "*");
+        let sinks: Vec<PeerSink> = self.registry.all();
+        for sink in sinks {
+            if ingress == Some(sink.node_id.as_str()) {
+                continue;
+            }
+            let _ = self.send_raw(&sink, env).await;
+        }
+        crate::trace::log_event(
+            tracing::Level::DEBUG,
+            "message.relay",
+            &self.cfg.node_id,
+            &trace_id,
+            Some(env),
+        );
+        self.deliver_local(env.clone()).await;
+    }
+
+    /// 控制面帧（`agents_update` 等）的中继扩散：除入站连接外全部直连 peer。
+    pub async fn relay_control(&self, env: &Envelope, ingress: Option<&str>) {
+        if !self.relay.enabled {
+            return;
+        }
+        let hops = env.hops.unwrap_or(0).saturating_add(1);
+        if hops > self.relay.max_hops.max(1) {
+            return;
+        }
+        let mut env = env.clone();
+        env.hops = Some(hops);
+        for sink in self.registry.all() {
+            if ingress == Some(sink.node_id.as_str()) {
+                continue;
+            }
+            let _ = self.send_raw(&sink, &env).await;
+        }
     }
 
     /// 订阅总线事件广播（M2 reconcile loop 消费原文 Envelope 用）。
@@ -1562,10 +1720,16 @@ impl Router {
     }
 
     fn register_pending(&self, env: &Envelope, tries: u32) {
+        self.register_pending_at(env, &env.to, tries);
+    }
+
+    /// v0.7 spine/relay：按**下一跳**（而非最终目标）记账 pending——
+    /// 逐跳 at-least-once，接收端 dedup 兜底端到端去重。
+    fn register_pending_at(&self, env: &Envelope, next_hop: &str, tries: u32) {
         self.pending.lock().unwrap().insert(
             env.msg_id.clone(),
             Pending {
-                peer_id: env.to.clone(),
+                peer_id: next_hop.to_string(),
                 env: env.clone(),
                 sent_at: Instant::now(),
                 tries,
@@ -1860,7 +2024,9 @@ impl Router {
             match self.registry.get(&pend.peer_id) {
                 Some(sink) => {
                     if self.send_raw(&sink, &pend.env).await {
-                        self.register_pending(&pend.env, pend.tries + 1);
+                        // v0.7 spine/relay：重试沿用原下一跳（pend.peer_id），
+                        // 不能回退成 env.to（最终目标常非直连）。
+                        self.register_pending_at(&pend.env, &pend.peer_id, pend.tries + 1);
                     } else {
                         self.enqueue_offline(&pend.env).await;
                     }
@@ -2411,5 +2577,118 @@ impl Router {
             blocked: None,
         };
         self.push_history(entry);
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::{Config, Envelope, PeerSink, Router};
+    use crate::conn::Frame;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn router_with(relay_enabled: bool, spine: &str, max_hops: u8) -> (Config, Arc<Router>) {
+        let mut cfg = Config::generate(
+            Some("relay-test".to_string()),
+            Some("tok".to_string()),
+            Some("open".to_string()), // open 模式：免签名，专注路由语义
+        );
+        cfg.data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("relay-test");
+        cfg.delivery.persist = false;
+        cfg.relay.enabled = relay_enabled;
+        cfg.relay.spine = spine.to_string();
+        cfg.relay.max_hops = max_hops;
+        let r = Arc::new(Router::new(&cfg));
+        (cfg, r)
+    }
+
+    fn attach(r: &Router, node_id: &str) -> tokio::sync::mpsc::Receiver<Frame> {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        r.register_peer(PeerSink {
+            node_id: node_id.to_string(),
+            name: node_id.to_string(),
+            addr: "test".to_string(),
+            tx,
+        });
+        rx
+    }
+
+    fn frame_env(to: &str, hops: Option<u8>) -> Envelope {
+        let mut env = Envelope::business(
+            "nodeA",
+            to,
+            "text",
+            "send",
+            json!({"content": "hi"}),
+            None,
+            None,
+            None,
+            Some("a1".into()),
+            Some("b1".into()),
+        );
+        env.hops = hops;
+        env
+    }
+
+    #[tokio::test]
+    async fn transit_dropped_when_relay_disabled() {
+        let (_cfg, r) = router_with(false, "", 2);
+        let mut env = frame_env("nodeB", None);
+        assert!(!r.handle_transit(&mut env, Some("nodeA")).await);
+        assert_eq!(r.history().len(), 0, "禁用中继不应写 history");
+    }
+
+    #[tokio::test]
+    async fn transit_forwards_to_direct_target_with_hop_increment() {
+        let (_cfg, r) = router_with(true, "", 2);
+        let mut rx = attach(&r, "nodeB");
+        let mut env = frame_env("nodeB", None);
+        assert!(r.handle_transit(&mut env, Some("nodeA")).await);
+        let text = match rx.recv().await.expect("帧应被转发") {
+            Frame::Text(t) => t,
+            other => panic!("非文本帧: {other:?}"),
+        };
+        let fwd: Envelope = serde_json::from_str(&text).unwrap();
+        assert_eq!(fwd.to, "nodeB", "目标保持最终节点");
+        assert_eq!(fwd.from, "nodeA", "中继不改写 from（透明转发）");
+        assert_eq!(fwd.hops, Some(1), "hops 逐跳 +1");
+        // 本跳 pending 按下一跳记账。
+        assert!(r.history().iter().any(|h| h.direction == "in"));
+    }
+
+    #[tokio::test]
+    async fn transit_rejects_beyond_hop_limit() {
+        let (_cfg, r) = router_with(true, "", 2);
+        let _rx = attach(&r, "nodeB");
+        let mut env = frame_env("nodeB", Some(2)); // 已 2 跳
+        assert!(!r.handle_transit(&mut env, Some("nodeA")).await);
+    }
+
+    #[tokio::test]
+    async fn transit_unknown_target_is_dropped_not_queued() {
+        let (_cfg, r) = router_with(true, "", 2);
+        let mut env = frame_env("ghost-node", None);
+        assert!(!r.handle_transit(&mut env, Some("nodeA")).await);
+        // 未知路由不与离线队列混用（离线队列按最终目标堆积，跨网段永不出队）。
+        assert!(r.offline.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_routes_via_spine_when_target_not_direct() {
+        let (_cfg, r) = router_with(false, "spine1", 2);
+        let mut rx = attach(&r, "spine1");
+        r.send(frame_env("far-node", None)).await.unwrap();
+        let text = match rx.recv().await.expect("应经 spine 转投") {
+            Frame::Text(t) => t,
+            other => panic!("非文本帧: {other:?}"),
+        };
+        let fwd: Envelope = serde_json::from_str(&text).unwrap();
+        assert_eq!(fwd.to, "far-node", "最终目标不变");
+        // pending 按 spine 记账（逐跳重试）。
+        let pending = r.pending.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.values().next().unwrap().peer_id, "spine1");
     }
 }

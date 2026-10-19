@@ -591,6 +591,14 @@ async fn handle_text(
             if let (Some(agents), false) = (agents, from.is_empty()) {
                 state.router.on_agents_update(from, agents);
             }
+            // v0.7 spine/relay：spine 把收到的 agent 表扩散给其它直连 peer
+            // （保留原 from）——叶子据此看到非直连节点的 agent，引擎才能跨
+            // 叶子调度。hops 上限防环。
+            if cfg.relay.enabled {
+                if let Ok(env) = serde_json::from_value::<Envelope>(value.clone()) {
+                    state.router.relay_control(&env, peer_id.as_deref()).await;
+                }
+            }
             true
         }
 
@@ -602,13 +610,35 @@ async fn handle_text(
             if env.kind == "ctrl" {
                 return true; // unknown control frame, ignore
             }
-            let addressed = env.to == cfg.node_id || env.to == "*" || env.to.is_empty();
-            if !addressed {
-                tracing::debug!(
-                    msg_id = %env.msg_id,
-                    to = %env.to,
-                    "conn: frame not addressed to us, dropped (mesh does not relay)"
-                );
+            // v0.7 spine/relay 三态判定：定向到第三方 → 中继转发；
+            // 广播且本节点是 spine → 中继扩散 + 本地投递；否则本地处理。
+            let is_broadcast = env.to == "*" || env.to.is_empty();
+            let addressed_to_us = env.to == cfg.node_id || is_broadcast;
+            if !addressed_to_us {
+                if !cfg.relay.enabled {
+                    tracing::debug!(
+                        msg_id = %env.msg_id,
+                        to = %env.to,
+                        "conn: frame not addressed to us, dropped (relay disabled)"
+                    );
+                    return true;
+                }
+                // 中继：逐跳 ACK（叶片等的是 spine 的收件确认），本跳负责
+                // 到下一跳的重试（handle_transit 内部 register_pending）。
+                let _ = state
+                    .router
+                    .handle_transit(&mut env, peer_id.as_deref())
+                    .await;
+                let ack = Envelope::ack(&cfg.node_id, &env.msg_id);
+                let _ = send_text(send, &ack).await;
+                return true;
+            }
+            if is_broadcast && cfg.relay.enabled {
+                // 广播中继：扩散给其它直连 peer（hops 上限内）+ 本地投递。
+                let _ = state
+                    .router
+                    .handle_transit(&mut env, peer_id.as_deref())
+                    .await;
                 return true;
             }
             let first = state.router.handle_incoming(&mut env).await;

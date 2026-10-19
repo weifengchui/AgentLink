@@ -70,6 +70,9 @@ pub struct Config {
     /// 缺省关闭（段可缺省）；`mesh.enabled` 未开时即便 enabled 也只告警不 spawn。
     #[serde(default)]
     pub gitops: GitopsConfig,
+    /// 中继拓扑（v0.7 spine/relay）。缺省关闭 = 全网格原行为。
+    #[serde(default)]
+    pub relay: RelayConfig,
 }
 
 /// GitOps 目录驱动参数（v0.6 P1）。缺省 `enabled=false`——完全惰性。
@@ -274,6 +277,37 @@ impl Default for CircuitConfig {
             failures: default_circuit_failures(),
             window_secs: default_circuit_window_secs(),
             cooldown_secs: default_circuit_cooldown_secs(),
+        }
+    }
+}
+
+/// 中继拓扑（v0.7 spine/relay）：叶子只连 spine，跨叶子帧由 spine 单跳转发。
+/// 缺省全关——现有全网格行为逐字节不变。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayConfig {
+    /// 本节点作为中继（spine）：接收「目标为第三方」的帧并转发，
+    /// 广播帧向除入站连接外的直连 peer 扩散（hops 上限内）。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 上游中继 node_id（叶子用）。非空且目标节点非直连时，出站帧改投
+    /// spine 并由其转发（spine 再按目标直连投递）；空 = 维持既有全网格语义。
+    #[serde(default)]
+    pub spine: String,
+    /// 中继跳数上限（缺省 2：leaf → spine → leaf；跨 spine 级联需 ≥3）。
+    #[serde(default = "default_relay_max_hops")]
+    pub max_hops: u8,
+}
+
+fn default_relay_max_hops() -> u8 {
+    2
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            spine: String::new(),
+            max_hops: default_relay_max_hops(),
         }
     }
 }
@@ -898,6 +932,7 @@ impl Config {
             web: WebConfig::default(),
             lease: LeaseConfig::default(),
             gitops: GitopsConfig::default(),
+            relay: RelayConfig::default(),
             discovery: DiscoveryConfig {
                 enabled: true,
                 methods: default_discovery_methods(),
