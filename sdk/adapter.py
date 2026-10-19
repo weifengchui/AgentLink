@@ -209,6 +209,7 @@ class TaskAdapter:
         self.log = log
         self.frame_hook = frame_hook            # 可选：逐帧透传给宿主 runner
         self._stop = threading.Event()
+        self._ws = None                         # 当前 WS 连接（stop() 硬关）
         self._canceled = {}                     # task_id -> Event（运行中置停）
         self._rollback = {}                     # task_id -> True（经 task_rollback）
         self.seen = {}                          # (task_id, seq) -> True 幂等
@@ -231,6 +232,7 @@ class TaskAdapter:
                 self.bus.register(self.capabilities)
                 ws = websocket.create_connection(self.bus.ws_url(), timeout=None,
                                                  ping_interval=25, ping_timeout=10)
+                self._ws = ws
                 if self.log:
                     self.log(f"[adapter {self.bus.agent}] ws 已连")
                 backoff = 1
@@ -262,6 +264,12 @@ class TaskAdapter:
 
     def stop(self):
         self._stop.set()
+        ws = self._ws
+        if ws:
+            try:
+                ws.close()          # 硬关连接：节点即判定 agent 下线（client_offline）
+            except Exception:
+                pass
         for ev in self._canceled.values():
             ev.set()
 

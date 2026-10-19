@@ -36,7 +36,7 @@
 - 出站 webhook（OnTaskFailed/OnNodeOffline/OnAuditAlert），wake-kit 收敛为标准实现【§8.2】——已交付全量（2026-10-19，`docs/webhook-wakekit收敛-验证-2026-10-19.md`：`251805a` 任务终态触发基础上补齐 ① `webhook.secret` HMAC-SHA256 签名（`X-Hub-Signature-256`，wake-hook 同口径，空=不签名零破坏）；② OnNodeOffline（`unregister_peer` 全下线路径 + discovery bye 补口）③ OnAuditAlert（lockdown 开关 / admission·token·协议版握手拒绝 / 入站签名时间戳拒绝）④ OnNodeTaint（熔断包 deferred 项闭环）⑤ `agent_message` 投递事实事件（替代 wake_hook.py 侧车：定向 text/file 帧被本节点接收即外呼，payload 带 to_agent/content/msg_id/reply_to/channel=inbox|live，HMAC 签名）；wake-hook/README 加官方退役指引，既有装好侧车继续兼容；冒烟 7/7（隔离端口 18995-18997））
 - Prometheus `/metrics`（queue_depth、task_duration、node_utilization）【§7.1】
 - GitOps：watch 仓库 tasks/ 目录自动 apply【§8.3】——已交付（2026-10-19，`docs/gitops目录驱动-验证-2026-10-19.md`：sha256 差分轮询 + 与 POST /v1/tasks 同一内核口径 `reconcile::apply_task_spec`；缺省关、mesh 缺席自拒）
-- 预热池形式化：常驻桥 = agent warmpool，任务到达即注上下文，冷启动 <200ms【§5.3】
+- 预热池形式化：常驻桥 = agent warmpool，任务到达即注上下文，冷启动 <200ms【§5.3】——已交付（2026-10-19，`docs/warmpool-预热池-验证-2026-10-19.md`：`engine.warmpool` 加性缺省关（members 显式名单 / keep_inflight / interval_secs / warmup.ping）；引擎 tick 内 keep-warm sweep——在线+未熔断+未满位才注入预热任务（与 POST /v1/tasks 同口径入库 + 直投），常驻桥 no-op 秒回收即保会话热态；`/v1/mesh/status` 出池视图；SDK BaseRunner 补 no-op 承接契约 + stop() 硬关连接；冷启动路径分解=引擎 tick 200ms 上界派发 + 常驻桥收帧即回；冒烟 6/6 隔离端口 18985/18986，单测 +1=121）
 - 熔断隔离：异常节点自动置 unschedulable 标签【§4.5 taint 等价物】——已交付（2026-10-19，`docs/熔断隔离-验证-2026-10-19.md`：`engine.circuit` 加性缺省关；首次转入 Failed 按执行节点归账、滑窗阈值触发、dispatch 选点硬过滤、冷却到期惰性恢复；`/v1/mesh/status` 出 taints 视图）
 - CLI 完全体：--dry-run、补全、`top nodes` 色标【§3.3】——已交付（2026-10-19，`docs/CLI-完全体-验证-2026-10-19.md`：`completions <shell>`（clap_complete 纯 Rust）+ `top` ANSI 色标快照/`--watch`（在线/CPU 三段色/熔断红标，mesh 任务摘要）；--dry-run v0.5 既有补验证）
 

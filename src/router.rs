@@ -2116,6 +2116,21 @@ impl Router {
         None
     }
 
+    /// v0.6 P2 预热池：agent 是否在线（本地注册与船队缓存同优先序，按
+    /// online 判定——find_agent_node 对本机注册不滤 online，不能直接复用）。
+    pub fn agent_online(&self, agent_id: &str) -> bool {
+        if let Some(rec) = self.agents.lock().unwrap().get(agent_id) {
+            return rec.online;
+        }
+        let fleet = self.fleet_agents.lock().unwrap();
+        for list in fleet.values() {
+            if let Some(rec) = list.iter().find(|r| r.agent_id == agent_id) {
+                return rec.online;
+            }
+        }
+        false
+    }
+
     /// A local WS subscriber connected (its `client` = agent id).
     pub fn client_online(&self, client_id: &str) {
         {

@@ -61,6 +61,23 @@ TaskAdapter(bus, OpenCodeRunner(), capabilities=["cap:shell:safe"]).serve_foreve
    payload 即任务结果（`content` 为文本命中即成 `task_succeeded.result`）；
 3. 网关不可达 / 回信超时 → `task_failed(retryable=True)`。
 
+## 预热池契约（v0.6 P2，与引擎 warmpool 呼应）
+
+引擎 `engine.warmpool`（缺省关）按 `interval_secs` 给成员名单里的在线 agent
+注入 `task_type`（缺省 `warmup.ping`）keep-warm 任务（correlation="warmpool"），
+把「常驻桥 = agent warmpool」形式化：宿主 runner 收到该 type 应作 **no-op
+承接**（快速回 succeeded，会话/进程保持常驻）——真实任务到达即注入已热的
+会话上下文，免去冷启动。本 SDK 的 `BaseRunner` 子类建议：
+
+```python
+def run(self, spec, report, cancelled):
+    if spec.get("type") == "warmup.ping":
+        return RunResult(ok=True, result="warm")   # no-op keep-warm，快速回收
+    ...
+```
+
+本仓冒烟 `tests/warmpool_smoke.py` 用 SDK 适配器充当池位桥（6/6）。
+
 ## 验证
 
 `tests/adapter_sdk_smoke.py` 10/10（2026-10-19，详见

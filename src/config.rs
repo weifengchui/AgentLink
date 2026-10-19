@@ -176,6 +176,66 @@ pub struct EngineConfig {
     /// 缺省关闭——调度行为零变化。
     #[serde(default)]
     pub circuit: CircuitConfig,
+    /// 预热池（v0.6 P2）：常驻桥 keep-warm 派发。缺省关闭——引擎零任务、
+    /// 零流量，`/v1/tasks` 面板不见任何池行。
+    #[serde(default)]
+    pub warmpool: WarmpoolConfig,
+}
+
+/// 预热池参数（v0.6 P2）。把「常驻桥 = agent warmpool」形式化为引擎内置
+/// keep-warm 派发循环：成员名单里的 agent 就是池位——引擎按
+/// `interval_secs` 周期为每个在线成员注入 `task_type` 预热任务
+/// （自带 correlation="warmpool"），回收 succeeded/failed 终态后池位空闲，
+/// 下拍再补一行。真实任务到达即可派给已热的执行方（引擎 tick 上界仍
+/// 200ms）。成员离线/熔断则该位跳过（find_agent_node + taint 双闸）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarmpoolConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 池成员（agent_id 名单，显式声明——预热是资源动作，不做隐式能力推断）。
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// 单成员同时允许的在池任务上限（pending+running 计）。
+    #[serde(default = "default_warmpool_keep_inflight")]
+    pub keep_inflight: usize,
+    /// keep-warm 派发周期（秒）；下限 5 秒。
+    #[serde(default = "default_warmpool_interval_secs")]
+    pub interval_secs: u64,
+    /// 预热任务的 type（执行方 runner 据此当 no-op keep-warm 处理）。
+    #[serde(default = "default_warmpool_task_type")]
+    pub task_type: String,
+    /// 预热任务优先级（越大越靠后，缺省 900——真任务一律先于池任务）。
+    #[serde(default = "default_warmpool_priority")]
+    pub priority: u64,
+}
+
+fn default_warmpool_keep_inflight() -> usize {
+    1
+}
+
+fn default_warmpool_interval_secs() -> u64 {
+    120
+}
+
+fn default_warmpool_task_type() -> String {
+    "warmup.ping".to_string()
+}
+
+fn default_warmpool_priority() -> u64 {
+    900
+}
+
+impl Default for WarmpoolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            members: Vec::new(),
+            keep_inflight: default_warmpool_keep_inflight(),
+            interval_secs: default_warmpool_interval_secs(),
+            task_type: default_warmpool_task_type(),
+            priority: default_warmpool_priority(),
+        }
+    }
 }
 
 /// 熔断隔离参数（v0.6 P1）。窗口内 task-status failed 帧按执行节点归账，
@@ -804,6 +864,7 @@ impl Default for EngineConfig {
             tick_ms: default_engine_tick_ms(),
             max_concurrent_per_node: default_engine_max_concurrent(),
             circuit: CircuitConfig::default(),
+            warmpool: WarmpoolConfig::default(),
         }
     }
 }

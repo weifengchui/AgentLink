@@ -447,6 +447,40 @@ async fn mesh_status_get(
                 .lock()
                 .unwrap()
                 .active(std::time::Instant::now());
+            // v0.6 P2 预热池视图（加性键；关闭时 enabled=false/members=[]）。
+            let wp_cfg = &state.config.mesh.engine.warmpool;
+            let warmpool = json!({
+                "enabled": wp_cfg.enabled,
+                "interval_secs": wp_cfg.interval_secs,
+                "task_type": wp_cfg.task_type,
+                "members": wp_cfg.members.iter().map(|a| {
+                    let online = state.router.agent_online(a);
+                    let outstanding = mesh
+                        .table
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .filter(|r| {
+                            r.to_agent.as_deref() == Some(a.as_str())
+                                && matches!(
+                                    r.state,
+                                    TaskState::Pending | TaskState::Running
+                                )
+                                && r.spec
+                                    .as_ref()
+                                    .and_then(|s| s.get("type"))
+                                    .and_then(|v| v.as_str())
+                                    == Some(wp_cfg.task_type.as_str())
+                        })
+                        .count();
+                    json!({
+                        "agent_id": a,
+                        "online": online,
+                        "outstanding": outstanding,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            });
             (
                 Some(json!({
                     "tier": mesh.license.tier.as_str(),
@@ -463,6 +497,7 @@ async fn mesh_status_get(
                     "tasks_pending": pending,
                     "by_state": by_state,
                     "circuit_taints": circuit_taints,
+                    "warmpool": warmpool,
                 })),
             )
         }

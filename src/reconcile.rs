@@ -182,6 +182,10 @@ pub struct Engine {
     node_id: String,
     /// v0.6 P1 熔断隔离参数（enabled/阈值/窗口/冷却快照；运行态在 mesh.circuit）。
     circuit_cfg: crate::config::CircuitConfig,
+    /// v0.6 P2 预热池参数快照（enabled/members/keep_inflight/周期/任务类型）。
+    warmpool_cfg: crate::config::WarmpoolConfig,
+    /// 预热池下一次 sweep 时刻（到点才派发 keep-warm）。
+    warm_next: std::sync::Mutex<std::time::Instant>,
 }
 
 impl Engine {
@@ -203,6 +207,11 @@ impl Engine {
         let webhook = router.webhook_client();
         let node_id = state.config.node_id.clone();
         let circuit_cfg = state.config.mesh.engine.circuit.clone();
+        let warmpool_cfg = state.config.mesh.engine.warmpool.clone();
+        let warm_next = std::sync::Mutex::new(
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(warmpool_cfg.interval_secs.clamp(5, 3600_u64)),
+        );
         let engine = Engine {
             mesh,
             router,
@@ -213,6 +222,8 @@ impl Engine {
             webhook,
             node_id,
             circuit_cfg,
+            warmpool_cfg,
+            warm_next,
         };
         tokio::spawn(async move {
             if let Err(e) = engine.run(shutdown_rx).await {
@@ -459,6 +470,9 @@ impl Engine {
                 "engine: maintain drift（心跳缺勤 > 3×interval），仅告警，不换机重派"
             );
         }
+
+        // ---- 3b. 预热池 keep-warm sweep（v0.6 P2：到点才动，零池零流量）----
+        self.warmpool_sweep().await?;
 
         // ---- 4. pending → 调度派发（M3 P3-2 bin-packing）----
         self.dispatch_pending(now_epoch).await?;
@@ -847,6 +861,105 @@ impl Engine {
         }
     }
 
+    /// v0.6 P2 预热池：keep-warm 派发 sweep（tick 内调用，到点才动）。
+    /// 每个在线且未熔断的池成员，若在池任务数 < `keep_inflight`，注入一行
+    /// `task_type` 预热任务（correlation="warmpool"，定向成员所在节点，经
+    /// `apply_task_spec` 与 POST /v1/tasks 同一内核口径入库 + send_engine_spec
+    /// 直投）；终态回收后下拍（下一个 sweep 周期）自动补位。成员离线/熔断
+    /// 该位本拍跳过。sweep 频率由 `warmpool.interval_secs` 决定，不受 tick
+    /// 周期摆布。
+    async fn warmpool_sweep(&self) -> Result<()> {
+        let cfg = &self.warmpool_cfg;
+        if !cfg.enabled || cfg.members.is_empty() {
+            return Ok(());
+        }
+        let due = {
+            let mut next = self.warm_next.lock().expect("warm_next mutex poisoned");
+            let d = std::time::Instant::now() >= *next;
+            if d {
+                *next = std::time::Instant::now()
+                    + std::time::Duration::from_secs(cfg.interval_secs.clamp(5, 3600_u64));
+            }
+            d
+        };
+        if !due {
+            return Ok(());
+        }
+        for agent in &cfg.members {
+            if !self.router.agent_online(agent) {
+                tracing::debug!(member = %agent, "engine: warmpool 成员不在线，本拍跳过");
+                continue;
+            }
+            let Some(node_id) = self.router.find_agent_node(agent) else {
+                tracing::debug!(member = %agent, "engine: warmpool 成员不在线，本拍跳过");
+                continue;
+            };
+            let blocked = self
+                .mesh
+                .circuit
+                .lock()
+                .unwrap()
+                .is_tainted(&node_id, std::time::Instant::now());
+            if blocked {
+                tracing::debug!(
+                    member = %agent,
+                    node = %node_id,
+                    "engine: warmpool 成员所在节点已熔断，本拍跳过"
+                );
+                continue;
+            }
+            let outstanding = {
+                let table = self.mesh.table.lock().unwrap();
+                table
+                    .values()
+                    .filter(|r| {
+                        r.to_agent.as_deref() == Some(agent.as_str())
+                            && matches!(r.state, TaskState::Pending | TaskState::Running)
+                            && r.spec
+                                .as_ref()
+                                .and_then(|s| s.get("type"))
+                                .and_then(|v| v.as_str())
+                                == Some(cfg.task_type.as_str())
+                    })
+                    .count()
+            };
+            if outstanding >= cfg.keep_inflight.max(1) {
+                tracing::debug!(
+                    member = %agent,
+                    outstanding,
+                    "engine: warmpool 池位已满（keep_inflight），本拍不补"
+                );
+                continue;
+            }
+            let epoch_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let tid = format!("warm-{agent}-{epoch_ms}");
+            let body = serde_json::json!({
+                "task_id": tid,
+                "type": cfg.task_type,
+                "intent": "warmpool keep-warm（预热池位）",
+                "priority": cfg.priority,
+                "to_agent": agent,
+                "correlation": "warmpool",
+                "params": { "warmpool": true, "node_id": node_id },
+            });
+            if let Err(e) = apply_task_spec(&self.mesh, &body) {
+                tracing::debug!(task_id = %tid, member = %agent, ?e, "engine: warmpool 预热任务入库失败，本拍跳过");
+                continue;
+            }
+            self.send_engine_spec(&tid, 1).await?;
+            tracing::info!(
+                task_id = %tid,
+                member = %agent,
+                node = %node_id,
+                "engine: warmpool keep-warm 预热任务已派发"
+            );
+        }
+        Ok(())
+    }
+
     /// 标记任务已分配（写入 to_agent + journal，防止重复调度）。
     fn mark_assigned(&self, task_id: &str, to_agent: &str) -> Result<()> {
         let mut table = self.mesh.table.lock().unwrap();
@@ -921,6 +1034,7 @@ mod tests {
                     tick_ms: 200,
                     max_concurrent_per_node: 2,
                     circuit: Default::default(),
+                    warmpool: Default::default(),
                 },
             },
             auth: AuthConfig::default(),
@@ -967,8 +1081,91 @@ mod tests {
             webhook: crate::api::WebhookClient::new(&cfg.webhook).map(Arc::new),
             node_id: cfg.node_id.clone(),
             circuit_cfg: cfg.mesh.engine.circuit.clone(),
+            warmpool_cfg: cfg.mesh.engine.warmpool.clone(),
+            warm_next: std::sync::Mutex::new(
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(
+                        cfg.mesh.engine.warmpool.interval_secs.clamp(5, 3600_u64),
+                    ),
+            ),
         };
         (state, mesh, engine)
+    }
+
+    #[tokio::test]
+    async fn warmpool_sweep_creates_keepwarm_task_and_caps_inflight() {
+        let (_state, mesh, mut engine) = test_mesh();
+        engine.warmpool_cfg = crate::config::WarmpoolConfig {
+            enabled: true,
+            members: vec!["w2".to_string(), "ghost".to_string()],
+            ..crate::config::WarmpoolConfig::default()
+        };
+        let mk_agent = |agent_id: &str, node: &str| crate::router::AgentRecord {
+            agent_id: agent_id.to_string(),
+            name: None,
+            capabilities: vec!["text".to_string()],
+            online: true,
+            node_id: node.to_string(),
+            last_seen: 0,
+        };
+        // 在线池位 w2@n2；ghost 未注册（离线位）。
+        engine
+            .router
+            .on_agents_update("n2", vec![mk_agent("w2", "n2")]);
+        fn count_warm(mesh: &MeshRuntime, member: &str) -> usize {
+            mesh.table
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|r| {
+                    r.to_agent.as_deref() == Some(member)
+                        && r.spec
+                            .as_ref()
+                            .and_then(|s| s.get("type"))
+                            .and_then(|v| v.as_str())
+                            == Some("warmup.ping")
+                })
+                .count()
+        }
+        let force_due = |e: &Engine| {
+            *e.warm_next.lock().unwrap() = std::time::Instant::now();
+        };
+
+        // sweep 第一拍：w2 建 keep-warm 行；ghost 离线不入池。
+        force_due(&engine);
+        engine.warmpool_sweep().await.unwrap();
+        assert_eq!(count_warm(&mesh, "w2"), 1, "w2 应有一行 keep-warm 任务");
+        assert_eq!(count_warm(&mesh, "ghost"), 0, "离线成员不应建行");
+        {
+            let table = mesh.table.lock().unwrap();
+            let rec = table
+                .values()
+                .find(|r| {
+                    r.to_agent.as_deref() == Some("w2")
+                        && r.spec
+                            .as_ref()
+                            .and_then(|s| s.get("type"))
+                            .and_then(|v| v.as_str())
+                            == Some("warmup.ping")
+                })
+                .expect("keep-warm 行应在表");
+            assert_eq!(rec.state, TaskState::Pending);
+            assert_eq!(
+                rec.spec.as_ref().and_then(|s| s.get("correlation")),
+                Some(&serde_json::json!("warmpool")),
+                "池任务必须带 correlation=warmpool"
+            );
+        }
+
+        // 第二拍（周期到点、真实任务 < keep_inflight 上限 outrun 安全）：行仍在
+        // pending → outstanding=1 满位 → 不再加行（keep_inflight=1 语义）。
+        force_due(&engine);
+        engine.warmpool_sweep().await.unwrap();
+        assert_eq!(
+            count_warm(&mesh, "w2"),
+            1,
+            "keep_inflight=1：在池任务未回收前不补位"
+        );
     }
 
     /// 造一条信封形帧（task_spec → task_accepted → task_failed 流程）。
