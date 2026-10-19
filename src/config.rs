@@ -316,6 +316,12 @@ pub struct MtlsConfig {
     /// 本地 API/网页仍在 `listen_port` 上走明文 HTTP，二者互不影响）。
     #[serde(default)]
     pub listen_port: Option<u16>,
+    /// **强制模式**（v0.6 P1）：开启后拒绝一切明文对等链路——出站只拨 `wss://`
+    /// （未广播 mtls 端点/明文静态条目直接拒），入站明文 `/peer/ws`、
+    /// `/peer/file/ws` 一律 403。缺省 false（机会式：对端不支持 TLS 则明文）。
+    /// 仅当 `enabled=true` 时实际生效；`--require` 需与 `--enable` 同用。
+    #[serde(default)]
+    pub require: bool,
     /// 是否允许本节点在无 CA 时**新建** CA（即集群「权威」节点）。缺省 true，
     /// 保持既有行为（首节点 `mtls --enable` 建 CA）。成员节点置 false：
     /// 不建 CA，启动后经已认证的对等链路自动领取集群 CA（CA 自动分发）。
@@ -336,9 +342,17 @@ impl Default for MtlsConfig {
             cert_ttl_days: default_mtls_cert_ttl_days(),
             cert_rotate_interval_seconds: default_mtls_rotate_interval(),
             listen_port: None,
+            require: false,
             create_ca: true,
             ca_sync: true,
         }
+    }
+}
+
+impl MtlsConfig {
+    /// 强制模式是否实际生效（require 必须以 enabled 为前提）。
+    pub fn require_enforced(&self) -> bool {
+        self.enabled && self.require
     }
 }
 
@@ -962,6 +976,22 @@ mod tests {
         assert_eq!(d.cert_ttl_days, 1);
         assert_eq!(d.cert_rotate_interval_seconds, 21600);
         assert_eq!(d.listen_port, None);
+        // require 缺省 false：保持机会式（零行为变化）。
+        assert!(!d.require);
+        assert!(!d.require_enforced());
+        // require 只有在 enabled 时才实际生效。
+        let pending = MtlsConfig {
+            require: true,
+            ..MtlsConfig::default()
+        };
+        assert!(pending.require);
+        assert!(!pending.require_enforced());
+        let enforced = MtlsConfig {
+            enabled: true,
+            require: true,
+            ..MtlsConfig::default()
+        };
+        assert!(enforced.require_enforced());
         // CA 自动分发：缺省「可建 CA + 允许同步」，保持既有行为。
         assert!(d.create_ca);
         assert!(d.ca_sync);

@@ -18,7 +18,7 @@ use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use crate::admission;
 use crate::api::SharedState;
-use crate::config::Config;
+use crate::config::{Config, MtlsConfig};
 use crate::mtls::{fingerprint_of_pem, AdoptOutcome};
 use crate::peer::DiscoveredPeer;
 use crate::proto::{CaSync, Envelope, Hello, PROTOCOL_VERSION};
@@ -206,6 +206,9 @@ async fn open_ws(
 ) -> anyhow::Result<(mpsc::Sender<Frame>, mpsc::Receiver<Frame>)> {
     let client = state.mtls.as_ref().and_then(|rt| rt.client_config());
     let use_tls = state.config.mtls.enabled && target.mtls_addr.is_some() && client.is_some();
+    // v0.6 P1 `mtls.require`：强制模式 —— 明文目标拒拨（本地判定、零网络开销）。
+    dial_allowed(&state.config.mtls, use_tls, target)
+        .map_err(|reason| anyhow::anyhow!("conn: dial refused: {reason}"))?;
 
     let (socket, _resp) = if use_tls {
         let addr = target.mtls_addr.as_deref().unwrap_or_default();
@@ -244,6 +247,28 @@ pub async fn open_file_ws(
         mtls_addr,
     };
     open_ws(state, &target, "/peer/file/ws").await
+}
+
+/// 强制模式判定（纯函数，供 `open_ws` 与单测复用）：
+///
+/// - `require_enforced()` 为 false（默认）→ 机会式，任何目标都可拨；
+/// - 强制模式下只允许 `wss://` 目标：要求对端广播了 mtls 端点**且**本机 TLS 客户端
+///   配置已就绪（`use_tls=true`）。明文条目（无 mtls_addr）在拨号前被拒绝，
+///   拒绝走 `debug!` 级别（对端广播 mtls_port 后即恢复可拨，不刷屏）。
+fn dial_allowed(mtls: &MtlsConfig, use_tls: bool, target: &DialTarget) -> Result<(), String> {
+    if !mtls.require_enforced() {
+        return Ok(());
+    }
+    if use_tls {
+        return Ok(());
+    }
+    if target.mtls_addr.is_none() {
+        return Err(format!(
+            "peer endpoint advertised no mTLS (mtls.require): {}",
+            target.addr
+        ));
+    }
+    Err("local TLS client not ready (mtls.require): no CA/client config yet".to_string())
 }
 
 // ---- session ----------------------------------------------------------------
@@ -636,7 +661,8 @@ fn bridge_ws(socket: WsStream, in_tx: mpsc::Sender<Frame>, mut out_rx: mpsc::Rec
 
 #[cfg(test)]
 mod tests {
-    use super::parse_static_peer;
+    use super::{dial_allowed, parse_static_peer, DialTarget};
+    use crate::config::MtlsConfig;
 
     #[test]
     fn static_peer_scheme_marks_mtls() {
@@ -660,5 +686,46 @@ mod tests {
                 Some("10.0.0.2:8766".to_string())
             )
         );
+    }
+
+    /// `mtls.require` 强制模式：明文目标拒拨（机会式默认全放行）。
+    #[test]
+    fn require_mode_dial_policy() {
+        let plain = DialTarget {
+            addr: "10.0.0.2:8765".into(),
+            mtls_addr: None,
+        };
+        let tls = DialTarget {
+            addr: "10.0.0.2:8765".into(),
+            mtls_addr: Some("10.0.0.2:8766".into()),
+        };
+
+        // 默认（机会式）：全部放行。
+        assert!(dial_allowed(&MtlsConfig::default(), false, &plain).is_ok());
+        assert!(dial_allowed(&MtlsConfig::default(), false, &tls).is_ok());
+
+        // 强制模式 + 对端没广播 mtls 端点 → 拒（fail-closed，无需碰网络）。
+        let enforced = MtlsConfig {
+            enabled: true,
+            require: true,
+            ..MtlsConfig::default()
+        };
+        let err = dial_allowed(&enforced, false, &plain).unwrap_err();
+        assert!(err.contains("advertised no mTLS"), "{err}");
+
+        // 强制模式 + 广播了 mtls 端点但本机 TLS 客户端未就绪（如成员未领 CA）
+        // → 拒，且提示原因不同。
+        let err = dial_allowed(&enforced, false, &tls).unwrap_err();
+        assert!(err.contains("not ready"), "{err}");
+
+        // 强制模式 + 双端就绪 → 放行（真正走 wss://）。
+        assert!(dial_allowed(&enforced, true, &tls).is_ok());
+
+        // enabled 但未开 require：保持机会式，不拦明文。
+        let opportunistic = MtlsConfig {
+            enabled: true,
+            ..MtlsConfig::default()
+        };
+        assert!(dial_allowed(&opportunistic, false, &plain).is_ok());
     }
 }

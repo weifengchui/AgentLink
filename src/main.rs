@@ -177,6 +177,10 @@ enum Command {
         /// 以「权威」身份启用：无 CA 时新建 CA（默认行为）。写入 `mtls.create_ca=true`。
         #[arg(long)]
         authority: bool,
+        /// 强制模式：拒绝一切明文对等链路（出站只拨 wss://、入站明文 403）。
+        /// 必须与 --enable 同用；关闭机会式降级（混版本灰度不再自动明文）。
+        #[arg(long, requires = "enable")]
+        require: bool,
     },
     /// 新节点准入（v0.6 P1）：bootstrap 令牌 + 硬件指纹双验证。
     Admission {
@@ -402,6 +406,7 @@ async fn main() -> Result<()> {
             rotate,
             member,
             authority,
+            require,
         }) => mtls_cmd(
             &cli.config,
             enable,
@@ -410,6 +415,7 @@ async fn main() -> Result<()> {
             rotate,
             member,
             authority,
+            require,
         ),
         Some(Command::Admission {
             status,
@@ -503,6 +509,7 @@ fn mtls_cmd(
     rotate: bool,
     member: bool,
     authority: bool,
+    require: bool,
 ) -> Result<()> {
     if enable && disable {
         bail!("--enable 与 --disable 不能同时使用");
@@ -531,6 +538,15 @@ fn mtls_cmd(
     } else if disable {
         cfg.mtls.enabled = false;
         changed = true;
+    }
+    if require {
+        // clap `requires = "enable"` 已保证随 --enable；但既有配置可能在
+        // disabled 态改过 require——这里仍写值并提示其生效前提。
+        cfg.mtls.require = true;
+        changed = true;
+        if !cfg.mtls.enabled {
+            println!("注意: mtls.require 仅在 mtls.enabled=true 时生效（当前 disabled）");
+        }
     }
     if changed {
         cfg.save(config_path)?;
@@ -574,6 +590,14 @@ fn print_mtls_status(
             "authority（可建 CA）"
         } else {
             "member（领取集群 CA）"
+        }
+    );
+    println!(
+        "  transport:   {}",
+        if cfg.mtls.require_enforced() {
+            "require（强制 wss，明文对等被拒）"
+        } else {
+            "opportunistic（对端支持则 wss，否则明文）"
         }
     );
     println!("  ca_sync:     {}", cfg.mtls.ca_sync);
@@ -806,6 +830,23 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
              all peer handshakes will be rejected (fail-closed)"
         );
     }
+    // v0.6 P1 `mtls.require`：配置矛盾/未就绪早告警（机会式为默认，零迁移）。
+    if cfg.mtls.require && !cfg.mtls.enabled {
+        tracing::warn!("mtls: require=true without mtls.enabled — inert (opportunistic)");
+    } else if cfg.mtls.require_enforced() {
+        match &mtls_runtime {
+            Some(rt) if rt.is_ready() => {
+                tracing::info!("mtls: require mode enforced; peer links must use wss://");
+            }
+            Some(_) => tracing::warn!(
+                "mtls: require mode but no cluster CA yet — this node stays isolated until \
+                 a peer distributes the CA; plaintext links are refused by policy"
+            ),
+            None => tracing::warn!(
+                "mtls: require mode set but TLS runtime unavailable — peer links refused"
+            ),
+        }
+    }
     let state = Arc::new(state_inner);
     // Restore the user's "forget this node" list (ghost-peer cleanup,
     // paired with DELETE /v1/peers/{node_id}).
@@ -887,7 +928,9 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
         match mtls_bind.parse::<std::net::SocketAddr>() {
             Ok(addr) => {
                 let rx = rt.server_watch();
-                let peer_app = api::peer_router(state.clone());
+                // 标记 TLS 通道：`mtls.require` 据此放行 wss://、拒绝明文对等连接。
+                let peer_app =
+                    api::peer_router(state.clone()).layer(axum::Extension(api::PeerTlsMarker));
                 let shutdown = shutdown_rx.clone();
                 Some(tokio::spawn(serve_mtls(addr, rx, peer_app, shutdown)))
             }

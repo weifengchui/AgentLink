@@ -30,7 +30,7 @@
 - **任务引擎内核化**：声明式 CRUD + reconcile loop + bin-packing 调度（优先级/重试/超时/断点续传）【§2.1、§2.2 Scheduler、§5.2 增量调度】
 - Adapter SDK：Hermes / Claude Code / OpenCode → 标准 Task Stream 协议；现役 hermes_bridge 转为第一参考实现【§2.3、Phase2】
 - RBAC：人 token 与 agent token 分轨；Admin/Operator/Viewer/Executor 四角色【§4.2 前半】
-- 可选 mTLS：内置 CA 一键签发+24h 轮转 + **CA 自动分发**（权威节点经已认证链路零拷贝下发，成员热启用；冲突保护）（rustls+rcgen，LAN 默认关闭、一键开启）【§4.1】
+- 可选 mTLS：内置 CA 一键签发+24h 轮转 + **CA 自动分发**（权威节点经已认证链路零拷贝下发，成员热启用；冲突保护）+ **强制 require 模式**（`mtls.require`，拒绝一切明文对等链路）（rustls+rcgen，LAN 默认关闭、一键开启）【§4.1】
 - 新节点准入：bootstrap token + 硬件指纹双验证（已交付：对等/文件通道同一闸门、fail-closed、单因素显式裁剪；`agentlink admission` CLI + `join --admission`）【§4.1】
 - Lease 心跳 + 阈值差异上报（CPU±5% 才发 Full Status）【§5.1】
 - 出站 webhook（OnTaskFailed/OnNodeOffline/OnAuditAlert），wake-kit 收敛为标准实现【§8.2】

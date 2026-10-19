@@ -19,7 +19,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Query, Request, 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{async_trait, Json, Router as AxRouter};
+use axum::{async_trait, Extension, Json, Router as AxRouter};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -3286,12 +3286,36 @@ async fn handle_subscriber(socket: WebSocket, state: SharedState, client_id: Str
 
 // ---- peer endpoint ----------------------------------------------------------
 
+/// 标记：本请求来自节点间 **TLS 监听**（v0.6 P1 `mtls.require` 判定用）。
+/// 仅 TLS 监听（`serve_mtls`）挂载该扩展；明文监听不挂，据此区分传输通道。
+#[derive(Clone, Copy, Debug)]
+pub struct PeerTlsMarker;
+
+/// 对等传输策略强制点（v0.6 P1）：`mtls.require` 模式下，明文对等链路一律拒绝。
+fn peer_transport_policy(state: &AppState, tls: bool) -> Option<Response> {
+    if state.config.mtls.require_enforced() && !tls {
+        tracing::warn!("api: peer link refused: plaintext transport (mtls.require)");
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "mtls.require" })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
 /// Accept a peer WebSocket upgrade.
 async fn peer_ws(
     ws: WebSocketUpgrade,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    tls_marker: Option<Extension<PeerTlsMarker>>,
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
+    if let Some(resp) = peer_transport_policy(&state, tls_marker.is_some()) {
+        return resp;
+    }
     ws.on_upgrade(move |socket| conn::handle_inbound(socket, state, remote))
 }
 
@@ -3299,8 +3323,12 @@ async fn peer_ws(
 async fn file_ws(
     ws: WebSocketUpgrade,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    tls_marker: Option<Extension<PeerTlsMarker>>,
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
+    if let Some(resp) = peer_transport_policy(&state, tls_marker.is_some()) {
+        return resp;
+    }
     ws.on_upgrade(move |socket| crate::file::handle_inbound(socket, state, remote))
 }
 
