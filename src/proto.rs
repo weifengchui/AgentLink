@@ -111,6 +111,13 @@ pub struct Hello {
     /// 但尚无 CA（等待领取）」与「未开 mTLS」——只有前者才应被推送 CA。
     #[serde(default)]
     pub mtls_enabled: bool,
+    /// 本机硬件指纹（v0.6 P1 新节点准入）。加性字段；缺省 None（老节点）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_fp: Option<String>,
+    /// 准入令牌证明：HMAC(bootstrap_token, node_id|nonce|v)（v0.6 P1 准入）。
+    /// 加性字段；缺省 None（未启用准入/老节点）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<String>,
 }
 
 impl Hello {
@@ -126,6 +133,8 @@ impl Hello {
             nonce,
             ca_fp: None,
             mtls_enabled: false,
+            hw_fp: None,
+            boot: None,
         }
     }
 
@@ -409,5 +418,31 @@ mod tests {
         assert_eq!(back.ca_cert, "CERT");
         assert_eq!(back.ca_key, "KEY");
         assert_eq!(back.fingerprint, "fp");
+    }
+
+    #[test]
+    fn hello_admission_fields_are_additive() {
+        // 老帧（无 hw_fp / boot）可解析为 None —— 与 v0.5.9 节点互通。
+        let legacy = r#"{"type":"ctrl","action":"hello","v":1,"node_id":"a","name":"n",
+                         "nonce":"x","auth":"deadbeef"}"#;
+        let h: Hello = serde_json::from_str(legacy).unwrap();
+        assert_eq!(h.hw_fp, None);
+        assert_eq!(h.boot, None);
+
+        // 新帧：字段在非 None 时序列化并可往返。
+        let mut sealed = Hello::new("a", "n", "tok");
+        sealed.hw_fp = Some("aa11".into());
+        sealed.boot = Some("beef".into());
+        let dumped = serde_json::to_string(&sealed).unwrap();
+        assert!(dumped.contains("\"hw_fp\":\"aa11\""));
+        assert!(dumped.contains("\"boot\":\"beef\""));
+        let back: Hello = serde_json::from_str(&dumped).unwrap();
+        assert_eq!(back.hw_fp.as_deref(), Some("aa11"));
+        assert_eq!(back.boot.as_deref(), Some("beef"));
+
+        // 缺省构造不落这两个键（对老节点最省字节）。
+        let plain = serde_json::to_string(&Hello::new("a", "n", "tok")).unwrap();
+        assert!(!plain.contains("hw_fp"));
+        assert!(!plain.contains("\"boot\""));
     }
 }

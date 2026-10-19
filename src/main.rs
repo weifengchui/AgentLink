@@ -3,6 +3,7 @@
 //! Each machine runs one `agentlink` node. Agents on that machine talk to it
 //! over the local HTTP/WS API; nodes talk to each other over WebSocket.
 
+mod admission;
 mod api;
 mod cli;
 mod config;
@@ -97,6 +98,10 @@ enum Command {
         /// Overwrite an existing configuration file.
         #[arg(long)]
         force: bool,
+        /// 准入令牌（v0.6 P1 新节点准入）。只写入本机配置，不自动开启——
+        /// 准入段（enabled/白名单）与集群令牌一同分发。
+        #[arg(long)]
+        admission: Option<String>,
     },
     /// Print this node's cluster token (for pairing other machines).
     Token,
@@ -172,6 +177,27 @@ enum Command {
         /// 以「权威」身份启用：无 CA 时新建 CA（默认行为）。写入 `mtls.create_ca=true`。
         #[arg(long)]
         authority: bool,
+    },
+    /// 新节点准入（v0.6 P1）：bootstrap 令牌 + 硬件指纹双验证。
+    Admission {
+        /// 打印准入状态与本机硬件指纹（默认行为）。
+        #[arg(long)]
+        status: bool,
+        /// 启用准入（必须可用的准入令牌：--boot 或既有配置）。
+        #[arg(long)]
+        enable: bool,
+        /// 准入令牌（集群侧统一发放；同 cluster_token 的分发语义）。
+        #[arg(long)]
+        boot: Option<String>,
+        /// 把给定硬件指纹加入白名单（可重复 --allow）。
+        #[arg(long)]
+        allow: Vec<String>,
+        /// 把给定硬件指纹移出白名单（可重复 --revoke）。
+        #[arg(long)]
+        revoke: Vec<String>,
+        /// 关闭准入（写回 enabled=false）。
+        #[arg(long)]
+        disable: bool,
     },
 }
 
@@ -286,6 +312,7 @@ async fn main() -> Result<()> {
             name,
             open,
             force,
+            admission,
         }) => {
             if cli.config.exists() && !force {
                 bail!(
@@ -294,10 +321,23 @@ async fn main() -> Result<()> {
                 );
             }
             let mode = open.then(|| "open".to_string());
-            let cfg = generate_preserving_identity(&cli.config, name, Some(token), mode);
+            let mut cfg = generate_preserving_identity(&cli.config, name, Some(token), mode);
             cfg.save(&cli.config)?;
+            if let Some(boot) = admission {
+                if boot.trim().is_empty() {
+                    bail!("--admission 准入令牌不能为空");
+                }
+                cfg.security.admission.bootstrap_token = boot;
+                cfg.save(&cli.config)?;
+            }
             println!("paired: {} ({})", cfg.name, cfg.node_id);
             println!("  cluster_token set ({} mode)", cfg.security.mode);
+            if cfg.security.admission.boot_token_configured() {
+                println!(
+                    "  admission bootstrap token 已记录（本机指纹: {}）",
+                    admission::hardware_fingerprint()
+                );
+            }
             println!("\nrun `agentlink run` to start");
             Ok(())
         }
@@ -371,6 +411,14 @@ async fn main() -> Result<()> {
             member,
             authority,
         ),
+        Some(Command::Admission {
+            status,
+            enable,
+            boot,
+            allow,
+            revoke,
+            disable,
+        }) => admission_cmd(&cli.config, status, enable, boot, allow, revoke, disable),
         None => {
             // v0.5 收官：裸启动 + 无配置 + 交互终端 → 自动进入首次向导
             // （Windows 双击 exe 的新机器旅程，不需要先读任何文档）。
@@ -573,6 +621,114 @@ fn format_unix(unix: i64) -> String {
         .unwrap_or_else(|| unix.to_string())
 }
 
+/// `agentlink admission`：新节点准入（v0.6 P1）管理——开关/令牌/硬件指纹白名单。
+#[allow(clippy::too_many_arguments)]
+fn admission_cmd(
+    config_path: &Path,
+    status: bool,
+    enable: bool,
+    boot: Option<String>,
+    allow: Vec<String>,
+    revoke: Vec<String>,
+    disable: bool,
+) -> Result<()> {
+    if enable && disable {
+        bail!("--enable 与 --disable 不能同时使用");
+    }
+    // `status` 是默认行为（无任何标志时也打印），仅为显式表达保留。
+    let _ = status;
+    let mut cfg = load_config(config_path, false)?;
+    std::fs::create_dir_all(&cfg.data_dir)
+        .with_context(|| format!("failed to create data dir {}", cfg.data_dir.display()))?;
+
+    let adm = &mut cfg.security.admission;
+    let mut changed = false;
+    if let Some(token) = &boot {
+        if token.trim().is_empty() {
+            bail!("--boot 准入令牌不能为空");
+        }
+        adm.bootstrap_token = token.clone();
+        changed = true;
+    }
+    if enable {
+        if !adm.boot_token_configured() {
+            bail!(
+                "启用准入必须先配置准入令牌：--boot <TOKEN>\n\
+                 （在权威节点生成并随集群令牌一同分发；指纹白名单 --allow 可后补）"
+            );
+        }
+        adm.enabled = true;
+        changed = true;
+    } else if disable {
+        adm.enabled = false;
+        changed = true;
+    }
+    for fp in &allow {
+        let fp = fp.trim().to_lowercase();
+        if fp.is_empty() {
+            bail!("--allow 指纹不能为空");
+        }
+        if !adm.allowed_hardware.iter().any(|f| f == &fp) {
+            adm.allowed_hardware.push(fp);
+            changed = true;
+        }
+    }
+    for fp in &revoke {
+        let fp = fp.trim().to_lowercase();
+        let before = adm.allowed_hardware.len();
+        adm.allowed_hardware.retain(|f| f != &fp);
+        changed |= adm.allowed_hardware.len() != before;
+    }
+    if changed {
+        cfg.save(config_path)?;
+    }
+
+    // 指纹白名单失败行为提示。
+    if changed
+        && cfg.security.admission.enabled
+        && !cfg.security.admission.boot_token_configured()
+        && cfg.security.admission.allowed_hardware.is_empty()
+    {
+        bail!("准入处于无令牌且无白名单的状态：fail-closed，入网会被全拒");
+    }
+
+    print_admission_status(&cfg);
+    Ok(())
+}
+
+/// 打印准入状态（不回显准入令牌本体）。
+fn print_admission_status(cfg: &Config) {
+    let adm = &cfg.security.admission;
+    println!(
+        "admission: {}",
+        if adm.enabled { "enabled" } else { "disabled" }
+    );
+    println!("  self hw fp: {}", admission::hardware_fingerprint());
+    println!(
+        "  bootstrap token: {}",
+        if adm.boot_token_configured() {
+            "configured"
+        } else {
+            "未配置"
+        }
+    );
+    println!("  allowed_hardware: {} 个", adm.allowed_hardware.len());
+    for fp in &adm.allowed_hardware {
+        println!("    {fp}");
+    }
+    if !adm.enabled {
+        println!(
+            "\n开启: agentlink admission --enable --boot <TOKEN> [--allow <指纹> ...]\n\
+             新机器: agentlink admission --status 查询指纹 → 权威节点 --allow 收录\n\
+             加入集群: agentlink join <CLUSTER_TOKEN> --admission <TOKEN>"
+        );
+    } else if adm.allowed_hardware.is_empty() {
+        println!("\n当前为单因素（仅令牌）；补白名单: agentlink admission --allow <指纹>");
+    } else if !adm.boot_token_configured() {
+        println!("\n当前为单因素（仅指纹白名单）；补令牌: agentlink admission --boot <TOKEN>");
+    }
+}
+
 async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
     let bind = format!("{}:{}", cfg.local_api.host, cfg.listen_port);
 
@@ -639,6 +795,17 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
     state_inner.mesh = api::build_mesh(&state_inner.config, &state_inner.config_file);
     // v0.6 P1 mTLS：把运行态交给连接层（拨号按需升级 wss://；对等链路触发 CA 领取）。
     state_inner.mtls = mtls_runtime.clone();
+    // v0.6 P1 新节点准入：本机硬件指纹（启动时算一次，进程内不变）。
+    state_inner.hw_fp = admission::hardware_fingerprint();
+    if cfg.security.admission.enabled
+        && !cfg.security.admission.boot_token_configured()
+        && cfg.security.admission.allowed_hardware.is_empty()
+    {
+        tracing::warn!(
+            "admission: enabled but neither bootstrap token nor allowlist configured; \
+             all peer handshakes will be rejected (fail-closed)"
+        );
+    }
     let state = Arc::new(state_inner);
     // Restore the user's "forget this node" list (ghost-peer cleanup,
     // paired with DELETE /v1/peers/{node_id}).

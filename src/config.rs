@@ -124,6 +124,35 @@ pub struct SecurityConfig {
     pub mode: String,
     #[serde(default = "default_placeholder_token")]
     pub cluster_token: String,
+    /// 新节点准入（v0.6 P1，roadmap §4.1）。缺省未配置 = 不启用，
+    /// 行为与从前完全一致（cluster_token 单因素）。
+    #[serde(default)]
+    pub admission: AdmissionConfig,
+}
+
+/// 新节点准入配置（v0.6 P1）：bootstrap 令牌 + 硬件指纹**双验证**。
+///
+/// 开启后，任何对等连接的握手（含文件通道）都必须同时满足：
+/// 1. 现有 `cluster_token` 校验（strict 模式下既有的必要条件）；
+/// 2. `boot` = HMAC(bootstrap_token, node_id|nonce|v) 正确（准入令牌）；
+/// 3. `hw_fp`（本机硬件指纹）在 `allowed_hardware` 白名单内。
+///
+/// 细则：
+/// - 只配置 bootstrap_token（白名单空）→ 仅验证令牌（单因素，小集群）。
+/// - 只配置白名单（令牌为空/占位符）→ 仅验证指纹。
+/// - 两者都未配置 → fail-closed：拒绝一切入网（握手段里视为非法配置，
+///   启动时就打告警）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdmissionConfig {
+    /// 准入开关。缺省 false：不启用，与之前版本行为逐字符一致。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 准入令牌。空或占位符视为「未配置」。
+    #[serde(default = "default_placeholder_token")]
+    pub bootstrap_token: String,
+    /// 硬件指纹白名单（SHA-256 前 16 个 hex 字符）。空 = 不校验指纹。
+    #[serde(default)]
+    pub allowed_hardware: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,7 +186,7 @@ impl Role {
             Role::Admin => true,
             Role::Operator => !matches!(
                 endpoint,
-                "/v1/config" | "/v1/mesh/status" | "/v1/metrics" | "/v1/lockdown"
+                "/v1/config" | "/v1/mesh/status" | "/v1/metrics" | "/v1/lockdown" | "/v1/admission"
             ),
             Role::Viewer => matches!(
                 endpoint,
@@ -556,7 +585,30 @@ impl Default for SecurityConfig {
         SecurityConfig {
             mode: default_security_mode(),
             cluster_token: default_placeholder_token(),
+            admission: AdmissionConfig::default(),
         }
+    }
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        AdmissionConfig {
+            enabled: false,
+            bootstrap_token: default_placeholder_token(),
+            allowed_hardware: Vec::new(),
+        }
+    }
+}
+
+impl AdmissionConfig {
+    /// 准入令牌是否真的被配置过（区分空串与占位符）。
+    pub fn boot_token_configured(&self) -> bool {
+        !self.bootstrap_token.is_empty() && self.bootstrap_token != default_placeholder_token()
+    }
+
+    /// 指纹是否在白名单内。
+    pub fn hardware_allowed(&self, hw_fp: &str) -> bool {
+        self.allowed_hardware.iter().any(|f| f == hw_fp)
     }
 }
 
@@ -646,6 +698,7 @@ impl Config {
             security: SecurityConfig {
                 mode: mode.unwrap_or_else(default_security_mode),
                 cluster_token: cluster_token.unwrap_or_else(new_secret),
+                admission: AdmissionConfig::default(),
             },
             local_api: LocalApiConfig {
                 host: default_local_host(),
@@ -836,6 +889,43 @@ mod tests {
         assert_eq!(cfg.mtls.ca_cert, None);
         assert_eq!(cfg.mtls.cert_ttl_days, 1);
         assert_eq!(cfg.mtls.cert_rotate_interval_seconds, 21600);
+        // 老配置没有 admission：必须默认关闭（准入不存在，与 v0.5 行为一致）。
+        assert!(!cfg.security.admission.enabled);
+        assert!(!cfg.security.admission.boot_token_configured());
+        assert!(cfg.security.admission.allowed_hardware.is_empty());
+    }
+
+    /// 准入段（v0.6 P1）：缺省关闭；显式配置后 token/白名单语义正确。
+    #[test]
+    fn admission_section_defaults_and_semantics() {
+        // 无 security 段：全默认。
+        let absent: Config = serde_json::from_str(r#"{"node_id":"n","name":"h"}"#).unwrap();
+        assert!(!absent.security.admission.enabled);
+
+        // 显式启用 + 白名单。
+        let cfg: Config = serde_json::from_str(
+            r#"{"node_id":"n","name":"h","security":{"mode":"strict",
+                "cluster_token":"tok","admission":{"enabled":true,
+                "bootstrap_token":"boot-tok","allowed_hardware":["aa11","bb22"]}}}"#,
+        )
+        .unwrap();
+        let adm = &cfg.security.admission;
+        assert!(adm.enabled);
+        assert!(adm.boot_token_configured());
+        assert!(adm.hardware_allowed("aa11"));
+        assert!(adm.hardware_allowed("bb22"));
+        assert!(!adm.hardware_allowed("cc33"));
+
+        // 只给白名单（token 未配置 → 指纹单因素模式）。
+        let fp_only: AdmissionConfig =
+            serde_json::from_str(r#"{"enabled":true,"allowed_hardware":["aa11"]}"#).unwrap();
+        assert!(!fp_only.boot_token_configured());
+        assert!(fp_only.allowed_hardware.len() == 1);
+
+        // token 用占位符等价于未配置。
+        let placeholder: AdmissionConfig =
+            serde_json::from_str(r#"{"enabled":true,"bootstrap_token":"change-me"}"#).unwrap();
+        assert!(!placeholder.boot_token_configured());
     }
 
     /// mTLS 段缺省/部分字段：默认关闭，逐项回落到默认值。

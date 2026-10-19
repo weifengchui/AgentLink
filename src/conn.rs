@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, watch, RwLock};
 use tokio_tungstenite::tungstenite::Message as TtMessage;
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
+use crate::admission;
 use crate::api::SharedState;
 use crate::config::Config;
 use crate::mtls::{fingerprint_of_pem, AdoptOutcome};
@@ -259,10 +260,12 @@ async fn session(
     let cfg = &state.config;
     let strict = cfg.security.mode == "strict";
 
-    // Always speak first: send our hello (含 mTLS 状态：CA 指纹 + 是否参与）。
+    // Always speak first: send our hello (含 mTLS 状态：CA 指纹 + 是否参与；
+    // 含准入要素：硬件指纹 + 准入令牌 HMAC，v0.6 P1）。
     let mut hello_name = state.display_name();
-    let hello = Hello::new(&cfg.node_id, &hello_name, &cfg.security.cluster_token)
+    let mut hello = Hello::new(&cfg.node_id, &hello_name, &cfg.security.cluster_token)
         .with_mtls(state.mtls_ca_fp(), cfg.mtls.enabled);
+    admission::seal_hello(&mut hello, &cfg.security.admission);
     if send_text(&send, &hello).await.is_err() {
         return;
     }
@@ -308,8 +311,9 @@ async fn session(
                 let cur = state.display_name();
                 if cur != hello_name {
                     hello_name = cur;
-                    let nh = Hello::new(&cfg.node_id, &hello_name, &cfg.security.cluster_token)
+                    let mut nh = Hello::new(&cfg.node_id, &hello_name, &cfg.security.cluster_token)
                         .with_mtls(state.mtls_ca_fp(), cfg.mtls.enabled);
+                    admission::seal_hello(&mut nh, &cfg.security.admission);
                     if send_text(&send, &nh).await.is_err() {
                         break;
                     }
@@ -358,6 +362,17 @@ async fn handle_text(
             }
             if strict && !hello.verify(&cfg.security.cluster_token) {
                 tracing::warn!(node_id = %hello.node_id, "conn: handshake rejected (bad cluster token)");
+                return false;
+            }
+            // v0.6 P1 新节点准入：bootstrap token + 硬件指纹双验证。必须在
+            // 节点登记/CA 分发之前执行——未通过闸门的机器拿不到集群 CA。
+            if let Err(reason) = admission::gate(&cfg.security.admission, &hello) {
+                tracing::warn!(
+                    node_id = %hello.node_id,
+                    addr = remote_addr,
+                    reason = reason,
+                    "conn: handshake rejected (admission)"
+                );
                 return false;
             }
             let changed = peer_id.as_deref() != Some(hello.node_id.as_str());

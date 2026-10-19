@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use crate::admission;
 use crate::api::SharedState;
 use crate::conn::{self, Frame};
 use crate::proto::{Envelope, Hello, PROTOCOL_VERSION};
@@ -184,11 +185,12 @@ async fn exchange_hello(
     sink: &mpsc::Sender<Frame>,
     recv: &mut mpsc::Receiver<Frame>,
 ) -> anyhow::Result<String> {
-    let hello = Hello::new(
+    let mut hello = Hello::new(
         &state.config.node_id,
         &state.config.name,
         &state.config.security.cluster_token,
     );
+    admission::seal_hello(&mut hello, &state.config.security.admission);
     send_value(sink, &hello).await?;
 
     let strict = state.config.security.mode == "strict";
@@ -211,6 +213,12 @@ async fn exchange_hello(
                             }
                             if strict && !their.verify(&state.config.security.cluster_token) {
                                 return Err(anyhow::anyhow!("peer rejected cluster token"));
+                            }
+                            // v0.6 P1 新节点准入：文件通道与对等通道共用同一闸门。
+                            if let Err(reason) =
+                                admission::gate(&state.config.security.admission, &their)
+                            {
+                                return Err(anyhow::anyhow!("peer rejected by admission: {reason}"));
                             }
                             return Ok(their.node_id);
                         }

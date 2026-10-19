@@ -69,6 +69,8 @@ pub struct AppState {
     /// `ws://`。由 main.rs 启动时装配一次；成员节点可在运行期经对等链路领取
     /// 集群 CA（CA 自动分发），故内部状态可变（见 [`crate::mtls::MtlsRuntime`]）。
     pub mtls: Option<Arc<crate::mtls::MtlsRuntime>>,
+    /// 本机硬件指纹（v0.6 P1 新节点准入）。启动时计算一次，进程内不变。
+    pub hw_fp: String,
 }
 
 impl AppState {
@@ -96,6 +98,7 @@ impl AppState {
             runtime: std::sync::RwLock::new(runtime),
             mesh: None,
             mtls: None,
+            hw_fp: String::new(),
         }
     }
 
@@ -343,6 +346,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/config", get(config_get).put(config_put))
         .route("/v1/mesh/status", get(mesh_status_get))
         .route("/v1/metrics", get(metrics_get))
+        .route("/v1/admission", get(admission_get))
         .route("/web", get(web_page))
         .route("/v1/web", get(web_page))
         .route("/v1/starmap", get(starmap_page))
@@ -460,6 +464,25 @@ async fn mesh_status_get(
 
 /// M3 P3-4 / P0：Prometheus 指标端点（文本格式，供 Prometheus 抓取）。
 /// Requires a valid local API token.
+/// `GET /v1/admission` — 本机准入状态 + 本机硬件指纹（v0.6 P1，Admin）。
+/// 只报「令牌是否已配置」，不回显令牌本体。
+async fn admission_get(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized().into_response();
+    };
+    if !role.allows("/v1/admission") {
+        return forbidden().into_response();
+    }
+    let adm = &state.config.security.admission;
+    Json(json!({
+        "enabled": adm.enabled,
+        "node_hardware": state.hw_fp,
+        "bootstrap_token_configured": adm.boot_token_configured(),
+        "allowed_hardware": adm.allowed_hardware,
+    }))
+    .into_response()
+}
+
 async fn metrics_get(
     State(state): State<SharedState>,
     headers: HeaderMap,
