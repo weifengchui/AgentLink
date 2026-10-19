@@ -10,7 +10,9 @@ mod config;
 mod conn;
 mod discovery;
 mod file;
+mod lease;
 mod license;
+mod load;
 mod logging;
 #[cfg(feature = "mdns")]
 mod mdns;
@@ -867,6 +869,11 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
         .mesh
         .as_ref()
         .map(|_| reconcile::Engine::spawn(state.clone(), router.clone(), shutdown_rx.clone()));
+
+    // v0.6 P1 Lease 差异上报：enabled 才 spawn（缺省 false = 零流量、零行为变化）。
+    if cfg.lease.enabled {
+        lease::spawn(state.clone(), shutdown_rx.clone());
+    }
 
     let discovery = if cfg.discovery.enabled {
         Some(tokio::spawn(discovery::run(

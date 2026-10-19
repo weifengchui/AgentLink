@@ -71,6 +71,9 @@ pub struct AppState {
     pub mtls: Option<Arc<crate::mtls::MtlsRuntime>>,
     /// 本机硬件指纹（v0.6 P1 新节点准入）。启动时计算一次，进程内不变。
     pub hw_fp: String,
+    /// Lease 差异上报的出站差异状态（v0.6 P1）。仅 `lease.enabled=true` 时
+    /// 有对应任务在跑；关闭态只是闲置内存（零流量）。
+    pub lease: crate::lease::LeaseState,
 }
 
 impl AppState {
@@ -99,6 +102,7 @@ impl AppState {
             mesh: None,
             mtls: None,
             hw_fp: String::new(),
+            lease: crate::lease::LeaseState::new(),
         }
     }
 
@@ -483,10 +487,7 @@ async fn admission_get(State(state): State<SharedState>, headers: HeaderMap) -> 
     .into_response()
 }
 
-async fn metrics_get(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-) -> Response {
+async fn metrics_get(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized().into_response();
     };
@@ -497,56 +498,85 @@ async fn metrics_get(
     let router_m = state.router.router_metrics();
 
     // Mesh 层任务指标（仅 mesh 启用时可用）。
-    let (tasks_total, tasks_running, tasks_pending, tasks_succeeded, tasks_failed,
-         tasks_declined, tasks_cancelled, scheduled_nodes, node_quota) =
-        match &state.mesh {
-            Some(mesh) => {
-                let table = mesh.table.lock().unwrap();
-                let total = table.len() as u64;
-                let mut running = 0u64;
-                let mut pending = 0u64;
-                let mut succeeded = 0u64;
-                let mut failed = 0u64;
-                let mut declined = 0u64;
-                let mut cancelled = 0u64;
-                for rec in table.values() {
-                    match rec.state {
-                        TaskState::Running => running += 1,
-                        TaskState::Pending => pending += 1,
-                        TaskState::Succeeded => succeeded += 1,
-                        TaskState::Failed => failed += 1,
-                        TaskState::Declined => declined += 1,
-                        TaskState::Cancelled => cancelled += 1,
-                        _ => {}
-                    }
+    let (
+        tasks_total,
+        tasks_running,
+        tasks_pending,
+        tasks_succeeded,
+        tasks_failed,
+        tasks_declined,
+        tasks_cancelled,
+        scheduled_nodes,
+        node_quota,
+    ) = match &state.mesh {
+        Some(mesh) => {
+            let table = mesh.table.lock().unwrap();
+            let total = table.len() as u64;
+            let mut running = 0u64;
+            let mut pending = 0u64;
+            let mut succeeded = 0u64;
+            let mut failed = 0u64;
+            let mut declined = 0u64;
+            let mut cancelled = 0u64;
+            for rec in table.values() {
+                match rec.state {
+                    TaskState::Running => running += 1,
+                    TaskState::Pending => pending += 1,
+                    TaskState::Succeeded => succeeded += 1,
+                    TaskState::Failed => failed += 1,
+                    TaskState::Declined => declined += 1,
+                    TaskState::Cancelled => cancelled += 1,
+                    _ => {}
                 }
-                drop(table);
-                let scheduled_nodes = mesh.scheduled_nodes.lock().unwrap().len() as u64;
-                let node_quota = mesh.license.node_quota as u64;
-                (total, running, pending, succeeded, failed, declined, cancelled,
-                 scheduled_nodes, node_quota)
             }
-            None => (0, 0, 0, 0, 0, 0, 0, 0, 0),
-        };
+            drop(table);
+            let scheduled_nodes = mesh.scheduled_nodes.lock().unwrap().len() as u64;
+            let node_quota = mesh.license.node_quota as u64;
+            (
+                total,
+                running,
+                pending,
+                succeeded,
+                failed,
+                declined,
+                cancelled,
+                scheduled_nodes,
+                node_quota,
+            )
+        }
+        None => (0, 0, 0, 0, 0, 0, 0, 0, 0),
+    };
 
     let mut out = String::new();
 
     // ---- 路由层指标 ----
     out.push_str("# HELP agentlink_peers_online Number of online mesh peers.\n");
     out.push_str("# TYPE agentlink_peers_online gauge\n");
-    out.push_str(&format!("agentlink_peers_online {}\n", router_m.peers_online));
+    out.push_str(&format!(
+        "agentlink_peers_online {}\n",
+        router_m.peers_online
+    ));
 
     out.push_str("# HELP agentlink_pending_acks Number of messages waiting for ACK.\n");
     out.push_str("# TYPE agentlink_pending_acks gauge\n");
-    out.push_str(&format!("agentlink_pending_acks {}\n", router_m.pending_acks));
+    out.push_str(&format!(
+        "agentlink_pending_acks {}\n",
+        router_m.pending_acks
+    ));
 
     out.push_str("# HELP agentlink_offline_queue_len Number of messages in offline queues.\n");
     out.push_str("# TYPE agentlink_offline_queue_len gauge\n");
-    out.push_str(&format!("agentlink_offline_queue_len {}\n", router_m.offline_queue_len));
+    out.push_str(&format!(
+        "agentlink_offline_queue_len {}\n",
+        router_m.offline_queue_len
+    ));
 
     out.push_str("# HELP agentlink_local_pending_count Number of locally pending messages.\n");
     out.push_str("# TYPE agentlink_local_pending_count gauge\n");
-    out.push_str(&format!("agentlink_local_pending_count {}\n", router_m.local_pending_count));
+    out.push_str(&format!(
+        "agentlink_local_pending_count {}\n",
+        router_m.local_pending_count
+    ));
 
     out.push_str("# HELP agentlink_inbox_len Number of messages in local inbox.\n");
     out.push_str("# TYPE agentlink_inbox_len gauge\n");
@@ -554,7 +584,30 @@ async fn metrics_get(
 
     out.push_str("# HELP agentlink_blocked_count Total number of lockdown-blocked frames.\n");
     out.push_str("# TYPE agentlink_blocked_count counter\n");
-    out.push_str(&format!("agentlink_blocked_count {}\n", router_m.blocked_count));
+    out.push_str(&format!(
+        "agentlink_blocked_count {}\n",
+        router_m.blocked_count
+    ));
+
+    // ---- Lease 差异上报（v0.6 P1）：仅 online 且对端发过 Full Status 的节点
+    //      产出 series；未启用 lease 的集群零新增 series（导出形态不变）。
+    let peers_snapshot = state.peers.snapshot();
+    let with_load: Vec<(&str, u32)> = peers_snapshot
+        .iter()
+        .filter(|p| p.online)
+        .filter_map(|p| p.load.as_ref().map(|l| (p.node_id.as_str(), l.cpu)))
+        .collect();
+    if !with_load.is_empty() {
+        out.push_str(
+            "# HELP agentlink_peer_cpu_percent Peer CPU utilization (lease full status).\n",
+        );
+        out.push_str("# TYPE agentlink_peer_cpu_percent gauge\n");
+        for (node, cpu) in &with_load {
+            out.push_str(&format!(
+                "agentlink_peer_cpu_percent{{node=\"{node}\"}} {cpu}\n"
+            ));
+        }
+    }
 
     // ---- Mesh/引擎层任务指标 ----
     out.push_str("# HELP agentlink_tasks_total Total number of tasks in engine table.\n");
@@ -585,7 +638,9 @@ async fn metrics_get(
     out.push_str("# TYPE agentlink_tasks_cancelled gauge\n");
     out.push_str(&format!("agentlink_tasks_cancelled {}\n", tasks_cancelled));
 
-    out.push_str("# HELP agentlink_scheduled_nodes Number of nodes scheduled by Mesh (quota used).\n");
+    out.push_str(
+        "# HELP agentlink_scheduled_nodes Number of nodes scheduled by Mesh (quota used).\n",
+    );
     out.push_str("# TYPE agentlink_scheduled_nodes gauge\n");
     out.push_str(&format!("agentlink_scheduled_nodes {}\n", scheduled_nodes));
 

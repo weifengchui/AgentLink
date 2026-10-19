@@ -254,6 +254,32 @@ impl Envelope {
         }
     }
 
+    /// Lease 心跳/Full Status 帧（v0.6 P1）：`Some(cpu)` = Full Status（payload
+    /// 带 cpu 0..=100），`None` = 裸心跳（payload 空）。加性 ctrl 帧——旧节点
+    /// 按「未知 ctrl 帧」直接忽略（conn 底部分支），零破坏。
+    pub fn lease(node_id: &str, cpu: Option<u32>) -> Self {
+        Envelope {
+            v: PROTOCOL_VERSION,
+            msg_id: new_id(),
+            from: node_id.to_string(),
+            to: "*".to_string(),
+            from_agent: None,
+            to_agent: None,
+            kind: "ctrl".to_string(),
+            action: "lease".to_string(),
+            payload: match cpu {
+                Some(c) => serde_json::json!({ "cpu": c }),
+                None => serde_json::Value::Null,
+            },
+            ts: now_rfc3339(),
+            reply_to: None,
+            thread: None,
+            trace_id: None,
+            ttl_seconds: None,
+            sig: None,
+        }
+    }
+
     /// Build a business envelope with a fresh `msg_id` and timestamp.
     #[allow(clippy::too_many_arguments)]
     pub fn business(

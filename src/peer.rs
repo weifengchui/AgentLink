@@ -22,6 +22,18 @@ pub struct PeerInfo {
     pub last_seen: Instant,
     /// `in` or `out`: who dialled.
     pub direction: String,
+    /// 节点负载（v0.6 P1 Lease 差异上报）。`None` = 对端未启用 lease 或尚未
+    /// 发过 Full Status —— 该字段是纯加性观察位，缺省不存在于任何帧里。
+    pub load: Option<PeerLoad>,
+}
+
+/// 节点负载快照（v0.6 P1 Lease）。`cpu` 为 0..=100 的整数利用率；
+/// 采样不可用时对端只发裸心跳（本字段保持 `None`）。
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerLoad {
+    pub cpu: u32,
+    /// 负载采样时刻（RFC3339，对端侧时钟）。
+    pub ts: String,
 }
 
 /// Serializable view returned by `/v1/peers`.
@@ -35,6 +47,10 @@ pub struct PeerView {
     pub online: bool,
     pub last_seen_seconds_ago: u64,
     pub direction: String,
+    /// 纯加性：缺省 `None` 且**跳过序列化**——默认态 `/v1/peers` JSON 与
+    /// 0.5.9 逐字节一致（零行为变化门）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load: Option<PeerLoad>,
 }
 
 /// A peer learned from discovery, forwarded to the connection manager.
@@ -127,6 +143,7 @@ impl PeerTable {
                         online: false,
                         last_seen: Instant::now(),
                         direction: String::new(),
+                        load: None,
                     },
                 );
                 true
@@ -158,6 +175,7 @@ impl PeerTable {
             online: false,
             last_seen: Instant::now(),
             direction: direction.to_string(),
+            load: None,
         });
         entry.name = name.to_string();
         entry.direction = direction.to_string();
@@ -175,6 +193,21 @@ impl PeerTable {
         let mut map = self.inner.write().unwrap();
         if let Some(p) = map.get_mut(node_id) {
             p.last_seen = Instant::now();
+        }
+    }
+
+    /// Record the peer's latest load snapshot (v0.6 P1 lease Full Status).
+    /// Receiving any lease frame (bare or full) also refreshes `last_seen`.
+    pub fn set_load(&self, node_id: &str, cpu: Option<u32>, ts: &str) {
+        let mut map = self.inner.write().unwrap();
+        if let Some(p) = map.get_mut(node_id) {
+            p.last_seen = Instant::now();
+            if let Some(cpu) = cpu {
+                p.load = Some(PeerLoad {
+                    cpu,
+                    ts: ts.to_string(),
+                });
+            }
         }
     }
 
@@ -208,9 +241,37 @@ impl PeerTable {
                 online: p.online,
                 last_seen_seconds_ago: p.last_seen.elapsed().as_secs(),
                 direction: p.direction.clone(),
+                load: p.load.clone(),
             })
             .collect();
         views.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         views
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v0.6 P1 Lease：`load` 为纯加性字段，`None` 时 /v1/peers JSON 里
+    /// **不存在** key —— 默认态（lease 关闭、对端未发 Full）逐字节与旧版一致。
+    #[test]
+    fn peer_view_load_is_additive() {
+        let table = PeerTable::new();
+        table.mark_online("node-b", "peer-b", "127.0.0.1:9000", "out");
+        let view = table.snapshot().remove(0);
+        let v = serde_json::to_value(&view).unwrap();
+        assert!(v.get("load").is_none(), "default view must omit load: {v}");
+
+        // Full Status 登记 → 视图带 cpu；裸心跳（cpu=None）保持既有值不覆盖。
+        table.set_load("node-b", Some(37), "2026-10-19T12:00:00+08:00");
+        let view = table.snapshot().remove(0);
+        let v = serde_json::to_value(&view).unwrap();
+        assert_eq!(v["load"]["cpu"], 37);
+        assert_eq!(v["load"]["ts"], "2026-10-19T12:00:00+08:00");
+
+        table.set_load("node-b", None, "");
+        let v = serde_json::to_value(&table.snapshot().remove(0)).unwrap();
+        assert_eq!(v["load"]["cpu"], 37, "bare lease must not clear load");
     }
 }

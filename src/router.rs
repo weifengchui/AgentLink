@@ -1937,7 +1937,11 @@ impl Router {
         RouterMetrics {
             peers_online: self.registry.len(),
             pending_acks: self.pending.lock().unwrap().len(),
-            offline_queue_len: self.offline.try_lock().map(|m| m.values().map(|q| q.len()).sum()).unwrap_or(0),
+            offline_queue_len: self
+                .offline
+                .try_lock()
+                .map(|m| m.values().map(|q| q.len()).sum())
+                .unwrap_or(0),
             local_pending_count: self.local_pending.lock().unwrap().len(),
             inbox_len: self.inbox.try_lock().map(|i| i.len()).unwrap_or(0),
             blocked_count: self.blocked_count(),
@@ -2101,6 +2105,20 @@ impl Router {
             return;
         };
         let Ok(text) = serde_json::to_string(&env) else {
+            return;
+        };
+        for sink in self.registry.all() {
+            let text = text.clone();
+            tokio::spawn(async move {
+                let _ = sink.tx.send(Frame::Text(text)).await;
+            });
+        }
+    }
+
+    /// Broadcast a raw envelope to every connected peer (fire-and-forget).
+    /// Used by internal control-plane cycles (v0.6 P1 lease 差异上报).
+    pub fn broadcast_envelope(&self, env: &Envelope) {
+        let Ok(text) = serde_json::to_string(env) else {
             return;
         };
         for sink in self.registry.all() {

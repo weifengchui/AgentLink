@@ -60,6 +60,52 @@ pub struct Config {
     /// mTLS 配置（v0.6 P1）。LAN 默认关闭，一键开启后节点间连接使用双向 TLS。
     #[serde(default)]
     pub mtls: MtlsConfig,
+    /// Lease 心跳与阈值差异上报（v0.6 P1）。缺省关闭：零新增流量。
+    /// 开启后节点按 `interval_secs` 采样本机 CPU，变化超过
+    /// `cpu_threshold_pct`（±5%）才发 Full Status 帧（`ctrl/lease`），
+    /// 其余沿用既有会话心跳（10~30 台阶段替代 UDP 广播风暴）。
+    #[serde(default)]
+    pub lease: LeaseConfig,
+}
+
+/// Lease 差异上报参数（v0.6 P1）。缺省 `enabled=false`——零流量、零行为变化。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 采样与差异判定周期（秒）。
+    #[serde(default = "default_lease_interval_secs")]
+    pub interval_secs: u64,
+    /// CPU 变化阈值（百分比点数；设计案 §5.1 的「±5% 才发 Full Status」）。
+    #[serde(default = "default_lease_cpu_threshold")]
+    pub cpu_threshold_pct: u32,
+    /// 两次 Full Status 之间，裸 lease 心跳帧（无负载字段）的最大间隔（秒）。
+    /// 0 = 只在阈值跨越时发帧（活性完全沿用既有会话心跳）。
+    #[serde(default = "default_lease_bare_secs")]
+    pub bare_beat_secs: u64,
+}
+
+impl Default for LeaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_lease_interval_secs(),
+            cpu_threshold_pct: default_lease_cpu_threshold(),
+            bare_beat_secs: default_lease_bare_secs(),
+        }
+    }
+}
+
+fn default_lease_interval_secs() -> u64 {
+    10
+}
+
+fn default_lease_cpu_threshold() -> u32 {
+    5
+}
+
+fn default_lease_bare_secs() -> u64 {
+    60
 }
 
 /// Mesh 总开关与 license/引擎调参入口。缺省即免费层：引擎不 spawn、
@@ -700,6 +746,7 @@ impl Config {
             history: HistoryConfig::default(),
             redact: RedactConfig::default(),
             web: WebConfig::default(),
+            lease: LeaseConfig::default(),
             discovery: DiscoveryConfig {
                 enabled: true,
                 methods: default_discovery_methods(),
@@ -940,6 +987,27 @@ mod tests {
         let placeholder: AdmissionConfig =
             serde_json::from_str(r#"{"enabled":true,"bootstrap_token":"change-me"}"#).unwrap();
         assert!(!placeholder.boot_token_configured());
+    }
+
+    /// Lease 段（v0.6 P1）：缺省关闭（零流量零行为变化），参数 sane 默认。
+    #[test]
+    fn lease_section_defaults_and_partial_fields() {
+        let absent: Config = serde_json::from_str(r#"{"node_id":"n","name":"h"}"#).unwrap();
+        assert!(!absent.lease.enabled);
+        assert_eq!(absent.lease.interval_secs, 10);
+        assert_eq!(absent.lease.cpu_threshold_pct, 5);
+        assert_eq!(absent.lease.bare_beat_secs, 60);
+
+        // 显式部分字段 + 覆盖缺省（bare_beat_secs=0 = 禁用裸心跳）。
+        let partial: Config = serde_json::from_str(
+            r#"{"node_id":"n","name":"h","lease":{"enabled":true,
+                "interval_secs":5,"cpu_threshold_pct":3,"bare_beat_secs":0}}"#,
+        )
+        .unwrap();
+        assert!(partial.lease.enabled);
+        assert_eq!(partial.lease.interval_secs, 5);
+        assert_eq!(partial.lease.cpu_threshold_pct, 3);
+        assert_eq!(partial.lease.bare_beat_secs, 0);
     }
 
     /// mTLS 段缺省/部分字段：默认关闭，逐项回落到默认值。

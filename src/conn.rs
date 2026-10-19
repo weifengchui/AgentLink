@@ -433,6 +433,15 @@ async fn handle_text(
             if let Some(env) = state.router.agents_update_envelope(&hello.node_id) {
                 let _ = send_text(send, &env).await;
             }
+            // v0.6 P1 Lease：新对端注册后补推一次当前负载快照——lease 任务的
+            // 每 ticker 首拍常发生在对端注册之前（阈值内静默期不再重发），
+            // 若不补推，新入网节点要等下一次阈值跨越才可见负载。
+            if cfg.lease.enabled {
+                if let Some(cpu) = state.lease.advertised_cpu() {
+                    let env = Envelope::lease(&cfg.node_id, Some(cpu));
+                    let _ = send_text(send, &env).await;
+                }
+            }
             // v0.6 P1 CA 自动分发：经已认证（strict）链路，把集群 CA 推给
             // 「已开 mTLS 但指纹不符/缺失」的对端（同一信任域内传播/引导）。
             if strict && cfg.mtls.ca_sync {
@@ -514,6 +523,23 @@ async fn handle_text(
             if let Some(pid) = peer_id {
                 state.peers.touch(pid);
             }
+            true
+        }
+
+        "lease" => {
+            // v0.6 P1 Lease 差异上报：full（带 cpu）/裸心跳（只刷活性）。
+            // 必须先通过 hello 握手（peer_id 已知），裸帧不创建台账条目。
+            let Some(pid) = peer_id else { return true };
+            let cpu = value
+                .get("payload")
+                .and_then(|p| p.get("cpu"))
+                .and_then(|c| c.as_u64());
+            if cpu.unwrap_or(0) > 100 {
+                tracing::debug!(from = %pid, "conn: lease cpu out of range; ignored");
+                return true;
+            }
+            let ts = value.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+            state.peers.set_load(pid, cpu.map(|c| c as u32), ts);
             true
         }
 
