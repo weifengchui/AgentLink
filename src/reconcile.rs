@@ -39,6 +39,110 @@ pub struct EngineParams {
     pub drift_alert_only: bool,
 }
 
+// ---- 内部任务声明入口（v0.6 P1 GitOps 与 HTTP `/v1/tasks` 共用） -------------
+
+/// `apply_task_spec` 的失败分类。HTTP 层映射为 400/409/500；GitOps 层映射为
+/// 日志警告（文件下一拍重试，journal/序列化失败同样可重试）。
+#[derive(Debug)]
+pub enum ApplyFail {
+    NotObject,
+    MissingTaskId,
+    MissingType,
+    /// 同 task_id 已存在且**非终态**（当前 state 字符串随行）。
+    Conflicting(String),
+    /// seq 幂等键重复（终态行重投才会出现）。
+    DuplicateSeq,
+    /// 其余引擎拒收原因（协议/topic 非法等）。
+    InvalidSpec(taskengine::IgnoreReason),
+    /// journal 落盘失败（内存表已回滚）。
+    Journal(String),
+    /// 行序列化失败（防御分支）。
+    SerializeRow,
+}
+
+/// 声明式创建任务（设计 §2.2；HTTP `/v1/tasks` 与 GitOps 目录扫描共用，
+/// 语义 = tasks_post 的内核部分：必填门 → 非终态 409 → apply_event →
+/// journal up → 节流快照；成功返回落表后的 state 字符串）。
+///
+/// 锁顺序与 tasks_post 一致：table → store，临界区内不跨 .await。
+pub fn apply_task_spec(mesh: &MeshRuntime, body: &serde_json::Value) -> Result<String, ApplyFail> {
+    let Some(spec) = body.as_object() else {
+        return Err(ApplyFail::NotObject);
+    };
+    let task_id = match spec.get("task_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.trim().is_empty() => id.to_string(),
+        _ => return Err(ApplyFail::MissingTaskId),
+    };
+    match spec.get("type").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => {}
+        _ => return Err(ApplyFail::MissingType),
+    }
+    // taskengine::apply_event 的取体口径是 frame["payload"]（信封形）——
+    // spec 体内缺 topic 时补定 "task_spec"（不覆盖已有 topic，非法 topic 走
+    // Ignored→拒收），其余字段原样入库（rec.spec 原文）。
+    let mut spec = body.clone();
+    if let Some(map) = spec.as_object_mut() {
+        map.entry("topic".to_string())
+            .or_insert_with(|| serde_json::json!("task_spec"));
+    }
+    let frame = serde_json::json!({ "topic": "task_spec", "payload": spec });
+
+    let mut table = mesh.table.lock().unwrap();
+    if let Some(rec) = table.get(&task_id) {
+        if !rec.state.is_terminal() {
+            return Err(ApplyFail::Conflicting(rec.state.as_str().to_string()));
+        }
+    }
+    let prev = table.get(&task_id).cloned();
+    if let taskengine::ApplyOutcome::Ignored { reason } =
+        taskengine::apply_event(&mut table, &frame)
+    {
+        // Ignored 承诺表零改动（MissingTaskId/NonTaskTopic/DuplicateSeq 都在
+        // 建行之前返回），无需回滚。
+        return Err(match reason {
+            taskengine::IgnoreReason::DuplicateSeq => ApplyFail::DuplicateSeq,
+            other => ApplyFail::InvalidSpec(other),
+        });
+    }
+    let rec_json = match table.get(&task_id).map(serde_json::to_value) {
+        Some(Ok(v)) => v,
+        // 防御：apply 后行必在；序列化理论恒成，真出事也不留幻影行。
+        _ => {
+            rollback_row(&mut table, &task_id, prev);
+            return Err(ApplyFail::SerializeRow);
+        }
+    };
+    let ev = TaskEvent::up(&task_id, mesh.next_rev(), rec_json);
+    if let Err(e) = mesh.store.append(&ev) {
+        rollback_row(&mut table, &task_id, prev);
+        return Err(ApplyFail::Journal(e.to_string()));
+    }
+    let final_state = table
+        .get(&task_id)
+        .map(|r| r.state.as_str().to_string())
+        .unwrap_or_else(|| "pending".to_string());
+    drop(table);
+    mesh.maybe_snapshot();
+    Ok(final_state)
+}
+
+/// journal 落盘失败时把内存表回滚到 apply 前状态（表赢于日志的前提是
+/// 日志绝不比表新；幻影行重启即蒸发，宁可当场拒绝写入）。
+pub(crate) fn rollback_row(
+    table: &mut taskengine::TaskTable,
+    task_id: &str,
+    prev: Option<taskengine::TaskRecord>,
+) {
+    match prev {
+        Some(rec) => {
+            table.insert(task_id.to_string(), rec);
+        }
+        None => {
+            table.remove(task_id);
+        }
+    }
+}
+
 impl From<&EngineConfig> for EngineParams {
     fn from(c: &EngineConfig) -> Self {
         Self {
@@ -592,8 +696,13 @@ impl Engine {
     /// P3-3：记录 correlation 批次的任务终态，用于更新护栏状态。
     /// 由 consume_event 中状态变更为 terminal 时调用（见 tick/consume_event 后续接线）。
     pub fn on_task_terminal(&self, task_id: &str, state: TaskState) {
-        let Some(spec) = self.spec_of(task_id) else { return };
-        let correlation = spec.get("correlation").and_then(|v| v.as_str()).map(|c| c.to_string());
+        let Some(spec) = self.spec_of(task_id) else {
+            return;
+        };
+        let correlation = spec
+            .get("correlation")
+            .and_then(|v| v.as_str())
+            .map(|c| c.to_string());
 
         // P0 出站 webhook：任务失败/超期时通知外部（不依赖 correlation）
         if matches!(state, TaskState::Failed | TaskState::Expired) {
@@ -620,7 +729,9 @@ impl Engine {
         }
 
         // 批次护栏：只有有 correlation 时才参与批次状态机
-        let Some(correlation) = correlation else { return };
+        let Some(correlation) = correlation else {
+            return;
+        };
         let mut batch = self.batch_state.lock().unwrap();
         let st = batch.entry(correlation.clone()).or_default();
 
@@ -698,6 +809,8 @@ mod tests {
             tags: vec![],
             history: Default::default(),
             redact: Default::default(),
+            lease: Default::default(),
+            gitops: Default::default(),
             web: Default::default(),
             discovery: Default::default(),
             security: Default::default(),

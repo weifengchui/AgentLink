@@ -35,7 +35,7 @@
 - Lease 心跳 + 阈值差异上报（CPU±5% 才发 Full Status）【§5.1】——已交付（2026-10-19，`docs/lease差异上报-验证-2026-10-19.md`：`ctrl/lease` 加性帧 + 首拍/阈值跨越发 Full + 裸心跳节流 + hello 补推；缺省关零流量）
 - 出站 webhook（OnTaskFailed/OnNodeOffline/OnAuditAlert），wake-kit 收敛为标准实现【§8.2】
 - Prometheus `/metrics`（queue_depth、task_duration、node_utilization）【§7.1】
-- GitOps：watch 仓库 tasks/ 目录自动 apply【§8.3】
+- GitOps：watch 仓库 tasks/ 目录自动 apply【§8.3】——已交付（2026-10-19，`docs/gitops目录驱动-验证-2026-10-19.md`：sha256 差分轮询 + 与 POST /v1/tasks 同一内核口径 `reconcile::apply_task_spec`；缺省关、mesh 缺席自拒）
 - 预热池形式化：常驻桥 = agent warmpool，任务到达即注上下文，冷启动 <200ms【§5.3】
 - 熔断隔离：异常节点自动置 unschedulable 标签【§4.5 taint 等价物】
 - CLI 完全体：--dry-run、补全、`top nodes` 色标【§3.3】

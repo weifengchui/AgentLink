@@ -66,6 +66,37 @@ pub struct Config {
     /// 其余沿用既有会话心跳（10~30 台阶段替代 UDP 广播风暴）。
     #[serde(default)]
     pub lease: LeaseConfig,
+    /// GitOps 目录驱动（v0.6 P1）：watch 仓库 tasks/ 目录自动 apply。
+    /// 缺省关闭（段可缺省）；`mesh.enabled` 未开时即便 enabled 也只告警不 spawn。
+    #[serde(default)]
+    pub gitops: GitopsConfig,
+}
+
+/// GitOps 目录驱动参数（v0.6 P1）。缺省 `enabled=false`——完全惰性。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitopsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 仓库内任务目录（典型 `tasks/`）。扫描根层 + 一层子目录的 `*.json`。
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// 轮询周期（秒）。实现不引入 fs-watch 依赖：内容 sha256 差分轮询。
+    #[serde(default = "default_gitops_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_gitops_interval_secs() -> u64 {
+    15
+}
+
+impl Default for GitopsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: None,
+            interval_secs: default_gitops_interval_secs(),
+        }
+    }
 }
 
 /// Lease 差异上报参数（v0.6 P1）。缺省 `enabled=false`——零流量、零行为变化。
@@ -747,6 +778,7 @@ impl Config {
             redact: RedactConfig::default(),
             web: WebConfig::default(),
             lease: LeaseConfig::default(),
+            gitops: GitopsConfig::default(),
             discovery: DiscoveryConfig {
                 enabled: true,
                 methods: default_discovery_methods(),

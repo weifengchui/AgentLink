@@ -10,6 +10,7 @@ mod config;
 mod conn;
 mod discovery;
 mod file;
+mod gitops;
 mod lease;
 mod license;
 mod load;
@@ -873,6 +874,10 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
     // v0.6 P1 Lease 差异上报：enabled 才 spawn（缺省 false = 零流量、零行为变化）。
     if cfg.lease.enabled {
         lease::spawn(state.clone(), shutdown_rx.clone());
+    }
+    // v0.6 P1 GitOps 目录驱动：enabled 才 spawn（mesh 未启用时 spawn 内自拒）。
+    if cfg.gitops.enabled {
+        gitops::spawn(state.clone(), shutdown_rx.clone());
     }
 
     let discovery = if cfg.discovery.enabled {

@@ -32,6 +32,7 @@ use crate::file::FileManager;
 use crate::license::{self, LicenseInfo};
 use crate::peer::{DiscoveredPeer, PeerTable};
 use crate::proto::{constant_time_eq, Envelope};
+use crate::reconcile;
 use crate::router::Router;
 use crate::taskengine::{self, TaskRecord, TaskState, TaskTable};
 use crate::taskstore::{TaskEvent, TaskStore};
@@ -1449,7 +1450,7 @@ async fn tasks_get(
 /// `POST /v1/tasks` 声明式创建（设计 §2.2）：body=task_spec 协议 §2 原文。
 /// 校验 task_id+type 必填 → 400；同 task_id 非终态重复声明 → 409；
 /// 有效则 apply_event 进表（pending）+ journal up 落盘 + 节流快照，202。
-/// M1 不派发（引擎休眠，注释见上方接线点清单）。
+/// 内核语义在 [`reconcile::apply_task_spec`]（v0.6 P1 与 GitOps 目录扫描共用）。
 async fn tasks_post(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -1461,120 +1462,67 @@ async fn tasks_post(
     if !role.allows("/v1/tasks") {
         return forbidden();
     }
-    let Some(mesh) = state.mesh.as_ref().cloned() else {
-        return mesh_required();
+    let mesh = match state.mesh.as_ref() {
+        Some(m) => m.clone(),
+        None => return mesh_required(),
     };
     // 协议 §2 必填门：task_id / type 为非空字符串。其余字段（requires、
     // deadline、payload、budget、priority、correlation…）原样透传——
     // 引擎表存原文，不做 schema 白名单（前向兼容，对齐 taskstore 透传口径）。
-    let Some(spec) = body.as_object() else {
-        return bad_request("task_spec 必须是 JSON 对象");
-    };
-    let task_id = match spec.get("task_id").and_then(|v| v.as_str()) {
-        Some(id) if !id.trim().is_empty() => id.to_string(),
-        _ => return bad_request("task_spec 缺必填字段 task_id"),
-    };
-    match spec.get("type").and_then(|v| v.as_str()) {
-        Some(t) if !t.is_empty() => {}
-        _ => return bad_request("task_spec 缺必填字段 type"),
-    }
-    // taskengine::apply_event 的取体口径是 frame["payload"]（信封形）——
-    // 协议 §2 的 spec 体内本身带名为 payload 的任务载荷字段，裸传会被误认
-    // 为信封，故必须包一层：外帧 payload=spec 原文；spec 体内缺 topic 时补
-    // 定 "task_spec"（apply_event 从 payload 里读 topic；已有 topic 一律不
-    // 覆盖，非法 topic 走 Ignored→400），其余字段原样入库（rec.spec 原文）。
-    let mut spec = body.clone();
-    if let Some(map) = spec.as_object_mut() {
-        map.entry("topic".to_string())
-            .or_insert_with(|| json!("task_spec"));
-    }
-    let frame = json!({ "topic": "task_spec", "payload": spec });
-
-    let mut table = mesh.table.lock().unwrap();
-    if let Some(rec) = table.get(&task_id) {
-        // 同 task_id **非终态**重复声明 → 409（设计 §2.2"未清扫 → 409"）。
-        // 终态行允许重投：apply_event 对硬终态粘性、failed 行 spec 首见
-        // 定版不覆盖——等于幂等读回当前行，不产生双行；要重建请先 DELETE。
-        if !rec.state.is_terminal() {
-            let st = rec.state.as_str();
-            return (
+    let task_id = body
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    match reconcile::apply_task_spec(&mesh, &body) {
+        Ok(state_str) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "ok": true, "task_id": task_id, "state": state_str })),
+        ),
+        Err(reconcile::ApplyFail::NotObject) => bad_request("task_spec 必须是 JSON 对象"),
+        Err(reconcile::ApplyFail::MissingTaskId) => bad_request("task_spec 缺必填字段 task_id"),
+        Err(reconcile::ApplyFail::MissingType) => bad_request("task_spec 缺必填字段 type"),
+        Err(reconcile::ApplyFail::Conflicting(st)) => {
+            // 同 task_id 非终态重复声明 → 409（设计 §2.2"未清扫 → 409"）。
+            // 终态行允许重投：等于幂等读回当前行；要重建请先 DELETE。
+            (
                 StatusCode::CONFLICT,
                 Json(json!({
                     "error": format!("task {task_id} 已存在（state: {st}），非终态禁止重复声明"),
                     "task_id": task_id,
                     "state": st,
                 })),
-            );
+            )
         }
-    }
-    let prev = table.get(&task_id).cloned();
-    if let taskengine::ApplyOutcome::Ignored { reason } =
-        taskengine::apply_event(&mut table, &frame)
-    {
-        // Ignored 承诺表零改动（MissingTaskId/NonTaskTopic/DuplicateSeq 都在
-        // 建行之前返回），无需回滚；映射到客户端可读的错误。
-        tracing::warn!(task_id = %task_id, ?reason, "mesh: task_spec 被引擎拒收");
-        return match reason {
-            taskengine::IgnoreReason::DuplicateSeq => (
-                StatusCode::CONFLICT,
-                Json(
-                    json!({ "error": format!("task {task_id} seq 幂等键重复"), "task_id": task_id }),
-                ),
-            ),
-            other => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("task_spec 非法（{other:?}）：需 task_id 与任务面 topic"),
-                    "task_id": task_id,
-                })),
-            ),
-        };
-    }
-    let rec_json = match table.get(&task_id).map(serde_json::to_value) {
-        Some(Ok(v)) => v,
-        // 防御：apply 后行必在；序列化理论恒成，真出事也不留幻影行。
-        _ => {
-            rollback_row(&mut table, &task_id, prev);
+        Err(reconcile::ApplyFail::DuplicateSeq) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!("task {task_id} seq 幂等键重复"), "task_id": task_id })),
+        ),
+        Err(reconcile::ApplyFail::InvalidSpec(reason)) => {
+            tracing::warn!(task_id = %task_id, ?reason, "mesh: task_spec 被引擎拒收");
+            bad_request(&format!(
+                "task_spec 非法（{reason:?}）：需 task_id 与任务面 topic"
+            ))
+        }
+        Err(reconcile::ApplyFail::SerializeRow) => {
             tracing::error!(task_id = %task_id, "mesh: 任务行序列化失败");
-            return (
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "task record serialize failed" })),
-            );
+            )
         }
-    };
-    let ev = TaskEvent::up(&task_id, mesh.next_rev(), rec_json);
-    if let Err(e) = mesh.store.append(&ev) {
-        rollback_row(&mut table, &task_id, prev);
-        tracing::error!(error = %e, task_id = %task_id, "mesh: 任务 journal 落盘失败");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "task journal append failed" })),
-        );
+        Err(reconcile::ApplyFail::Journal(e)) => {
+            tracing::error!(error = %e, task_id = %task_id, "mesh: 任务 journal 落盘失败");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "task journal append failed" })),
+            )
+        }
     }
-    let final_state = table
-        .get(&task_id)
-        .map(|r| r.state.as_str().to_string())
-        .unwrap_or_else(|| "pending".to_string());
-    drop(table);
-    mesh.maybe_snapshot();
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({ "ok": true, "task_id": task_id, "state": final_state })),
-    )
 }
 
-/// journal 落盘失败时把内存表回滚到 apply 前状态（表赢于日志的前提是
-/// 日志绝不比表新；幻影行重启即蒸发，宁可当场拒绝写入）。
-fn rollback_row(table: &mut TaskTable, task_id: &str, prev: Option<TaskRecord>) {
-    match prev {
-        Some(rec) => {
-            table.insert(task_id.to_string(), rec);
-        }
-        None => {
-            table.remove(task_id);
-        }
-    }
-}
+// journal 落盘失败时的表回滚助手已移至 `reconcile::rollback_row`
+// （v0.6 P1 GitOps 与 HTTP 共用同一内核口径）。
 
 /// `GET /v1/tasks/{task_id}` 单任务详情（引擎表行，设计 §2.2）。
 /// M1 返回纯表行（spec 原文、未脱敏、字段 snake_case）；表+trail 合并
@@ -1665,7 +1613,7 @@ async fn tasks_cancel_post(
         .store
         .append(&TaskEvent::up(&task_id, mesh.next_rev(), rec_json))
     {
-        rollback_row(&mut table, &task_id, prev);
+        reconcile::rollback_row(&mut table, &task_id, prev);
         tracing::error!(error = %e, task_id = %task_id, "mesh: 撤销事件落盘失败");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
