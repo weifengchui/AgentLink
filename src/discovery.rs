@@ -111,6 +111,12 @@ fn handle_datagram(data: &[u8], src: SocketAddr, cfg: &Config, state: &SharedSta
     if msg.action == "bye" {
         state.peers.mark_offline(&msg.node_id);
         tracing::info!(peer = %msg.name, node_id = %msg.node_id, "discovery: peer announced bye");
+        // v0.6 P2 wake-kit 收敛：bye 不走 unregister_peer（registry 仍在
+        // 或从未入册），here 单独补 OnNodeOffline（reason=bye）。
+        state.router.notify(
+            "node_offline",
+            serde_json::json!({ "peer_id": msg.node_id, "reason": "bye" }),
+        );
         return;
     }
 

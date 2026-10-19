@@ -1,0 +1,7 @@
+{"scenario": "S1 agent_message 投递事实+HMAC 签名", "pass": true, "detail": {"hits": 1, "channel": "live", "payload": {"channel": "live", "content": "wake-kitted 定向件", "from": "wk1", "from_agent": "orch", "msg_id": "4d372d1ae9734d53a84f872190ddc45f", "reply_to": null, "to_agent": "wk-worker", "topic": "inbox-ok", "type": "text"}}}
+{"scenario": "S2 agent_message live 路径", "pass": true, "detail": {"channel": "live"}}
+{"scenario": "S3 audit_alert lockdown 开/关", "pass": true, "detail": {"on": 1, "off": 1}}
+{"scenario": "S4 task_failed(P0 兼容) + node_taint(熔断 webhook)", "pass": true, "detail": {"task_failed": 3, "node_taint": 1, "circuit_taints": 1}}
+{"scenario": "S5 node_offline 心跳超时捕获", "pass": true, "detail": {"reason": "unregistered"}}
+{"scenario": "S6 无 secret 兼容（事件照收且无签名头）", "pass": true, "detail": {"hits": 1}}
+{"scenario": "S7 HMAC 全验签无误报", "pass": true, "detail": {"errors": 0}}

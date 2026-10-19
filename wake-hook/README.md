@@ -1,5 +1,13 @@
 # 给新机器接入 AgentLink —— 极简四步
 
+> **v0.6 起（2026-10-19）：本目录的 wake_hook.py/wake.json 侧车进入「官方退役」状态。**
+> 内核已原生出站 webhook（`agentlink.json` 的 `webhook` 段：`url`/`events`/`secret`/
+> 重试策略），配 `events: agent_message` + `secret` 即获得与 wake-hook 完全同口径
+> 的 HMAC-SHA256 签名唤醒（`X-Hub-Signature-256`，事件含 to_agent/content/msg_id/
+> reply_to，外部端点自行按 agent 过滤），且**零 Python 依赖、对所有 agent 生效**
+> （侧车只装在特定 profile）。既有装好的侧车继续兼容工作；新机器建议直接用内核
+> webhook，见 `docs/webhook-wakekit收敛-验证-2026-10-19.md`。
+
 目标：让另一台机器接入网格，**收发消息 + 收到消息自动唤醒 AI + 看门狗兜底**。
 
 前提条件（唯一）：新机器装了 **WSL + Hermes Agent**。

@@ -389,10 +389,15 @@ pub struct WebhookConfig {
     /// 空字符串表示不启用 webhook。
     #[serde(default)]
     pub url: String,
-    /// 触发 webhook 的事件类型，逗号分隔（如 "task_failed,node_offline,audit_alert"）。
-    /// 空字符串表示不启用任何事件。
+    /// 触发 webhook 的事件类型，逗号分隔（如 "task_failed,node_offline,audit_alert,
+    /// agent_message,node_taint"）。空字符串表示不启用任何事件。
     #[serde(default)]
     pub events: String,
+    /// HMAC-SHA256 签名密钥（wake-hook 同口径）。非空时每个 webhook 请求带
+    /// `X-Hub-Signature-256: sha256=<hex>`（对 body 原文逐字节签名）；空 =
+    /// 不签名（向后兼容，行为与 v0.6 P0 一致）。
+    #[serde(default)]
+    pub secret: String,
     /// HTTP 请求超时（秒），缺省 5 秒。
     #[serde(default = "default_webhook_timeout_seconds")]
     pub timeout_seconds: u64,

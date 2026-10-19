@@ -952,6 +952,10 @@ pub struct Router {
     blocked_in: AtomicU64,
     /// 进程启动时刻——`__node__` hello 应答携带 uptime（v0.5 收官）。
     started: Instant,
+    /// v0.6 P2 wake-kit 收敛：出站 webhook 客户端（`node_offline` /
+    /// `audit_alert` / `agent_message` 等消息面事件由此送出；`cfg.webhook`
+    /// 与引擎共用同一配置，任务面事件仍由 reconcile::Engine 发出）。
+    webhook: Option<Arc<crate::api::WebhookClient>>,
 }
 
 /// 路由层 Prometheus 指标。
@@ -1067,6 +1071,7 @@ impl Router {
             blocked_out: AtomicU64::new(0),
             blocked_in: AtomicU64::new(0),
             started: Instant::now(),
+            webhook: crate::api::WebhookClient::new(&cfg.webhook).map(Arc::new),
         }
     }
 
@@ -1292,6 +1297,29 @@ impl Router {
         let _ = self.events.send(ev);
     }
 
+    /// v0.6 P2 wake-kit 收敛：对外共享的 webhook 客户端（引擎任务面事件
+    /// 与本节点消息面事件共用同一 client：同一 url/secret/retries 策略）。
+    pub fn webhook_client(&self) -> Option<Arc<crate::api::WebhookClient>> {
+        self.webhook.clone()
+    }
+
+    /// v0.6 P2 wake-kit 收敛：出站 webhook 派发帮手（事件名先过事件清单门，
+    /// 再 spawn 异步发送——永不阻塞消息路径、不在运行时外 panic）。
+    pub fn notify(&self, event: &str, payload: serde_json::Value) {
+        if let Some(wh) = &self.webhook {
+            if wh.should_fire(event) {
+                let wh = wh.clone();
+                let node_id = self.cfg.node_id.clone();
+                let event = event.to_string();
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    tokio::spawn(async move {
+                        wh.fire(event, node_id, payload).await;
+                    });
+                }
+            }
+        }
+    }
+
     pub fn unregister_peer(&self, node_id: &str) {
         let removed = self.registry.remove(node_id).is_some();
         // A node that left takes its agent list with it: drop the cached
@@ -1312,6 +1340,16 @@ impl Router {
             );
             let ev = Envelope::event(&self.cfg.node_id, "leave", node_id, node_id);
             let _ = self.events.send(ev);
+            // v0.6 P2 wake-kit 收敛：OnNodeOffline（覆盖 WS 断开/心跳超时/
+            // 发送失败/主动 forget 等所有 unregister 路径；bye 另在 discovery 侧补）。
+            self.notify(
+                "node_offline",
+                serde_json::json!({
+                    "peer_id": node_id,
+                    "agents_lost": cached.len(),
+                    "reason": "unregistered",
+                }),
+            );
         }
     }
 
@@ -1350,6 +1388,16 @@ impl Router {
                 } else {
                     "OFF — bus resumed (blocked frames are NOT replayed)"
                 }
+            );
+            // v0.6 P2 wake-kit 收敛：OnAuditAlert（lockdown 切换是最高级
+            // 审计事实——窗口期被拦帧只留审计标记，见上）。
+            self.notify(
+                "audit_alert",
+                serde_json::json!({
+                    "kind": "lockdown",
+                    "on": on,
+                    "blocked_total": self.blocked_count(),
+                }),
             );
         }
         on
@@ -1532,6 +1580,16 @@ impl Router {
     pub async fn handle_incoming(&self, env: &mut Envelope) -> bool {
         if !self.verify_incoming(env) {
             tracing::warn!(msg_id = %env.msg_id, from = %env.from, "router: incoming rejected (signature or timestamp)");
+            // v0.6 P2 wake-kit 收敛：OnAuditAlert（签名/时间戳拒绝 = 疑似
+            // 伪造或时钟漂移，值得外呼）。
+            self.notify(
+                "audit_alert",
+                serde_json::json!({
+                    "kind": "incoming_rejected",
+                    "msg_id": env.msg_id,
+                    "from": env.from,
+                }),
+            );
             let trace_id = crate::trace::dash(&env.trace_id);
             crate::trace::log_event(
                 tracing::Level::DEBUG,
@@ -1626,6 +1684,25 @@ impl Router {
 
     async fn deliver_local(&self, env: Envelope) {
         let trace_id = crate::trace::dash(&env.trace_id);
+        // v0.6 P2 wake-kit 收敛：定向业务帧（to_agent 非空、text/file）被
+        // 本节点接收即算「投递事实」——无论落离线 inbox 还是投给在册 WS
+        // 客户端，都发 `agent_message`（替代 wake_hook.py 侧车的内核标准实现;
+        // 广播/控制帧不唤醒，与 wake-kit `agent` 自回声过滤语义由外部端点
+        // 按 from_agent 自行过滤）。
+        let wake_payload = if env.to_agent.is_some() && (env.kind == "text" || env.kind == "file") {
+            Some(serde_json::json!({
+                "msg_id": env.msg_id,
+                "from": env.from,
+                "from_agent": env.from_agent,
+                "to_agent": env.to_agent,
+                "type": env.kind,
+                "topic": env.payload.get("topic").cloned().unwrap_or_default(),
+                "reply_to": env.reply_to,
+                "content": env.payload.get("content").cloned().unwrap_or(env.payload.clone()),
+            }))
+        } else {
+            None
+        };
         if self.events.receiver_count() == 0 {
             let mut inbox = self.inbox.lock().await;
             if inbox.len() >= INBOX_MAX {
@@ -1643,6 +1720,10 @@ impl Router {
                 Some(&env),
             );
             inbox.push_back(env);
+            if let Some(mut wp) = wake_payload {
+                wp["channel"] = serde_json::Value::String("inbox".into());
+                self.notify("agent_message", wp);
+            }
         } else {
             crate::trace::log_event(
                 tracing::Level::DEBUG,
@@ -1652,6 +1733,10 @@ impl Router {
                 Some(&env),
             );
             let _ = self.events.send(env);
+            if let Some(mut wp) = wake_payload {
+                wp["channel"] = serde_json::Value::String("live".into());
+                self.notify("agent_message", wp);
+            }
         }
     }
 

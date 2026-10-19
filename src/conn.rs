@@ -383,10 +383,28 @@ async fn handle_text(
             };
             if hello.v > PROTOCOL_VERSION {
                 tracing::warn!(peer_v = hello.v, "conn: unsupported peer protocol version");
+                state.router.notify(
+                    "audit_alert",
+                    serde_json::json!({
+                        "kind": "handshake_rejected",
+                        "reason": "protocol_version",
+                        "node_id": hello.node_id,
+                        "addr": remote_addr,
+                    }),
+                );
                 return false;
             }
             if strict && !hello.verify(&cfg.security.cluster_token) {
                 tracing::warn!(node_id = %hello.node_id, "conn: handshake rejected (bad cluster token)");
+                state.router.notify(
+                    "audit_alert",
+                    serde_json::json!({
+                        "kind": "handshake_rejected",
+                        "reason": "cluster_token",
+                        "node_id": hello.node_id,
+                        "addr": remote_addr,
+                    }),
+                );
                 return false;
             }
             // v0.6 P1 新节点准入：bootstrap token + 硬件指纹双验证。必须在
@@ -397,6 +415,15 @@ async fn handle_text(
                     addr = remote_addr,
                     reason = reason,
                     "conn: handshake rejected (admission)"
+                );
+                state.router.notify(
+                    "audit_alert",
+                    serde_json::json!({
+                        "kind": "handshake_rejected",
+                        "reason": "admission",
+                        "node_id": hello.node_id,
+                        "addr": remote_addr,
+                    }),
                 );
                 return false;
             }

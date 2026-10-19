@@ -716,6 +716,23 @@ impl WebhookClient {
             "ts": crate::store::now_wall(),
             "payload": payload,
         });
+        // body 原文逐字节签名（wake-hook 收敛口径：X-Hub-Signature-256，
+        // sha256=<hex>）。secret 空 = 不签名，帧内容与 P0 完全一致。
+        let bytes = serde_json::to_vec(&body).unwrap_or_default();
+        let signature = if self.config.secret.is_empty() {
+            None
+        } else {
+            use hmac::Mac;
+            let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(
+                self.config.secret.as_bytes(),
+            )
+            .expect("HMAC accepts any key length");
+            mac.update(&bytes);
+            Some(format!(
+                "sha256={}",
+                hex::encode(mac.finalize().into_bytes())
+            ))
+        };
         let client = self.http.clone();
         let url = self.config.url.clone();
         let max_retries = self.config.max_retries;
@@ -723,7 +740,14 @@ impl WebhookClient {
         tokio::spawn(async move {
             let mut last_err = None;
             for attempt in 0..=max_retries {
-                match client.post(&url).json(&body).send().await {
+                let mut req = client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .body(bytes.clone());
+                if let Some(sig) = &signature {
+                    req = req.header("X-Hub-Signature-256", sig);
+                }
+                match req.send().await {
                     Ok(resp) if resp.status().is_success() => return,
                     Ok(resp) => {
                         last_err = Some(format!("HTTP {}", resp.status()));

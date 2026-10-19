@@ -198,7 +198,9 @@ impl Engine {
             0, // max_inflight：0=不限制，M3 后续由配额/护栏决定
         );
         let local_tags = state.config.tags.clone();
-        let webhook = crate::api::WebhookClient::new(&state.config.webhook);
+        // v0.6 P2 wake-kit 收敛：复用 Router 上的同一 webhook 客户端
+        // （同 config 实例化两次只会重复打启动日志，无其他差异）。
+        let webhook = router.webhook_client();
         let node_id = state.config.node_id.clone();
         let circuit_cfg = state.config.mesh.engine.circuit.clone();
         let engine = Engine {
@@ -208,7 +210,7 @@ impl Engine {
             scheduler,
             batch_state: Arc::new(Mutex::new(HashMap::new())),
             local_tags,
-            webhook: webhook.map(Arc::new),
+            webhook,
             node_id,
             circuit_cfg,
         };
@@ -810,11 +812,38 @@ impl Engine {
                     cooldown_secs = secs,
                     "engine: 节点熔断——窗口内失败达阈值，已置 unschedulable（冷却后自动恢复）"
                 );
+                // v0.6 P2 wake-kit 收敛：OnNodeTaint（熔断包 deferred 的
+                // webhook 外呼——运维侧可据此把节点提出舰队或告警）。
+                self.notify_webhook(
+                    "node_taint",
+                    serde_json::json!({
+                        "node_id": culprit,
+                        "cooldown_secs": secs,
+                        "reason": "circuit_failure_threshold",
+                    }),
+                );
             }
             crate::circuit::FailureVerdict::Counted(n) => {
                 tracing::debug!(node = %culprit, failures = n, "engine: 熔断窗口计数+1");
             }
             _ => {}
+        }
+    }
+
+    /// v0.6 P2 wake-kit 收敛：引擎侧 webhook 派发帮手（同 router.notify 口径：
+    /// 事件清单门先行，运行时外不 panic；任务面 task_failed 仍走原 spawn 点）。
+    fn notify_webhook(&self, event: &str, payload: serde_json::Value) {
+        if let Some(wh) = &self.webhook {
+            if wh.should_fire(event) {
+                let wh = wh.clone();
+                let node_id = self.node_id.clone();
+                let event = event.to_string();
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    tokio::spawn(async move {
+                        wh.fire(event, node_id, payload).await;
+                    });
+                }
+            }
         }
     }
 
