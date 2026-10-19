@@ -283,6 +283,10 @@ pub struct MtlsConfig {
     /// 证书轮转间隔（秒），缺省 21600s（6h），提前于 ttl 过期前重新签发。
     #[serde(default = "default_mtls_rotate_interval")]
     pub cert_rotate_interval_seconds: u64,
+    /// 节点间 TLS 监听端口。缺省 = `listen_port + 1`（对等 WS 专用端口，
+    /// 本地 API/网页仍在 `listen_port` 上走明文 HTTP，二者互不影响）。
+    #[serde(default)]
+    pub listen_port: Option<u16>,
 }
 
 impl Default for MtlsConfig {
@@ -293,6 +297,7 @@ impl Default for MtlsConfig {
             ca_key: None,
             cert_ttl_days: default_mtls_cert_ttl_days(),
             cert_rotate_interval_seconds: default_mtls_rotate_interval(),
+            listen_port: None,
         }
     }
 }
@@ -697,6 +702,13 @@ impl Config {
         }
     }
 
+    /// 节点间 TLS 监听端口（mTLS 开启时使用）：显式配置优先，否则 `listen_port + 1`。
+    pub fn mtls_listen_port(&self) -> u16 {
+        self.mtls
+            .listen_port
+            .unwrap_or_else(|| self.listen_port.saturating_add(1))
+    }
+
     /// Persist configuration as pretty JSON.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
@@ -848,6 +860,14 @@ mod tests {
         assert!(!d.enabled);
         assert_eq!(d.cert_ttl_days, 1);
         assert_eq!(d.cert_rotate_interval_seconds, 21600);
+        assert_eq!(d.listen_port, None);
+
+        // 监听端口：缺省 = listen_port + 1；显式配置优先。
+        let mut c = Config::generate(None, None, None);
+        c.listen_port = 8765;
+        assert_eq!(c.mtls_listen_port(), 8766);
+        c.mtls.listen_port = Some(9000);
+        assert_eq!(c.mtls_listen_port(), 9000);
     }
 
     /// mesh 段只写一部分字段：逐项缺省值必须生效（含 mesh 有段但 engine 缺、

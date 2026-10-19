@@ -18,12 +18,16 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
@@ -198,6 +202,50 @@ impl MtlsManager {
         self.node_expiry_unix = expiry;
         Ok(())
     }
+
+    // ---- rustls 双向 TLS 配置（第二波：节点间传输） ----------------------------
+
+    /// 信任锚：仅本集群 CA（CA pinning，不用系统根）。
+    fn root_store(&self) -> Result<RootCertStore> {
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(self.ca_cert_der()?))
+            .context("failed to add cluster CA to root store")?;
+        Ok(roots)
+    }
+
+    /// 本机节点证书链（单证书，验签链由对端内置 CA 补全）。
+    fn cert_chain(&self) -> Result<Vec<CertificateDer<'static>>> {
+        Ok(vec![CertificateDer::from(self.node_cert_der()?)])
+    }
+
+    /// 本机节点私钥（PKCS#8 DER）。
+    fn private_key(&self) -> Result<PrivateKeyDer<'static>> {
+        let der = pem_to_der(&self.node_key_pem)?;
+        Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)))
+    }
+
+    /// 服务端 TLS 配置：**要求并校验客户端证书**（双向 TLS），客户端证书必须
+    /// 由本集群 CA 签发。
+    pub fn server_config(&self) -> Result<Arc<ServerConfig>> {
+        let verifier = WebPkiClientVerifier::builder(Arc::new(self.root_store()?))
+            .build()
+            .context("failed to build mTLS client verifier")?;
+        let cfg = ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(self.cert_chain()?, self.private_key()?)
+            .context("failed to build server TLS config")?;
+        Ok(Arc::new(cfg))
+    }
+
+    /// 客户端 TLS 配置：只信任本集群 CA，并出示本机节点证书。
+    pub fn client_config(&self) -> Result<Arc<ClientConfig>> {
+        let cfg = ClientConfig::builder()
+            .with_root_certificates(self.root_store()?)
+            .with_client_auth_cert(self.cert_chain()?, self.private_key()?)
+            .context("failed to build client TLS config")?;
+        Ok(Arc::new(cfg))
+    }
 }
 
 /// 轮转判定：距到期不足 `rotate_interval_seconds`（或已过期）即需重签。
@@ -234,7 +282,7 @@ fn generate_ca() -> Result<(String, String)> {
 fn issue_node(ca: &Certificate, ttl_days: u32) -> Result<(String, String, i64)> {
     let key =
         KeyPair::generate(&PKCS_ECDSA_P256_SHA256).context("failed to generate node key pair")?;
-    let mut params = CertificateParams::default();
+    let mut params = CertificateParams::new(resolve_sans());
     params.alg = &PKCS_ECDSA_P256_SHA256;
     params.is_ca = IsCa::NoCa;
     params.distinguished_name = distinguished_name(NODE_COMMON_NAME);
@@ -276,6 +324,38 @@ fn distinguished_name(cn: &str) -> DistinguishedName {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, cn);
     dn
+}
+
+/// 节点证书的 Subject Alternative Names：`localhost`/回环 + 主机名 +
+/// 本机全部网卡 IP。对端按 IP 拨号时，标准 rustls 校验器即可通过名称校验，
+/// 从而无需自写「跳过域名」的危险校验器。IP 变化由 24h 轮转自然刷新。
+fn resolve_sans() -> Vec<String> {
+    let mut sans = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if let Some(h) = hostname() {
+        sans.push(h);
+    }
+    if let Ok(ifs) = local_ip_address::list_afinet_netifas() {
+        for (_name, ip) in ifs {
+            if !ip.is_unspecified() {
+                sans.push(ip.to_string());
+            }
+        }
+    }
+    sans.sort();
+    sans.dedup();
+    sans
+}
+
+/// 尽力获取主机名（Windows: COMPUTERNAME；类 Unix: HOSTNAME）。
+fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 /// 读取 CA 证书与私钥；任一缺失或空则返回 `None`（触发重新生成）。
@@ -465,5 +545,102 @@ mod tests {
         assert_eq!(m2.ca_fingerprint().unwrap(), ca_fp);
         assert!(!m2.node_cert_pem().is_empty());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 起一个最小 TLS echo 服务器，返回其地址；用于握手自证。
+    async fn spawn_tls_echo(
+        server: Arc<ServerConfig>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (tcp, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let acceptor = tokio_rustls::TlsAcceptor::from(server);
+            let mut tls = match acceptor.accept(tcp).await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut buf = [0u8; 4];
+            if tls.read_exact(&mut buf).await.is_ok() {
+                let _ = tls.write_all(b"pong").await;
+                let _ = tls.flush().await;
+            }
+        });
+        (addr, handle)
+    }
+
+    async fn client_roundtrip(
+        client: Arc<ClientConfig>,
+        addr: std::net::SocketAddr,
+    ) -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(client)
+            .connect(name, tcp)
+            .await?;
+        tls.write_all(b"ping").await?;
+        tls.flush().await?;
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).await?;
+        anyhow::ensure!(&buf == b"pong", "unexpected echo payload");
+        Ok(())
+    }
+
+    /// 双向 TLS 正例：同一 CA 的客户端 → 服务器，握手成功且数据往返。
+    #[tokio::test]
+    async fn mtls_two_way_handshake_succeeds() {
+        let dir = tmp_dir("tls-ok");
+        let cfg = MtlsConfig::default();
+        let m = MtlsManager::load_or_create(&cfg, &dir).unwrap();
+        let (addr, server) = spawn_tls_echo(m.server_config().unwrap()).await;
+
+        client_roundtrip(m.client_config().unwrap(), addr)
+            .await
+            .expect("同 CA 双向 TLS 握手应成功");
+
+        let _ = server.await;
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 客户端无证书（普通 TLS）→ 服务器要求客户端证书，必须拒绝。
+    #[tokio::test]
+    async fn mtls_server_rejects_client_without_cert() {
+        let dir = tmp_dir("tls-noclient");
+        let cfg = MtlsConfig::default();
+        let m = MtlsManager::load_or_create(&cfg, &dir).unwrap();
+        let (addr, server) = spawn_tls_echo(m.server_config().unwrap()).await;
+
+        // 只信任 CA，但不出示客户端证书。
+        let no_client = ClientConfig::builder()
+            .with_root_certificates(m.root_store().unwrap())
+            .with_no_client_auth();
+        let res = client_roundtrip(Arc::new(no_client), addr).await;
+        assert!(res.is_err(), "无客户端证书的连接必须失败");
+
+        let _ = server.await;
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 客户端来自另一套 CA（未受信）→ 服务器侧客户端证书校验失败。
+    #[tokio::test]
+    async fn mtls_server_rejects_client_from_other_ca() {
+        let dir_a = tmp_dir("tls-ca-a");
+        let dir_b = tmp_dir("tls-ca-b");
+        let cfg = MtlsConfig::default();
+        let server_m = MtlsManager::load_or_create(&cfg, &dir_a).unwrap();
+        let client_m = MtlsManager::load_or_create(&cfg, &dir_b).unwrap();
+
+        let (addr, server) = spawn_tls_echo(server_m.server_config().unwrap()).await;
+        let res = client_roundtrip(client_m.client_config().unwrap(), addr).await;
+        assert!(res.is_err(), "异 CA 客户端必须被拒绝");
+
+        let _ = server.await;
+        fs::remove_dir_all(&dir_a).ok();
+        fs::remove_dir_all(&dir_b).ok();
     }
 }

@@ -13,6 +13,9 @@ pub struct PeerInfo {
     pub name: String,
     /// `host:port` of the peer's WebSocket endpoint.
     pub addr: String,
+    /// `host:port` of the peer's mTLS (node-to-node TLS) WebSocket endpoint,
+    /// advertised only when the peer enabled mTLS (v0.6 P1).
+    pub mtls_addr: Option<String>,
     /// Machine-level capability labels advertised by the peer.
     pub tags: Vec<String>,
     pub online: bool,
@@ -27,6 +30,7 @@ pub struct PeerView {
     pub node_id: String,
     pub name: String,
     pub addr: String,
+    pub mtls_addr: Option<String>,
     pub tags: Vec<String>,
     pub online: bool,
     pub last_seen_seconds_ago: u64,
@@ -40,6 +44,8 @@ pub struct DiscoveredPeer {
     pub name: String,
     /// `host:port` of the peer's WebSocket endpoint.
     pub addr: String,
+    /// `host:port` of the peer's mTLS endpoint when advertised (else `None`).
+    pub mtls_addr: Option<String>,
 }
 
 /// Thread-safe peer table. Critical sections are short and never await.
@@ -89,6 +95,7 @@ impl PeerTable {
         node_id: &str,
         name: &str,
         addr: &str,
+        mtls_addr: Option<String>,
         tags: Vec<String>,
     ) -> bool {
         if self.is_forgotten(node_id) {
@@ -99,6 +106,10 @@ impl PeerTable {
             Some(p) => {
                 p.name = name.to_string();
                 p.addr = addr.to_string();
+                // 仅在本次携带时更新，避免 mDNS 等无 mTLS 信息的来源清空已知值。
+                if mtls_addr.is_some() {
+                    p.mtls_addr = mtls_addr;
+                }
                 if !tags.is_empty() {
                     p.tags = tags;
                 }
@@ -111,6 +122,7 @@ impl PeerTable {
                         node_id: node_id.to_string(),
                         name: name.to_string(),
                         addr: addr.to_string(),
+                        mtls_addr,
                         tags,
                         online: false,
                         last_seen: Instant::now(),
@@ -120,6 +132,15 @@ impl PeerTable {
                 true
             }
         }
+    }
+
+    /// The peer's advertised mTLS endpoint (`host:port`), if known.
+    pub fn mtls_addr(&self, node_id: &str) -> Option<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .get(node_id)
+            .and_then(|p| p.mtls_addr.clone())
     }
 
     /// Mark a peer online / refresh identity after a successful handshake.
@@ -132,6 +153,7 @@ impl PeerTable {
             node_id: node_id.to_string(),
             name: name.to_string(),
             addr: addr.to_string(),
+            mtls_addr: None,
             tags: Vec::new(),
             online: false,
             last_seen: Instant::now(),
@@ -181,6 +203,7 @@ impl PeerTable {
                 node_id: p.node_id.clone(),
                 name: p.name.clone(),
                 addr: p.addr.clone(),
+                mtls_addr: p.mtls_addr.clone(),
                 tags: p.tags.clone(),
                 online: p.online,
                 last_seen_seconds_ago: p.last_seen.elapsed().as_secs(),

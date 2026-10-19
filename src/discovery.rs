@@ -68,11 +68,14 @@ fn make_socket(port: u16) -> anyhow::Result<UdpSocket> {
 
 async fn send(socket: &UdpSocket, state: &SharedState, action: &str) {
     let cfg = &state.config;
+    // 仅当本节点开启 mTLS 时才广播 TLS 端口，对端据此改走 wss://。
+    let mtls_port = cfg.mtls.enabled.then(|| cfg.mtls_listen_port());
     let msg = DiscoveryMessage::new(
         action,
         &cfg.node_id,
         &state.display_name(),
         cfg.listen_port,
+        mtls_port,
         &state.tags(),
     );
     let data = match serde_json::to_vec(&msg) {
@@ -100,6 +103,8 @@ fn handle_datagram(data: &[u8], src: SocketAddr, cfg: &Config, state: &SharedSta
     // The datagram source address is authoritative; the advertised IP is not
     // transmitted at all on purpose (multi-NIC safe).
     let addr = format!("{}:{}", src.ip(), msg.port);
+    // mTLS 端点（若对端广播）：同源 IP + TLS 端口。
+    let mtls_addr = msg.mtls_port.map(|p| format!("{}:{}", src.ip(), p));
 
     if msg.action == "bye" {
         state.peers.mark_offline(&msg.node_id);
@@ -107,9 +112,10 @@ fn handle_datagram(data: &[u8], src: SocketAddr, cfg: &Config, state: &SharedSta
         return;
     }
 
-    let is_new = state
-        .peers
-        .upsert_discovered(&msg.node_id, &msg.name, &addr, msg.tags);
+    let is_new =
+        state
+            .peers
+            .upsert_discovered(&msg.node_id, &msg.name, &addr, mtls_addr.clone(), msg.tags);
     if is_new {
         tracing::info!(peer = %msg.name, node_id = %msg.node_id, addr, "discovery: new peer");
     }
@@ -119,6 +125,7 @@ fn handle_datagram(data: &[u8], src: SocketAddr, cfg: &Config, state: &SharedSta
         node_id: msg.node_id,
         name: msg.name,
         addr,
+        mtls_addr,
     };
     if let Err(e) = state.peer_tx.try_send(ev) {
         tracing::trace!(error = %e, "discovery: peer event dropped (channel full)");

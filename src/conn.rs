@@ -14,7 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio_tungstenite::tungstenite::Message as TtMessage;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use crate::api::SharedState;
 use crate::config::Config;
@@ -22,6 +22,16 @@ use crate::peer::DiscoveredPeer;
 use crate::proto::{Envelope, Hello, PROTOCOL_VERSION};
 
 const CHANNEL_CAPACITY: usize = 128;
+
+/// Dial target for a peer: the plain `host:port` plus the optional mTLS
+/// `host:port` advertised by the peer (v0.6 P1). TLS is used only when this
+/// node has mTLS enabled *and* the peer advertised an mTLS endpoint — an
+/// opportunistic upgrade that never breaks mixed-version fleets.
+#[derive(Clone, Default)]
+struct DialTarget {
+    addr: String,
+    mtls_addr: Option<String>,
+}
 
 /// Normalised frame exchanged between the socket bridge and the session logic.
 #[derive(Debug)]
@@ -50,15 +60,18 @@ pub async fn manager(
     mut rx: mpsc::Receiver<DiscoveredPeer>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut dialers: HashMap<String, Arc<RwLock<String>>> = HashMap::new();
+    let mut dialers: HashMap<String, Arc<RwLock<DialTarget>>> = HashMap::new();
 
     // Static peers are dialled unconditionally (their node_id is unknown yet).
-    for addr in cfg.discovery.static_peers.clone() {
-        let key = format!("static:{addr}");
-        let cell = Arc::new(RwLock::new(addr.clone()));
+    // A `wss://host:port` (or `mtls://host:port`) entry marks the endpoint as
+    // a node-to-node TLS one (v0.6 P1), so static-peer fleets also get mTLS.
+    for raw in cfg.discovery.static_peers.clone() {
+        let (addr, mtls_addr) = parse_static_peer(&raw);
+        let key = format!("static:{raw}");
+        let cell = Arc::new(RwLock::new(DialTarget { addr, mtls_addr }));
         dialers.insert(key.clone(), cell.clone());
         spawn_dialer(state.clone(), key, None, cell, shutdown.clone());
-        tracing::info!(addr, "conn: static peer configured");
+        tracing::info!(peer = %raw, "conn: static peer configured");
     }
 
     loop {
@@ -75,7 +88,10 @@ pub async fn manager(
                     continue;
                 }
                 match dialers.get(&ev.node_id) {
-                    Some(cell) => *cell.write().await = ev.addr,
+                    Some(cell) => *cell.write().await = DialTarget {
+                        addr: ev.addr.clone(),
+                        mtls_addr: ev.mtls_addr.clone(),
+                    },
                     None => {
                         tracing::info!(
                             peer = %ev.name,
@@ -83,7 +99,10 @@ pub async fn manager(
                             addr = %ev.addr,
                             "conn: will dial peer"
                         );
-                        let cell = Arc::new(RwLock::new(ev.addr.clone()));
+                        let cell = Arc::new(RwLock::new(DialTarget {
+                            addr: ev.addr.clone(),
+                            mtls_addr: ev.mtls_addr.clone(),
+                        }));
                         dialers.insert(ev.node_id.clone(), cell.clone());
                         spawn_dialer(
                             state.clone(),
@@ -100,12 +119,24 @@ pub async fn manager(
     tracing::info!("conn: manager stopped");
 }
 
+/// Parse a `discovery.static_peers` entry into `(plain_addr, mtls_addr)`.
+/// `wss://host:port` / `mtls://host:port` mark the endpoint as TLS-only.
+fn parse_static_peer(raw: &str) -> (String, Option<String>) {
+    for prefix in ["wss://", "mtls://"] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            let addr = rest.trim_end_matches('/').to_string();
+            return (addr.clone(), Some(addr));
+        }
+    }
+    (raw.to_string(), None)
+}
+
 /// Spawn a long-lived dialer that reconnects with exponential backoff.
 fn spawn_dialer(
     state: SharedState,
     key: String,
     expected: Option<String>,
-    addr: Arc<RwLock<String>>,
+    target: Arc<RwLock<DialTarget>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
@@ -127,9 +158,9 @@ fn spawn_dialer(
                 }
             }
 
-            let target = addr.read().await.clone();
-            if let Err(e) = dial_once(state.clone(), &target, expected.clone()).await {
-                tracing::debug!(%key, target = %target, error = %e, "conn: dial failed");
+            let target = target.read().await.clone();
+            if let Err(e) = dial_once(state.clone(), target.clone(), expected.clone()).await {
+                tracing::debug!(%key, target = %target.addr, error = %e, "conn: dial failed");
             }
 
             tokio::select! {
@@ -142,9 +173,13 @@ fn spawn_dialer(
 }
 
 /// One connection attempt. Returns after the session ends.
-async fn dial_once(state: SharedState, addr: &str, expected: Option<String>) -> anyhow::Result<()> {
-    let (out_tx, in_rx) = open_peer_ws(addr).await?;
-    session(state, in_rx, out_tx, expected, "out", addr.to_string()).await;
+async fn dial_once(
+    state: SharedState,
+    target: DialTarget,
+    expected: Option<String>,
+) -> anyhow::Result<()> {
+    let (out_tx, in_rx) = open_peer_ws(&state, &target).await?;
+    session(state, in_rx, out_tx, expected, "out", target.addr.clone()).await;
     Ok(())
 }
 
@@ -158,12 +193,28 @@ pub fn spawn_axum_bridge(socket: WebSocket) -> (mpsc::Sender<Frame>, mpsc::Recei
 }
 
 /// Dial a peer WebSocket endpoint and return frame channels `(sink, stream)`.
+///
+/// Uses `wss://` (mutual TLS) when this node has mTLS enabled and the peer
+/// advertised an mTLS endpoint; otherwise plain `ws://`. The TLS choice is
+/// per-connection and opportunistic, so a mixed fleet keeps working.
 async fn open_ws(
-    addr: &str,
+    state: &SharedState,
+    target: &DialTarget,
     path: &str,
 ) -> anyhow::Result<(mpsc::Sender<Frame>, mpsc::Receiver<Frame>)> {
-    let url = format!("ws://{addr}{path}");
-    let (socket, _resp) = tokio_tungstenite::connect_async(url.as_str()).await?;
+    let use_tls =
+        state.config.mtls.enabled && target.mtls_addr.is_some() && state.mtls_client.is_some();
+
+    let (socket, _resp) = if use_tls {
+        let addr = target.mtls_addr.as_deref().unwrap_or_default();
+        let url = format!("wss://{addr}{path}");
+        let connector = Connector::Rustls(state.mtls_client.clone().expect("checked above"));
+        tokio_tungstenite::connect_async_tls_with_config(url.as_str(), None, false, Some(connector))
+            .await?
+    } else {
+        let url = format!("ws://{}{path}", target.addr);
+        tokio_tungstenite::connect_async(url.as_str()).await?
+    };
     let (in_tx, in_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (out_tx, out_rx) = mpsc::channel(CHANNEL_CAPACITY);
     bridge_ws(socket, in_tx, out_rx);
@@ -171,17 +222,26 @@ async fn open_ws(
 }
 
 /// Open a message channel to a peer (`/peer/ws`).
-pub async fn open_peer_ws(
-    addr: &str,
+async fn open_peer_ws(
+    state: &SharedState,
+    target: &DialTarget,
 ) -> anyhow::Result<(mpsc::Sender<Frame>, mpsc::Receiver<Frame>)> {
-    open_ws(addr, "/peer/ws").await
+    open_ws(state, target, "/peer/ws").await
 }
 
 /// Open a dedicated file-transfer channel to a peer (`/peer/file/ws`).
+/// `addr` is the plain endpoint; `mtls_addr` (when present and mTLS is enabled)
+/// upgrades the transfer to `wss://` so file bytes are never sent in the clear.
 pub async fn open_file_ws(
+    state: &SharedState,
     addr: &str,
+    mtls_addr: Option<String>,
 ) -> anyhow::Result<(mpsc::Sender<Frame>, mpsc::Receiver<Frame>)> {
-    open_ws(addr, "/peer/file/ws").await
+    let target = DialTarget {
+        addr: addr.to_string(),
+        mtls_addr,
+    };
+    open_ws(state, &target, "/peer/file/ws").await
 }
 
 // ---- session ----------------------------------------------------------------
@@ -488,4 +548,33 @@ fn bridge_ws(socket: WsStream, in_tx: mpsc::Sender<Frame>, mut out_rx: mpsc::Rec
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_static_peer;
+
+    #[test]
+    fn static_peer_scheme_marks_mtls() {
+        // 明文：addr 原样，无 mTLS 端点。
+        assert_eq!(
+            parse_static_peer("10.0.0.2:8765"),
+            ("10.0.0.2:8765".to_string(), None)
+        );
+        // wss:// / mtls://：标记为节点间 TLS 端点。
+        assert_eq!(
+            parse_static_peer("wss://10.0.0.2:8766"),
+            (
+                "10.0.0.2:8766".to_string(),
+                Some("10.0.0.2:8766".to_string())
+            )
+        );
+        assert_eq!(
+            parse_static_peer("mtls://10.0.0.2:8766/"),
+            (
+                "10.0.0.2:8766".to_string(),
+                Some("10.0.0.2:8766".to_string())
+            )
+        );
+    }
 }

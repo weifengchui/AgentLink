@@ -513,16 +513,29 @@ fn format_unix(unix: i64) -> String {
 async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
     let bind = format!("{}:{}", cfg.local_api.host, cfg.listen_port);
 
-    // v0.6 P1 mTLS：开启时确保内置 CA 与本机节点证书就绪（一键签发/轮转）。
-    // 证书是节点间 TLS 传输（第二波接线）的前置；此处失败只告警不阻断启动。
+    // v0.6 P1 mTLS：开启时确保内置 CA 与本机节点证书就绪（一键签发/轮转），
+    // 并构建双向 TLS 的服务端/客户端配置。任一步失败都只告警、退化明文，
+    // 不阻断启动（对齐“空态好过崩”）。
+    let mut mtls_server: Option<Arc<rustls::ServerConfig>> = None;
+    let mut mtls_client: Option<Arc<rustls::ClientConfig>> = None;
     if cfg.mtls.enabled {
         match mtls::MtlsManager::load_or_create(&cfg.mtls, &cfg.data_dir) {
-            Ok(m) => tracing::info!(
-                ca_path = %m.paths().ca_cert.display(),
-                ca_fingerprint = %m.ca_fingerprint().unwrap_or_default(),
-                node_expiry_unix = m.node_expiry_unix(),
-                "mtls: certificates ready"
-            ),
+            Ok(m) => match (m.server_config(), m.client_config()) {
+                (Ok(server), Ok(client)) => {
+                    tracing::info!(
+                        ca_path = %m.paths().ca_cert.display(),
+                        ca_fingerprint = %m.ca_fingerprint().unwrap_or_default(),
+                        node_expiry_unix = m.node_expiry_unix(),
+                        mtls_port = cfg.mtls_listen_port(),
+                        "mtls: certificates ready"
+                    );
+                    mtls_server = Some(server);
+                    mtls_client = Some(client);
+                }
+                _ => tracing::error!(
+                    "mtls: failed to build TLS configs; continuing without peer mTLS"
+                ),
+            },
             Err(e) => tracing::error!(
                 error = %e,
                 "mtls: certificate setup failed; continuing without peer mTLS"
@@ -549,6 +562,8 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
     //   绝不炸进程）→ TaskStore 打开 + rebuild 灌表（引擎休眠：只恢复表，
     //   不起 reconcile loop——loop/总线派发/调度全在 M2/M3 接线）。
     state_inner.mesh = api::build_mesh(&state_inner.config, &state_inner.config_file);
+    // v0.6 P1 mTLS：把客户端 TLS 配置交给连接层（拨号时按需升级 wss://）。
+    state_inner.mtls_client = mtls_client.clone();
     let state = Arc::new(state_inner);
     // Restore the user's "forget this node" list (ghost-peer cleanup,
     // paired with DELETE /v1/peers/{node_id}).
@@ -622,6 +637,43 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
             )
         })?;
 
+    // v0.6 P1 mTLS：对等节点走独立 TLS 监听（本地 API/网页仍在 `bind` 上明文）。
+    // 仅当证书与服务端配置就绪时启动；失败只告警，节点继续以明文对外。
+    let mtls_task: Option<tokio::task::JoinHandle<()>> = if let Some(server_cfg) = mtls_server {
+        let mtls_bind = format!("{}:{}", cfg.local_api.host, cfg.mtls_listen_port());
+        match mtls_bind.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                let tls = axum_server::tls_rustls::RustlsConfig::from_config(server_cfg);
+                let peer_app = api::peer_router(state.clone());
+                let handle = axum_server::Handle::new();
+                let mut shutdown = shutdown_rx.clone();
+                let handle_for_shutdown = handle.clone();
+                tokio::spawn(async move {
+                    let _ = shutdown.changed().await;
+                    handle_for_shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
+                });
+                tracing::info!(bind = %mtls_bind, "mtls: peer TLS listener started");
+                Some(tokio::spawn(async move {
+                    if let Err(e) = axum_server::bind_rustls(addr, tls)
+                        .handle(handle)
+                        .serve(
+                            peer_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                        )
+                        .await
+                    {
+                        tracing::error!(error = %e, "mtls: peer TLS listener stopped");
+                    }
+                }))
+            }
+            Err(e) => {
+                tracing::error!(bind = %mtls_bind, error = %e, "mtls: invalid TLS bind address");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     tracing::info!(
         version = api::VERSION,
         node_id = %cfg.node_id,
@@ -658,6 +710,9 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
         }
         if let Some(engine) = engine_handle {
             let _ = engine.await;
+        }
+        if let Some(mtls) = mtls_task {
+            let _ = mtls.await;
         }
         let _ = manager.await;
         let _ = maintenance.await;

@@ -31,7 +31,7 @@ futures-util = "0.3"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 base64 = "0.22"
 regex = "1"
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 local-ip-address = "0.6"
 # CLI 薄壳（get/logs/apply）的 HTTP 客户端。纯 Rust 栈：rustls（禁
 # native-tls/openssl），保持 x86_64-pc-windows-gnu 交叉编译友好。
@@ -41,6 +41,15 @@ ed25519-compact = "2"
 # mTLS 证书生成（v0.6 P1）：纯 Rust，无 C 依赖，保持单二进制。
 # 默认 `pem` feature 即可（CA 自签 + CA 签发节点证书），无需 x509-parser。
 rcgen = "0.11"
+# mTLS 传输（v0.6 P1 第二波）：用 rustls 构建双向 TLS 配置。显式走 ring provider、
+# 禁用默认的 aws-lc-rs（避免 C/cmake 依赖，保持 windows-gnu 交叉编译与单二进制）。
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# 节点间 TLS 监听（对等 WS 专用端口）。用 no-provider 变体，provider 由上面的
+# rustls `ring` feature 提供；`tls-rustls` 会强拉 aws-lc-rs，故不用。
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+
+[dev-dependencies]
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 
 [profile.release]
 lto = true

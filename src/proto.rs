@@ -57,6 +57,10 @@ pub struct DiscoveryMessage {
     pub name: String,
     /// Peer WebSocket port.
     pub port: u16,
+    /// mTLS 节点间 TLS 端口（v0.6 P1）：仅当本节点开启 mTLS 时携带；对端据此
+    /// 以 `wss://` 拨号。老节点忽略未知字段，故为加性协议。
+    #[serde(default)]
+    pub mtls_port: Option<u16>,
     /// Machine-level capability labels.
     #[serde(default)]
     pub tags: Vec<String>,
@@ -64,13 +68,21 @@ pub struct DiscoveryMessage {
 }
 
 impl DiscoveryMessage {
-    pub fn new(action: &str, node_id: &str, name: &str, port: u16, tags: &[String]) -> Self {
+    pub fn new(
+        action: &str,
+        node_id: &str,
+        name: &str,
+        port: u16,
+        mtls_port: Option<u16>,
+        tags: &[String],
+    ) -> Self {
         DiscoveryMessage {
             discovery: DISCOVERY_VERSION,
             action: action.to_string(),
             node_id: node_id.to_string(),
             name: name.to_string(),
             port,
+            mtls_port,
             tags: tags.to_vec(),
             ts: now_rfc3339(),
         }
@@ -288,4 +300,25 @@ pub fn ts_within_skew(ts: &str, skew_seconds: i64) -> bool {
 pub fn ts_age_seconds(ts: &str) -> Option<i64> {
     let t = OffsetDateTime::parse(ts, &Rfc3339).ok()?;
     Some((OffsetDateTime::now_utc() - t).whole_seconds())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_mtls_port_is_additive() {
+        // 老节点广播（无 mtls_port 字段）必须可解析，且为 None（向后兼容）。
+        let legacy = r#"{"discovery":1,"action":"announce","node_id":"a","name":"n",
+                         "port":8765,"tags":[],"ts":"2026-01-01T00:00:00Z"}"#;
+        let m: DiscoveryMessage = serde_json::from_str(legacy).unwrap();
+        assert_eq!(m.mtls_port, None);
+
+        // 新节点广播携带 mtls_port。
+        let msg = DiscoveryMessage::new("announce", "a", "n", 8765, Some(8766), &[]);
+        let dumped = serde_json::to_string(&msg).unwrap();
+        assert!(dumped.contains("\"mtls_port\":8766"));
+        let back: DiscoveryMessage = serde_json::from_str(&dumped).unwrap();
+        assert_eq!(back.mtls_port, Some(8766));
+    }
 }

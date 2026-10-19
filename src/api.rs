@@ -65,6 +65,9 @@ pub struct AppState {
     /// 完全不实例化，行为与 0.5.9 逐字符一致。启动时由 main.rs 经
     /// [`build_mesh`] 装配一次，运行期只读。
     pub mesh: Option<Arc<MeshRuntime>>,
+    /// 节点间 mTLS 客户端配置（v0.6 P1）。`None` = 未启用 mTLS/未就绪：对端
+    /// 连接一律明文 `ws://`。由 main.rs 启动时装配一次，运行期只读。
+    pub mtls_client: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl AppState {
@@ -91,6 +94,7 @@ impl AppState {
             files,
             runtime: std::sync::RwLock::new(runtime),
             mesh: None,
+            mtls_client: None,
         }
     }
 
@@ -341,6 +345,15 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/peer/ws", get(peer_ws))
         .route("/peer/file/ws", get(file_ws))
         .merge(upload_route)
+        .with_state(state)
+}
+
+/// 仅对等节点使用的路由（v0.6 P1 mTLS）：只挂 peer 消息与文件通道。
+/// 本地 API/网页仍在明文主监听上；mTLS 开启时对端连接走独立 TLS 监听。
+pub fn peer_router(state: SharedState) -> AxRouter {
+    AxRouter::new()
+        .route("/peer/ws", get(peer_ws))
+        .route("/peer/file/ws", get(file_ws))
         .with_state(state)
 }
 

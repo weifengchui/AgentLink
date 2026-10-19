@@ -31,12 +31,15 @@ pub async fn run(cfg: Config, state: SharedState, mut shutdown: watch::Receiver<
         tracing::warn!("mdns: no non-loopback address found");
         return;
     };
-    let props: HashMap<String, String> = [
+    let mut props: HashMap<String, String> = [
         ("node_id".to_string(), cfg.node_id.clone()),
         ("name".to_string(), state.display_name()),
     ]
     .into_iter()
     .collect();
+    if cfg.mtls.enabled {
+        props.insert("mtls_port".to_string(), cfg.mtls_listen_port().to_string());
+    }
     let instance = format!("{}#{}", cfg.name, &cfg.node_id[..4.min(cfg.node_id.len())]);
     match ServiceInfo::new(
         SERVICE_TYPE,
@@ -97,9 +100,14 @@ fn handle_resolved(cfg: &Config, state: &SharedState, info: &ServiceInfo) {
     };
 
     let addr = format!("{ip}:{port}");
-    let is_new = state
-        .peers
-        .upsert_discovered(&node_id, &name, &addr, Vec::new());
+    let mtls_addr = info
+        .get_property_val_str("mtls_port")
+        .and_then(|s| s.parse::<u16>().ok())
+        .map(|p| format!("{ip}:{p}"));
+    let is_new =
+        state
+            .peers
+            .upsert_discovered(&node_id, &name, &addr, mtls_addr.clone(), Vec::new());
     if is_new {
         tracing::info!(peer = %name, node_id = %node_id, addr, "mdns: peer discovered");
     }
@@ -109,5 +117,6 @@ fn handle_resolved(cfg: &Config, state: &SharedState, info: &ServiceInfo) {
         node_id,
         name,
         addr,
+        mtls_addr,
     });
 }

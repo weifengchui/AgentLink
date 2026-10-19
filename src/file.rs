@@ -231,7 +231,7 @@ async fn run_sender(
     file_id: &str,
     ttl_seconds: Option<u64>,
 ) -> anyhow::Result<String> {
-    let (sink, mut recv) = conn::open_file_ws(addr).await?;
+    let (sink, mut recv) = conn::open_file_ws(state, addr, state.peers.mtls_addr(peer_id)).await?;
     let _their_id = exchange_hello(state, &sink, &mut recv).await?;
 
     tracing::info!(file_id = %file_id, peer = %peer_id, path = %path.display(), "file: sender started");
