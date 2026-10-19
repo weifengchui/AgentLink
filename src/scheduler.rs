@@ -81,23 +81,38 @@ impl Scheduler {
             .collect()
     }
 
-    /// 从 candidates 中选出最佳节点：
-    /// 剩余并发额度最大（负载最小），同分按 node_id 字典序。
+    /// 从 candidates 中选出最佳节点（`select_agent` 的节点级薄包装；
+    /// 运行期派发走 select_agent，本函数保留给调度单测的节点级断言）。
+    #[allow(dead_code)]
     pub fn select_node(
         candidates: &[&AgentRecord],
         loads: &HashMap<String, usize>,
         max_concurrent_per_node: usize,
     ) -> Option<String> {
+        Self::select_agent(candidates, loads, max_concurrent_per_node).map(|a| a.node_id.clone())
+    }
+
+    /// v0.6 验收修复：返回选中 agent（含 node_id 与 agent_id）。
+    pub fn select_agent<'a>(
+        candidates: &[&'a AgentRecord],
+        loads: &HashMap<String, usize>,
+        max_concurrent_per_node: usize,
+    ) -> Option<&'a AgentRecord> {
         candidates
             .iter()
             .filter(|a| loads.get(&a.node_id).copied().unwrap_or(0) < max_concurrent_per_node)
             .min_by_key(|a| {
                 let load = loads.get(&a.node_id).copied().unwrap_or(0);
                 let remaining = max_concurrent_per_node.saturating_sub(load);
-                // 剩余额度越大越优先（Reverse 负载最小），同分按 node_id 字典序
-                (std::cmp::Reverse(remaining), a.node_id.clone())
+                // 剩余额度越大越优先（Reverse 负载最小），同分按
+                // (node_id, agent_id) 字典序（确定性）。
+                (
+                    std::cmp::Reverse(remaining),
+                    a.node_id.clone(),
+                    a.agent_id.clone(),
+                )
             })
-            .map(|a| a.node_id.clone())
+            .copied()
     }
 
     /// 为一批 pending 任务做 bin-packing 调度。
@@ -142,17 +157,24 @@ impl Scheduler {
                 break;
             }
 
-            let to_agent = spec
+            let explicit = spec
                 .get("to_agent")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
 
             let cands = Self::candidates(&spec, agents, node_tags);
-            if let Some(node_id) = Self::select_node(&cands, loads, self.max_concurrent_per_node) {
-                loads.entry(node_id.clone()).or_insert(0);
-                *loads.get_mut(&node_id).unwrap() += 1;
-                out.push((task_id, node_id, to_agent));
+            if let Some(chosen) = Self::select_agent(&cands, loads, self.max_concurrent_per_node) {
+                loads.entry(chosen.node_id.clone()).or_insert(0);
+                *loads.get_mut(&chosen.node_id).unwrap() += 1;
+                // v0.6 验收修复：显式 to_agent 优先（原样透传），否则落到
+                // 选中的具体 agent——派发必须有 agent 身份才能定向投帧。
+                let to_agent = if explicit.is_empty() {
+                    chosen.agent_id.clone()
+                } else {
+                    explicit
+                };
+                out.push((task_id, chosen.node_id.clone(), to_agent));
                 dispatched += 1;
             }
             // 无可用 candidate：任务保持 pending，下一拍重试
@@ -275,6 +297,46 @@ mod tests {
         let cands = Scheduler::candidates(&spec, &agents, &node_tags);
         let selected = Scheduler::select_node(&cands, &loads, sched.max_concurrent_per_node);
         assert_eq!(selected, None, "并发额度已满应返回 None");
+    }
+
+    #[test]
+    fn schedule_batch_picks_concrete_agent_for_agentless_spec() {
+        // v0.6 验收修复回归：agentless spec（无 to_agent）必须落到具体 agent，
+        // 否则 mark_assigned 写空串 → send_engine_spec 必然「缺 to_agent」。
+        let sched = Scheduler::new(2, 0);
+        let agents = vec![
+            agent("n1", "a1", &["cap:file"], true),
+            agent("n2", "a2", &["cap:file"], true),
+        ];
+        let node_tags: HashMap<String, Vec<String>> = HashMap::new();
+        let mut loads: HashMap<String, usize> = HashMap::new();
+        let out = sched.schedule_batch(
+            &[(
+                "t".to_string(),
+                spec(&["cap:file"], 100, "2026-01-01T00:00:00Z"),
+            )],
+            &agents,
+            &node_tags,
+            &mut loads,
+            0,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, "n1", "负载同分按 node_id 字典序");
+        assert_eq!(out[0].2, "a1", "agentless 任务必须落到具体 agent");
+    }
+
+    #[test]
+    fn schedule_batch_passes_explicit_to_agent() {
+        let sched = Scheduler::new(2, 0);
+        let agents = vec![agent("n1", "a1", &["cap:file"], true)];
+        let node_tags: HashMap<String, Vec<String>> = HashMap::new();
+        let mut loads: HashMap<String, usize> = HashMap::new();
+        let mut s = spec(&["cap:file"], 100, "2026-01-01T00:00:00Z");
+        s.as_object_mut()
+            .unwrap()
+            .insert("to_agent".to_string(), json!("pinned-agent"));
+        let out = sched.schedule_batch(&[("t".to_string(), s)], &agents, &node_tags, &mut loads, 0);
+        assert_eq!(out[0].2, "pinned-agent", "显式 to_agent 原样透传");
     }
 
     #[test]

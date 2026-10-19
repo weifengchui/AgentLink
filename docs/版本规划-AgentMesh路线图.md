@@ -40,7 +40,7 @@
 - 熔断隔离：异常节点自动置 unschedulable 标签【§4.5 taint 等价物】——已交付（2026-10-19，`docs/熔断隔离-验证-2026-10-19.md`：`engine.circuit` 加性缺省关；首次转入 Failed 按执行节点归账、滑窗阈值触发、dispatch 选点硬过滤、冷却到期惰性恢复；`/v1/mesh/status` 出 taints 视图）
 - CLI 完全体：--dry-run、补全、`top nodes` 色标【§3.3】——已交付（2026-10-19，`docs/CLI-完全体-验证-2026-10-19.md`：`completions <shell>`（clap_complete 纯 Rust）+ `top` ANSI 色标快照/`--watch`（在线/CPU 三段色/熔断红标，mesh 任务摘要）；--dry-run v0.5 既有补验证）
 
-验收门：20 机并发 200 任务 0 丢失 0 崩溃；P99 调度延迟 <500ms；外部用户 5 分钟装完并跑通多机任务。
+验收门：20 机并发 200 任务 0 丢失 0 崩溃；P99 调度延迟 <500ms；外部用户 5 分钟装完并跑通多机任务。——单机仿真已过（2026-10-19，`docs/v0.6验收门-单机仿真-2026-10-19.md`：10 节点进程/10 常驻执行器/200 agentless 任务并发 → 200/200 succeeded、0 崩溃、P50 176ms/P99 234ms（<500ms，内存队列口径）、quota 跨 10 节点；**同时修复 M3 遗留真 bug**——bin-pack 只选节点不选 agent，agentless 派发必失败（scheduler select_agent + 2 单测，cargo test 123/123）；持久化模式 P99 ~2s 系每条 fsync（v0.7 group commit 候选，需拍板掉电语义）；真 20 机与「5 分钟上手」仍待实机/外部验收
 
 ## 3. v0.7.x — 商用化版（30~100 台，可售卖预演）
 

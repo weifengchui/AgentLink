@@ -1,5 +1,5 @@
 {"scenario": "S1 池视图 engine.warmpool 加性", "pass": true, "detail": {"pool": {"enabled": true, "interval_secs": 5, "members": [{"agent_id": "warm-bridge", "online": true, "outstanding": 0}], "task_type": "warmup.ping"}}}
-{"scenario": "S2 keep-warm 派发+承接(iterval≤15s 内 succeeded)", "pass": true, "detail": {"task": "warm-warm-bridge-1792388393945", "state": "succeeded", "elapsed": 4.68}}
+{"scenario": "S2 keep-warm 派发+承接(iterval≤15s 内 succeeded)", "pass": true, "detail": {"task": "warm-warm-bridge-1792390344869", "state": "succeeded", "elapsed": 4.67}}
 {"scenario": "S3 keep_inflight 满位不补（outstanding 恒 ≤1）", "pass": true, "detail": {"samples": 20, "max_o": 0}}
 {"scenario": "S4 常驻桥承接（warm_runs ≥1）", "pass": true, "detail": {"warm_runs": 3}}
 {"scenario": "S5 成员离线跳过（停服后一个周期不新增）", "pass": true, "detail": {"before": 3, "after": 3}}

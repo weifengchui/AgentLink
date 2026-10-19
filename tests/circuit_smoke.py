@@ -190,7 +190,9 @@ def run_case(circuit, expect_taint):
     details = []
 
     # 基线：agentless t0 走引擎 dispatch（无熔断 → scheduled_nodes 收入本节点，
-    # 行 to_agent 被标 ""——注意与建行回填 spec.to_agent 的 addressed 行区分）。
+    # 行 to_agent 被写成本节点被选中的具体 agent（v0.6 验收修复后 scheduler
+    # 选到 agent 粒度；此前为 ""——注意与建行回填 spec.to_agent 的 addressed
+    # 行区分）。
     st, _ = make_agentless("t0")
     ok &= st in (202, 200)
     dispatched = wait_for(lambda: quota_used() >= 1)
@@ -238,10 +240,11 @@ def run_case(circuit, expect_taint):
     # 自动恢复：cooldown 过后 taints 清空 + 挂起的 t4 被派发（quota_used 增至 2）。
     # 自动恢复：cooldown 过后 taints 清空（必须显式 == []，HTTP 瞬断返回
     # None 不得误判为「已恢复」）+ 挂起的 t4 被派发（dispatch 的
-    # mark_assigned 把行 to_agent 从 None 写成 ""——scheduled_nodes 是
-    # 去重集合、同节点不重复计数，quota_used 不再变化，故用行标记作证据）。
+    # mark_assigned 把行 to_agent 从 None 写成被选中的具体 agent——
+    # scheduled_nodes 是去重集合、同节点不重复计数，quota_used 不再变化，
+    # 故用行标记作证据）。
     recovered = wait_for(lambda: engine_stats() == [], tries=cooldown * 4 + 30)
-    assigned = wait_for(lambda: to_agent_of(row("t4")[1]) == "", tries=40)
+    assigned = wait_for(lambda: to_agent_of(row("t4")[1]) == AG, tries=40)
     r4b = quota_used()
     ok &= recovered
     ok &= assigned

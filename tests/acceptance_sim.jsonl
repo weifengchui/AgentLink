@@ -1,0 +1,5 @@
+{"scenario": "A5 组网就绪（种子看到 N-1 在线 peer）", "pass": true, "detail": {"peers_expected": 9}}
+{"scenario": "A1 零丢失（200/200 终态 succeeded）", "pass": true, "detail": {"accepted": 200, "submit_errors": 0, "succeeded": 200, "by_state": {"succeeded": 200}, "tasks_total": 200}}
+{"scenario": "A2 零崩溃（10 进程存活、日志无 panic）", "pass": true, "detail": {"alive": 10, "panics": []}}
+{"scenario": "A3 P99 调度延迟 <500ms", "pass": true, "detail": {"p50_ms": 182.8, "p99_ms": 269.7, "max_ms": 301.2, "samples": 200, "missing": 0, "submit_span_s": 1.12, "wall_s": 2.03}}
+{"scenario": "A4 调度跨节点（quota_used ≥ 8 且执行器分布 ≥8）", "pass": true, "detail": {"quota_used": 10, "executors_used": 10}}
