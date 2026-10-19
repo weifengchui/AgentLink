@@ -11,6 +11,9 @@
   S7 logs --follow：增量轮询捕获新事件，SIGINT 干净退出
   S8 无配置文件：友好错误提示 `agentlink init`
   S9 --url/--token 全覆盖：不读配置文件也能查
+  S10 completions bash/zsh 补全脚本产物（v0.6 P1 CLI 完全体）
+  S11 top 快照：本机行+CPU 列+熔断列，无 tty 不染 ANSI
+  S12 top --watch 秒级刷新（≥2 帧）
 
 用法：python3 cli-smoke.py <path-to-agentlink-binary>
 退出码 0 = 全过。
@@ -208,6 +211,35 @@ def main():
                                cfg=None, cwd=EMPTY_DIR)
         check("S9 --url/--token 覆盖免配置", rc == 0 and NODE_ID in out,
               f"rc={rc} {err[:200]}")
+
+        # S10 completions：bash/zsh 脚本可产（stdout 非空 + 特征行）
+        rc, out, err = run_cli("completions", "bash", cfg=None, cwd=EMPTY_DIR)
+        check("S10a completions bash 脚本产物",
+              rc == 0 and "_agentlink()" in out, f"rc={rc} err={err[:120]}")
+        rc, out, err = run_cli("completions", "zsh", cfg=None, cwd=EMPTY_DIR)
+        check("S10b completions zsh 脚本产物",
+              rc == 0 and "#compdef agentlink" in out, f"rc={rc} err={err[:120]}")
+
+        # S11 top 快照：聚合 health/peers（本机行 + 色标；无 tty 时无 ANSI 无干扰）
+        rc, out, err = run_cli("top", "--url", BASE, "--token", TOKEN,
+                               cfg=None, cwd=EMPTY_DIR)
+        check("S11 top 快照（本机行+CPU 列+熔断列）",
+              rc == 0 and "agentlink top" in out and NODE_ID in out
+              and "CPU%" in out and "熔断" in out,
+              f"rc={rc} {err[:200]}")
+        # S12 top --watch 快速刷新：~2.2s 内产出 ≥2 帧快照（帧头 agentlink top 计数）
+        try:
+            p = subprocess.Popen([BIN, "top", "--watch", "1", "--url", BASE,
+                                  "--token", TOKEN],
+                                 cwd=EMPTY_DIR, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, text=True)
+            time.sleep(2.2)
+            p.send_signal(signal.SIGINT)
+            out = p.communicate(timeout=3)[0]
+            frames = out.count("agentlink top")
+            check("S12 top --watch 秒级刷新", frames >= 2, f"frames={frames}")
+        except Exception as e:
+            check("S12 top --watch 秒级刷新", False, str(e)[:120])
     finally:
         for p in (executor, follow, node):
             if p is None:

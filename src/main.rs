@@ -186,6 +186,20 @@ enum Command {
         #[arg(long, requires = "enable")]
         require: bool,
     },
+    /// 集群实时概览（/v1/health + /v1/peers + /v1/mesh/status 快照，
+    /// ANSI 色标：在线/离线、CPU 水位、熔断节点；--watch 秒级刷新）。
+    Top {
+        /// 刷新间隔（秒，缺省 3）；缺省只看一张快照。
+        #[arg(long)]
+        watch: Option<u64>,
+    },
+    /// 生成 shell 补全脚本（bash/zsh/fish/powershell；stdout 重定向到补全目录），
+    /// 如 `agentlink completions bash > /etc/bash_completion.d/agentlink`。
+    Completions {
+        /// 目标 shell。
+        #[arg(value_enum)]
+        shell: clap_complete::shells::Shell,
+    },
     /// 新节点准入（v0.6 P1）：bootstrap 令牌 + 硬件指纹双验证。
     Admission {
         /// 打印准入状态与本机硬件指纹（默认行为）。
@@ -429,6 +443,15 @@ async fn main() -> Result<()> {
             revoke,
             disable,
         }) => admission_cmd(&cli.config, status, enable, boot, allow, revoke, disable),
+        Some(Command::Top { watch }) => {
+            cli::top(cli.url.as_deref(), cli.token.as_deref(), &cli.config, watch).await
+        }
+        Some(Command::Completions { shell }) => {
+            use clap::CommandFactory;
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "agentlink", &mut std::io::stdout());
+            Ok(())
+        }
         None => {
             // v0.5 收官：裸启动 + 无配置 + 交互终端 → 自动进入首次向导
             // （Windows 双击 exe 的新机器旅程，不需要先读任何文档）。

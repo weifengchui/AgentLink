@@ -321,6 +321,239 @@ pub async fn get(
     Ok(())
 }
 
+// ---- top 集群概览（v0.6 P1 CLI 完全体）：色标快照 / --watch -----------------
+
+/// ANSI 色彩开关（有 tty 且无 NO_COLOR 环境变量才启用）。
+#[derive(Clone, Copy)]
+struct Ini {
+    off: bool,
+}
+impl Ini {
+    fn paint(&self, code: &str, s: &str) -> String {
+        if self.off || s.is_empty() {
+            s.to_string()
+        } else {
+            format!("\x1b[{code}m{s}\x1b[0m")
+        }
+    }
+}
+
+/// CPU 水位色：<60% 绿、<85% 黄、≥85% 红。
+fn cpu_code(cpu: u32) -> &'static str {
+    if cpu < 60 {
+        "32"
+    } else if cpu < 85 {
+        "33"
+    } else {
+        "31"
+    }
+}
+
+/// `agentlink top [--watch 秒]`：/v1/health + /v1/peers + /v1/mesh/status
+/// 聚合快照（ANSI 色标：在线绿/离线红、CPU 水位三段色、熔断节点红标，
+/// taints 来自熔断隔离的 /v1/mesh/status 观察位）。--watch N 每 N 秒清屏
+/// 刷新，Ctrl-C 干净退出；缺省只渲染一张快照。
+pub async fn top(
+    url: Option<&str>,
+    token: Option<&str>,
+    config: &Path,
+    watch: Option<u64>,
+) -> Result<()> {
+    let api = Api::connect(url, token, config).await?;
+    let ini = Ini {
+        off: !(std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && std::env::var_os("NO_COLOR").is_none()),
+    };
+    loop {
+        // 清屏复位（快照模式不扰屏）。
+        if watch.is_some() {
+            print!("\x1b[2J\x1b[H");
+        }
+        let snapshot = top_snapshot(&api, ini).await?;
+        print!("{snapshot}");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        let Some(secs) = watch else {
+            return Ok(());
+        };
+        let secs = secs.clamp(1, 3600);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
+            _ = tokio::signal::ctrl_c() => {
+                println!("top 退出");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// 渲染一帧 top 快照（async HTTP 读取三视图；纯函数式拼装，便于单测口径）。
+async fn top_snapshot(api: &Api, ini: Ini) -> Result<String> {
+    let health = api.get("/v1/health", &[]).await?;
+    let peers = api.get("/v1/peers", &[]).await?;
+    let mesh = api.get("/v1/mesh/status", &[]).await.ok();
+    let addr = api.base.split("://").nth(1).unwrap_or("").to_string();
+
+    // mesh 观察位：任务计数 + 熔断节点集合（circuit 关 → 空数组）。
+    let mesh_engine = mesh.as_ref().and_then(|m| m.get("engine"));
+    let task_n = |k: &str| {
+        mesh_engine
+            .and_then(|e| e.get(k))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    // 失败计数不在 mesh status 直出键里，从 by_state（[[state, n],…]）聚合。
+    let failed_n = mesh_engine
+        .and_then(|e| e.get("by_state"))
+        .and_then(Value::as_array)
+        .and_then(|v| {
+            v.iter().find_map(|kv| {
+                if kv.get(0).and_then(Value::as_str)? == "failed" {
+                    Some(kv.get(1).and_then(Value::as_u64).unwrap_or(0))
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(0);
+    let taints: Vec<String> = mesh_engine
+        .and_then(|e| e.get("circuit_taints"))
+        .and_then(Value::as_array)
+        .map(|v| {
+            v.iter()
+                .filter_map(|t| t.get("node").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 行集：本机 + 对端；每行携带各列的色码（空串=不染色）。
+    let mut rows: Vec<([String; 6], [&str; 6])> = Vec::new();
+    rows.push((
+        [
+            s(&health, "name"),
+            s(&health, "node_id"),
+            addr.clone(),
+            "在线".to_string(),
+            s_or(&health, "cpu_percent", "-"),
+            if taints.contains(&s(&health, "node_id")) {
+                "熔断".to_string()
+            } else {
+                "-".to_string()
+            },
+        ],
+        ["1", "-", "-", "32", "2", "-"],
+    ));
+    for p in peers
+        .get("peers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let online = p.get("online").and_then(Value::as_bool) == Some(true);
+        let cpu = p
+            .get("load")
+            .and_then(|l| l.get("cpu"))
+            .and_then(Value::as_u64)
+            .unwrap_or(64);
+        let has_cpu = p.get("load").and_then(|l| l.get("cpu")).is_some();
+        let nid = s(&p, "node_id");
+        let tainted = taints.contains(&nid);
+        rows.push((
+            [
+                s(&p, "name"),
+                nid,
+                s(&p, "addr"),
+                if online {
+                    "在线".into()
+                } else {
+                    "离线".into()
+                },
+                if has_cpu { cpu.to_string() } else { "-".into() },
+                if tainted { "熔断".into() } else { "-".into() },
+            ],
+            [
+                "-",
+                "-",
+                "-",
+                if online { "32" } else { "31" },
+                if has_cpu { cpu_code(cpu as u32) } else { "2" },
+                if tainted { "31;1" } else { "2" },
+            ],
+        ));
+    }
+    // 排序：在线优先、再按 name 字典序（确定性快照）。
+    rows.sort_by(|a, b| (a.0[3] == "离线", &a.0[0]).cmp(&(b.0[3] == "离线", &b.0[0])));
+
+    // 头部摘要。
+    let total = rows.len();
+    let online_n = rows.iter().filter(|r| r.0[3] == "在线").count();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} · 节点 {}（在线 {}）",
+        ini.paint("1", "agentlink top"),
+        total,
+        online_n
+    ));
+    if mesh_engine.is_some() {
+        out.push_str(&format!(
+            " · 任务 pending {} / running {} / failed {}",
+            task_n("tasks_pending"),
+            task_n("tasks_running"),
+            failed_n
+        ));
+    } else {
+        out.push_str(" · mesh 未启用");
+    }
+    if !taints.is_empty() {
+        out.push_str(&format!(" · 熔断 {}", taints.len()));
+    }
+    out.push('\n');
+
+    // 表格（宽度按无色文本计算；先补齐再整体染色，对齐不受 ANSI 干扰）。
+    let headers = ["名称", "节点", "地址", "状态", "CPU%", "熔断"];
+    let mut widths: [usize; 6] = std::array::from_fn(|i| term_width(headers[i]));
+    for (cells, _) in &rows {
+        for (i, c) in cells.iter().enumerate() {
+            widths[i] = widths[i].max(term_width(c));
+        }
+    }
+    let head_line: String = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            if i == 5 {
+                ini.paint("1", h)
+            } else {
+                format!("{}  ", ini.paint("1", &pad_to(h, widths[i])))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
+        .trim_end()
+        .to_string();
+    out.push_str(&head_line);
+    out.push('\n');
+    for (cells, codes) in &rows {
+        for (i, c) in cells.iter().enumerate() {
+            let plain = if i == 5 {
+                c.clone()
+            } else {
+                pad_to(c, widths[i])
+            };
+            out.push_str(&ini.paint(codes[i], &plain));
+            if i != 5 {
+                out.push_str("  ");
+            }
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn pad_to(s: &str, w: usize) -> String {
+    format!("{}{}", s, " ".repeat(w.saturating_sub(term_width(s))))
+}
+
 /// `agentlink logs [--follow]`
 pub async fn logs(
     opts: LogsArgs,
