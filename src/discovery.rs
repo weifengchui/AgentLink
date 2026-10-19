@@ -68,8 +68,10 @@ fn make_socket(port: u16) -> anyhow::Result<UdpSocket> {
 
 async fn send(socket: &UdpSocket, state: &SharedState, action: &str) {
     let cfg = &state.config;
-    // 仅当本节点开启 mTLS 时才广播 TLS 端口，对端据此改走 wss://。
-    let mtls_port = cfg.mtls.enabled.then(|| cfg.mtls_listen_port());
+    // 仅当本节点开启 mTLS **且已就绪**（持有 CA/TLS 配置）时才广播 TLS 端口；
+    // 成员节点在领取 CA 之前不广播，对端按明文 ws:// 连接（机会式降级）。
+    let mtls_port = (cfg.mtls.enabled && state.mtls.as_ref().is_some_and(|rt| rt.is_ready()))
+        .then(|| cfg.mtls_listen_port());
     let msg = DiscoveryMessage::new(
         action,
         &cfg.node_id,

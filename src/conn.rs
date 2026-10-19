@@ -18,8 +18,9 @@ use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use crate::api::SharedState;
 use crate::config::Config;
+use crate::mtls::{fingerprint_of_pem, AdoptOutcome};
 use crate::peer::DiscoveredPeer;
-use crate::proto::{Envelope, Hello, PROTOCOL_VERSION};
+use crate::proto::{CaSync, Envelope, Hello, PROTOCOL_VERSION};
 
 const CHANNEL_CAPACITY: usize = 128;
 
@@ -202,13 +203,13 @@ async fn open_ws(
     target: &DialTarget,
     path: &str,
 ) -> anyhow::Result<(mpsc::Sender<Frame>, mpsc::Receiver<Frame>)> {
-    let use_tls =
-        state.config.mtls.enabled && target.mtls_addr.is_some() && state.mtls_client.is_some();
+    let client = state.mtls.as_ref().and_then(|rt| rt.client_config());
+    let use_tls = state.config.mtls.enabled && target.mtls_addr.is_some() && client.is_some();
 
     let (socket, _resp) = if use_tls {
         let addr = target.mtls_addr.as_deref().unwrap_or_default();
         let url = format!("wss://{addr}{path}");
-        let connector = Connector::Rustls(state.mtls_client.clone().expect("checked above"));
+        let connector = Connector::Rustls(client.expect("checked above"));
         tokio_tungstenite::connect_async_tls_with_config(url.as_str(), None, false, Some(connector))
             .await?
     } else {
@@ -258,16 +259,13 @@ async fn session(
     let cfg = &state.config;
     let strict = cfg.security.mode == "strict";
 
-    // Always speak first: send our hello.
-    let hello = Hello::new(
-        &cfg.node_id,
-        &state.display_name(),
-        &cfg.security.cluster_token,
-    );
+    // Always speak first: send our hello (含 mTLS 状态：CA 指纹 + 是否参与）。
+    let mut hello_name = state.display_name();
+    let hello = Hello::new(&cfg.node_id, &hello_name, &cfg.security.cluster_token)
+        .with_mtls(state.mtls_ca_fp(), cfg.mtls.enabled);
     if send_text(&send, &hello).await.is_err() {
         return;
     }
-    let mut hello_name = state.display_name();
 
     let mut peer_id: Option<String> = expected_peer;
     let mut last_recv = Instant::now();
@@ -310,11 +308,8 @@ async fn session(
                 let cur = state.display_name();
                 if cur != hello_name {
                     hello_name = cur;
-                    let nh = Hello::new(
-                        &cfg.node_id,
-                        &hello_name,
-                        &cfg.security.cluster_token,
-                    );
+                    let nh = Hello::new(&cfg.node_id, &hello_name, &cfg.security.cluster_token)
+                        .with_mtls(state.mtls_ca_fp(), cfg.mtls.enabled);
                     if send_text(&send, &nh).await.is_err() {
                         break;
                     }
@@ -390,13 +385,87 @@ async fn handle_text(
                 .unwrap_or_else(|| remote_addr.to_string());
             state.router.register_peer(crate::router::PeerSink {
                 node_id: hello.node_id.clone(),
-                name: hello.name,
+                name: hello.name.clone(),
                 addr: advertised,
                 tx: send.clone(),
             });
             // Tell the peer which agents live on this node.
             if let Some(env) = state.router.agents_update_envelope(&hello.node_id) {
                 let _ = send_text(send, &env).await;
+            }
+            // v0.6 P1 CA 自动分发：经已认证（strict）链路，把集群 CA 推给
+            // 「已开 mTLS 但指纹不符/缺失」的对端（同一信任域内传播/引导）。
+            if strict && cfg.mtls.ca_sync {
+                if let Some(rt) = &state.mtls {
+                    if let (Some(fp), Some((cert, key))) = (rt.ca_fingerprint(), rt.ca_pems()) {
+                        if hello.mtls_enabled && hello.ca_fp.as_deref() != Some(fp.as_str()) {
+                            let frame = CaSync::new(&cfg.node_id, &cert, &key, &fp);
+                            if send_text(send, &frame).await.is_ok() {
+                                tracing::info!(
+                                    peer = %hello.name,
+                                    ca_fp = %fp,
+                                    "conn: pushed cluster CA to peer"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            true
+        }
+
+        "ca_sync" => {
+            // 仅接受已认证（strict）对端推送的集群 CA（CA 自动分发）。
+            if !strict || !cfg.mtls.ca_sync {
+                tracing::debug!("conn: ignoring ca_sync (disabled or non-strict mode)");
+                return true;
+            }
+            let frame: CaSync = match serde_json::from_value(value) {
+                Ok(f) => f,
+                Err(_) => return true,
+            };
+            let Some(rt) = &state.mtls else { return true };
+            // 用 PEM 实算指纹，不信任帧内声明。
+            match fingerprint_of_pem(&frame.ca_cert) {
+                Ok(fp) if fp == frame.fingerprint => {}
+                Ok(actual) => {
+                    tracing::warn!(
+                        declared = %frame.fingerprint,
+                        actual = %actual,
+                        "conn: ca_sync fingerprint mismatch; ignored"
+                    );
+                    return true;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "conn: ca_sync cert unparseable; ignored");
+                    return true;
+                }
+            }
+            match rt.adopt(&frame.ca_cert, &frame.ca_key) {
+                Ok(AdoptOutcome::Adopted) => {
+                    tracing::info!(
+                        peer = %frame.node_id,
+                        ca_fp = %frame.fingerprint,
+                        "conn: adopted cluster CA (mTLS now ready)"
+                    );
+                    // 重新广播 hello（携带新指纹），避免对端重复推送。
+                    let nh = Hello::new(
+                        &cfg.node_id,
+                        &state.display_name(),
+                        &cfg.security.cluster_token,
+                    )
+                    .with_mtls(state.mtls_ca_fp(), cfg.mtls.enabled);
+                    let _ = send_text(send, &nh).await;
+                }
+                Ok(AdoptOutcome::Same) => {}
+                Ok(AdoptOutcome::Conflict { local, remote }) => {
+                    tracing::warn!(
+                        local = %local,
+                        remote = %remote,
+                        "conn: CA conflict; kept local CA (refused to adopt)"
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, "conn: failed to adopt cluster CA"),
             }
             true
         }

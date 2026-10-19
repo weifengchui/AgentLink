@@ -30,6 +30,7 @@ use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+use tokio::sync::watch;
 
 use crate::config::MtlsConfig;
 
@@ -82,8 +83,20 @@ pub struct MtlsManager {
 
 impl MtlsManager {
     /// 加载或创建证书：四件套齐全则直接加载；节点证书缺失/临近到期则用
-    /// 现有 CA 重签；CA 缺失则新生成整条链。
+    /// 现有 CA 重签；CA 缺失则新生成整条链。等价于
+    /// [`Self::load_or_create_opt`] 且 `create_ca=true`。
     pub fn load_or_create(config: &MtlsConfig, data_dir: &Path) -> Result<Self> {
+        Self::load_or_create_opt(config, data_dir, true)?
+            .context("mtls manager unavailable despite create_ca=true")
+    }
+
+    /// 加载；**CA 缺失且 `create_ca=false` 时返回 `Ok(None)`**（成员节点：不建
+    /// CA，等待经已认证的对等链路领取集群 CA，见 [`MtlsRuntime`]）。
+    pub fn load_or_create_opt(
+        config: &MtlsConfig,
+        data_dir: &Path,
+        create_ca: bool,
+    ) -> Result<Option<Self>> {
         let paths = MtlsPaths::resolve(config, data_dir);
         if let Some(parent) = paths.node_cert.parent() {
             fs::create_dir_all(parent)
@@ -94,10 +107,14 @@ impl MtlsManager {
         let rotate = config.cert_rotate_interval_seconds;
         let now = OffsetDateTime::now_utc().unix_timestamp();
 
-        // 1) CA：能读就用，读不到（缺失/损坏）才新生成。
+        // 1) CA：能读就用；读不到（缺失/损坏）时——权威节点新生成，成员节点
+        //    返回 None（等待领取）。
         let (ca_cert_pem, ca_key_pem) = match read_ca(&paths) {
             Some(pair) => pair,
             None => {
+                if !create_ca {
+                    return Ok(None);
+                }
                 let (cert, key) = generate_ca()?;
                 write_secret(&paths.ca_cert, cert.as_bytes())?;
                 write_secret(&paths.ca_key, key.as_bytes())?;
@@ -123,7 +140,7 @@ impl MtlsManager {
             (cert, key, expiry)
         };
 
-        Ok(Self {
+        Ok(Some(Self {
             paths,
             ca_cert_pem,
             ca_key_pem,
@@ -132,6 +149,44 @@ impl MtlsManager {
             node_expiry_unix,
             cert_ttl_days: ttl,
             rotate_interval_seconds: rotate,
+        }))
+    }
+
+    /// 采用外部 CA（CA 自动分发）：先校验 PEM 可解析（能重建签发者）再落盘，
+    /// 并用该 CA 重新签发本机节点证书。返回采用后的管理器，其 CA 指纹即新 CA。
+    pub fn adopt_ca(
+        config: &MtlsConfig,
+        data_dir: &Path,
+        ca_cert_pem: &str,
+        ca_key_pem: &str,
+    ) -> Result<Self> {
+        // 校验：私钥可解析、算法受支持，能重建签发者，才允许落盘。
+        let ca_signer = ca_signer_from_pems(ca_cert_pem, ca_key_pem)
+            .context("rejected CA: unparseable cert/key")?;
+        let paths = MtlsPaths::resolve(config, data_dir);
+        if let Some(parent) = paths.node_cert.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create mtls dir {}", parent.display()))?;
+        }
+        write_secret(&paths.ca_cert, ca_cert_pem.as_bytes())?;
+        write_secret(&paths.ca_key, ca_key_pem.as_bytes())?;
+
+        let ttl = config.cert_ttl_days.max(1);
+        let (cert, key, expiry) = issue_node(&ca_signer, ttl)?;
+        write_secret(&paths.node_cert, cert.as_bytes())?;
+        write_secret(&paths.node_key, key.as_bytes())?;
+        fs::write(&paths.node_expiry, expiry.to_string())
+            .with_context(|| format!("failed to write {}", paths.node_expiry.display()))?;
+
+        Ok(Self {
+            paths,
+            ca_cert_pem: ca_cert_pem.to_string(),
+            ca_key_pem: ca_key_pem.to_string(),
+            node_cert_pem: cert,
+            node_key_pem: key,
+            node_expiry_unix: expiry,
+            cert_ttl_days: ttl,
+            rotate_interval_seconds: config.cert_rotate_interval_seconds,
         })
     }
 
@@ -143,6 +198,11 @@ impl MtlsManager {
     /// CA 证书 PEM。
     pub fn ca_cert_pem(&self) -> &str {
         &self.ca_cert_pem
+    }
+
+    /// CA 私钥 PEM（PKCS#8）。CA 自动分发时用于推送给同信任域的对端。
+    pub fn ca_key_pem(&self) -> &str {
+        &self.ca_key_pem
     }
 
     /// 节点证书 PEM（已由 CA 签发）。
@@ -246,6 +306,134 @@ impl MtlsManager {
             .context("failed to build client TLS config")?;
         Ok(Arc::new(cfg))
     }
+}
+
+// ---- 运行期运行态（CA 自动分发） -------------------------------------------
+
+/// 运行期 mTLS 运行态（v0.6 P1 CA 自动分发）。
+///
+/// 持有当前 CA/节点证书（可能为空——成员节点入网前尚无 CA），并把「服务端 TLS
+/// 配置」经 watch 通道喂给独立 TLS 监听任务：成员节点领取到 CA 后即可**热启动**
+/// 监听，无需重启进程。客户端配置供拨号时按需读取。
+pub struct MtlsRuntime {
+    config: MtlsConfig,
+    data_dir: PathBuf,
+    paths: MtlsPaths,
+    inner: std::sync::RwLock<MtlsInner>,
+    server_tx: watch::Sender<Option<Arc<ServerConfig>>>,
+}
+
+struct MtlsInner {
+    manager: Option<MtlsManager>,
+    client: Option<Arc<ClientConfig>>,
+}
+
+/// CA 领取结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdoptOutcome {
+    /// 领取成功（此前无 CA）。
+    Adopted,
+    /// 与当前 CA 指纹一致，无需变更。
+    Same,
+    /// 已有不同的 CA：为防信任域分裂而拒绝覆盖。
+    Conflict { local: String, remote: String },
+}
+
+impl MtlsRuntime {
+    /// 由配置与当前管理器（可为 None = 成员节点待领取）构建运行态。
+    pub fn new(
+        config: MtlsConfig,
+        data_dir: PathBuf,
+        manager: Option<MtlsManager>,
+    ) -> Result<Arc<Self>> {
+        let paths = MtlsPaths::resolve(&config, &data_dir);
+        let (client, server) = match &manager {
+            Some(m) => (Some(m.client_config()?), Some(m.server_config()?)),
+            None => (None, None),
+        };
+        let (server_tx, _rx) = watch::channel(server);
+        Ok(Arc::new(Self {
+            config,
+            data_dir,
+            paths,
+            inner: std::sync::RwLock::new(MtlsInner { manager, client }),
+            server_tx,
+        }))
+    }
+
+    /// 证书文件路径集合。
+    pub fn paths(&self) -> &MtlsPaths {
+        &self.paths
+    }
+
+    /// 服务端 TLS 配置的 watch 订阅（TLS 监听任务据此绑定）。
+    pub fn server_watch(&self) -> watch::Receiver<Option<Arc<ServerConfig>>> {
+        self.server_tx.subscribe()
+    }
+
+    /// 是否已就绪（持有 CA，可用双向 TLS）。
+    pub fn is_ready(&self) -> bool {
+        self.inner.read().unwrap().manager.is_some()
+    }
+
+    /// 当前集群 CA 指纹（未领取时为 None）。
+    pub fn ca_fingerprint(&self) -> Option<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .manager
+            .as_ref()
+            .and_then(|m| m.ca_fingerprint().ok())
+    }
+
+    /// 当前 CA（证书 PEM + 私钥 PEM），用于推送给对端。
+    pub fn ca_pems(&self) -> Option<(String, String)> {
+        self.inner
+            .read()
+            .unwrap()
+            .manager
+            .as_ref()
+            .map(|m| (m.ca_cert_pem().to_string(), m.ca_key_pem().to_string()))
+    }
+
+    /// 当前客户端 TLS 配置（未就绪时为 None，拨号回落明文）。
+    pub fn client_config(&self) -> Option<Arc<ClientConfig>> {
+        self.inner.read().unwrap().client.clone()
+    }
+
+    /// 领取集群 CA（CA 自动分发）：校验 → 落盘 → 用该 CA 重签本机节点证书 →
+    /// 热更新 TLS 配置并通知监听任务。
+    ///
+    /// 冲突保护：本地已有**不同** CA 时返回 [`AdoptOutcome::Conflict`] 且不改动
+    /// 任何文件（避免信任域被静默替换/分裂）。
+    pub fn adopt(&self, ca_cert_pem: &str, ca_key_pem: &str) -> Result<AdoptOutcome> {
+        let remote_fp = fingerprint_of_pem(ca_cert_pem)?;
+        let mut g = self.inner.write().unwrap();
+        if let Some(m) = &g.manager {
+            let local_fp = m.ca_fingerprint().unwrap_or_default();
+            if local_fp == remote_fp {
+                return Ok(AdoptOutcome::Same);
+            }
+            return Ok(AdoptOutcome::Conflict {
+                local: local_fp,
+                remote: remote_fp,
+            });
+        }
+        let manager = MtlsManager::adopt_ca(&self.config, &self.data_dir, ca_cert_pem, ca_key_pem)?;
+        let client = manager.client_config()?;
+        let server = manager.server_config()?;
+        *g = MtlsInner {
+            manager: Some(manager),
+            client: Some(client),
+        };
+        let _ = self.server_tx.send(Some(server));
+        Ok(AdoptOutcome::Adopted)
+    }
+}
+
+/// 由 CA 证书 PEM 计算 SHA-256 指纹（用于对端声明的指纹去伪存真）。
+pub fn fingerprint_of_pem(pem: &str) -> Result<String> {
+    Ok(fingerprint(&pem_to_der(pem)?))
 }
 
 /// 轮转判定：距到期不足 `rotate_interval_seconds`（或已过期）即需重签。
@@ -545,6 +733,97 @@ mod tests {
         assert_eq!(m2.ca_fingerprint().unwrap(), ca_fp);
         assert!(!m2.node_cert_pem().is_empty());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mtls_member_does_not_create_ca() {
+        let dir = tmp_dir("member-noca");
+        let cfg = MtlsConfig::default();
+        // 成员节点（create_ca=false）且无 CA：不建 CA，返回 None。
+        assert!(MtlsManager::load_or_create_opt(&cfg, &dir, false)
+            .unwrap()
+            .is_none());
+        assert!(!dir.join("mtls").join("ca.pem").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CA 自动分发：成员节点从零领取权威 CA → 落盘 → 与权威节点双向 TLS 握手。
+    #[tokio::test]
+    async fn mtls_member_adopts_ca_then_handshakes_with_authority() {
+        let auth_dir = tmp_dir("adopt-auth");
+        let member_dir = tmp_dir("adopt-member");
+        let cfg = MtlsConfig::default();
+        let authority = MtlsManager::load_or_create(&cfg, &auth_dir).unwrap();
+        let authority_fp = authority.ca_fingerprint().unwrap();
+
+        // 成员初始未就绪（无 CA）。
+        let member = MtlsRuntime::new(cfg.clone(), member_dir.clone(), None).unwrap();
+        assert!(!member.is_ready());
+        assert!(member.client_config().is_none());
+        assert!(member.ca_fingerprint().is_none());
+
+        // 领取权威 CA。
+        assert_eq!(
+            member
+                .adopt(authority.ca_cert_pem(), authority.ca_key_pem())
+                .unwrap(),
+            AdoptOutcome::Adopted
+        );
+        assert!(member.is_ready());
+        assert_eq!(member.ca_fingerprint().unwrap(), authority_fp);
+
+        // 落盘：成员以 create_ca=false 重新加载仍得到同一 CA。
+        let reloaded = MtlsManager::load_or_create_opt(&cfg, &member_dir, false)
+            .unwrap()
+            .expect("成员领取后应能加载");
+        assert_eq!(reloaded.ca_fingerprint().unwrap(), authority_fp);
+
+        // 领取后：成员客户端 ↔ 权威服务器，双向 TLS 握手成功。
+        let (addr, server) = spawn_tls_echo(authority.server_config().unwrap()).await;
+        client_roundtrip(member.client_config().unwrap(), addr)
+            .await
+            .expect("领取 CA 后应能与权威节点双向 TLS 握手");
+        let _ = server.await;
+
+        // 重复领取同一 CA：Same（幂等）。
+        assert_eq!(
+            member
+                .adopt(authority.ca_cert_pem(), authority.ca_key_pem())
+                .unwrap(),
+            AdoptOutcome::Same
+        );
+
+        fs::remove_dir_all(&auth_dir).ok();
+        fs::remove_dir_all(&member_dir).ok();
+    }
+
+    /// 冲突保护：本地已有不同 CA 时拒绝覆盖（防信任域分裂）。
+    #[test]
+    fn mtls_runtime_adopt_conflict_keeps_local_ca() {
+        let dir = tmp_dir("adopt-conflict");
+        let cfg = MtlsConfig::default();
+        let local = MtlsManager::load_or_create(&cfg, &dir).unwrap();
+        let local_fp = local.ca_fingerprint().unwrap();
+        let rt = MtlsRuntime::new(cfg.clone(), dir.clone(), Some(local)).unwrap();
+
+        let other_dir = tmp_dir("adopt-other");
+        let other = MtlsManager::load_or_create(&cfg, &other_dir).unwrap();
+        let other_fp = other.ca_fingerprint().unwrap();
+        assert_ne!(local_fp, other_fp);
+
+        match rt.adopt(other.ca_cert_pem(), other.ca_key_pem()).unwrap() {
+            AdoptOutcome::Conflict { local, remote } => {
+                assert_eq!(local, local_fp);
+                assert_eq!(remote, other_fp);
+            }
+            got => panic!("expected conflict, got {got:?}"),
+        }
+        // 本地 CA 未被覆盖。
+        assert_eq!(rt.ca_fingerprint().unwrap(), local_fp);
+        assert_ne!(rt.ca_fingerprint().unwrap(), other_fp);
+
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&other_dir).ok();
     }
 
     /// 起一个最小 TLS echo 服务器，返回其地址；用于握手自证。

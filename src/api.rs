@@ -65,9 +65,10 @@ pub struct AppState {
     /// 完全不实例化，行为与 0.5.9 逐字符一致。启动时由 main.rs 经
     /// [`build_mesh`] 装配一次，运行期只读。
     pub mesh: Option<Arc<MeshRuntime>>,
-    /// 节点间 mTLS 客户端配置（v0.6 P1）。`None` = 未启用 mTLS/未就绪：对端
-    /// 连接一律明文 `ws://`。由 main.rs 启动时装配一次，运行期只读。
-    pub mtls_client: Option<Arc<rustls::ClientConfig>>,
+    /// 节点间 mTLS 运行态（v0.6 P1）。`None` = 未启用 mTLS：对端连接一律明文
+    /// `ws://`。由 main.rs 启动时装配一次；成员节点可在运行期经对等链路领取
+    /// 集群 CA（CA 自动分发），故内部状态可变（见 [`crate::mtls::MtlsRuntime`]）。
+    pub mtls: Option<Arc<crate::mtls::MtlsRuntime>>,
 }
 
 impl AppState {
@@ -94,8 +95,13 @@ impl AppState {
             files,
             runtime: std::sync::RwLock::new(runtime),
             mesh: None,
-            mtls_client: None,
+            mtls: None,
         }
+    }
+
+    /// 本节点当前集群 CA 指纹（未启用/未领取 mTLS 时为 `None`）。
+    pub fn mtls_ca_fp(&self) -> Option<String> {
+        self.mtls.as_ref().and_then(|rt| rt.ca_fingerprint())
     }
 
     pub fn uptime_seconds(&self) -> u64 {

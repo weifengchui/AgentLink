@@ -287,6 +287,15 @@ pub struct MtlsConfig {
     /// 本地 API/网页仍在 `listen_port` 上走明文 HTTP，二者互不影响）。
     #[serde(default)]
     pub listen_port: Option<u16>,
+    /// 是否允许本节点在无 CA 时**新建** CA（即集群「权威」节点）。缺省 true，
+    /// 保持既有行为（首节点 `mtls --enable` 建 CA）。成员节点置 false：
+    /// 不建 CA，启动后经已认证的对等链路自动领取集群 CA（CA 自动分发）。
+    #[serde(default = "default_true")]
+    pub create_ca: bool,
+    /// 是否允许经已认证（strict 集群令牌）的对等链路**分发/领取** CA。
+    /// 缺省 true。关闭后节点只能使用本地已有 CA（需人工分发文件）。
+    #[serde(default = "default_true")]
+    pub ca_sync: bool,
 }
 
 impl Default for MtlsConfig {
@@ -298,6 +307,8 @@ impl Default for MtlsConfig {
             cert_ttl_days: default_mtls_cert_ttl_days(),
             cert_rotate_interval_seconds: default_mtls_rotate_interval(),
             listen_port: None,
+            create_ca: true,
+            ca_sync: true,
         }
     }
 }
@@ -861,6 +872,20 @@ mod tests {
         assert_eq!(d.cert_ttl_days, 1);
         assert_eq!(d.cert_rotate_interval_seconds, 21600);
         assert_eq!(d.listen_port, None);
+        // CA 自动分发：缺省「可建 CA + 允许同步」，保持既有行为。
+        assert!(d.create_ca);
+        assert!(d.ca_sync);
+        // 老配置（无这两个字段）也回落到默认 true（向后兼容）。
+        assert!(absent.mtls.create_ca);
+        assert!(absent.mtls.ca_sync);
+
+        // 成员节点：不建 CA，仅领取。
+        let member: Config = serde_json::from_str(
+            r#"{"node_id":"n","name":"h","mtls":{"enabled":true,"create_ca":false,"ca_sync":true}}"#,
+        )
+        .unwrap();
+        assert!(member.mtls.enabled);
+        assert!(!member.mtls.create_ca);
 
         // 监听端口：缺省 = listen_port + 1；显式配置优先。
         let mut c = Config::generate(None, None, None);

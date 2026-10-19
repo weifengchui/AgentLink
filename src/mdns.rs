@@ -37,7 +37,7 @@ pub async fn run(cfg: Config, state: SharedState, mut shutdown: watch::Receiver<
     ]
     .into_iter()
     .collect();
-    if cfg.mtls.enabled {
+    if cfg.mtls.enabled && state.mtls.as_ref().is_some_and(|rt| rt.is_ready()) {
         props.insert("mtls_port".to_string(), cfg.mtls_listen_port().to_string());
     }
     let instance = format!("{}#{}", cfg.name, &cfg.node_id[..4.min(cfg.node_id.len())]);

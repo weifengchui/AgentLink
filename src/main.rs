@@ -165,6 +165,13 @@ enum Command {
         /// 立即轮转节点证书（CA 与全网信任不变）。
         #[arg(long)]
         rotate: bool,
+        /// 以「成员」身份启用：不新建 CA，启动后经已认证的对等链路自动领取集群 CA
+        /// （CA 自动分发）。写入 `mtls.create_ca=false`。
+        #[arg(long)]
+        member: bool,
+        /// 以「权威」身份启用：无 CA 时新建 CA（默认行为）。写入 `mtls.create_ca=true`。
+        #[arg(long)]
+        authority: bool,
     },
 }
 
@@ -353,7 +360,17 @@ async fn main() -> Result<()> {
             disable,
             show,
             rotate,
-        }) => mtls_cmd(&cli.config, enable, disable, show, rotate),
+            member,
+            authority,
+        }) => mtls_cmd(
+            &cli.config,
+            enable,
+            disable,
+            show,
+            rotate,
+            member,
+            authority,
+        ),
         None => {
             // v0.5 收官：裸启动 + 无配置 + 交互终端 → 自动进入首次向导
             // （Windows 双击 exe 的新机器旅程，不需要先读任何文档）。
@@ -429,15 +446,21 @@ async fn setup_flow(config_path: &Path, log_format: Option<String>, yes: bool) -
 }
 
 /// `agentlink mtls`：一键启用/查看/轮转内置 CA 与本机节点证书（v0.6 P1）。
+#[allow(clippy::too_many_arguments)]
 fn mtls_cmd(
     config_path: &Path,
     enable: bool,
     disable: bool,
     show: bool,
     rotate: bool,
+    member: bool,
+    authority: bool,
 ) -> Result<()> {
     if enable && disable {
         bail!("--enable 与 --disable 不能同时使用");
+    }
+    if member && authority {
+        bail!("--member 与 --authority 不能同时使用");
     }
     // `--show` 是默认行为（无任何标志时也打印状态），仅为显式表达保留。
     let _ = show;
@@ -445,28 +468,49 @@ fn mtls_cmd(
     std::fs::create_dir_all(&cfg.data_dir)
         .with_context(|| format!("failed to create data dir {}", cfg.data_dir.display()))?;
 
-    let mut manager = mtls::MtlsManager::load_or_create(&cfg.mtls, &cfg.data_dir)?;
-    if rotate {
-        manager.rotate_node_cert()?;
-        println!("已轮转节点证书（CA 不变）");
+    // 角色：--member 置 create_ca=false（领取者），--authority 置 true（默认）。
+    let mut changed = false;
+    if member {
+        cfg.mtls.create_ca = false;
+        changed = true;
+    } else if authority {
+        cfg.mtls.create_ca = true;
+        changed = true;
+    }
+    if enable {
+        cfg.mtls.enabled = true;
+        changed = true;
+    } else if disable {
+        cfg.mtls.enabled = false;
+        changed = true;
+    }
+    if changed {
+        cfg.save(config_path)?;
     }
 
-    if enable && !cfg.mtls.enabled {
-        cfg.mtls.enabled = true;
-        cfg.save(config_path)?;
-    } else if disable && cfg.mtls.enabled {
-        cfg.mtls.enabled = false;
-        cfg.save(config_path)?;
+    let mut manager =
+        mtls::MtlsManager::load_or_create_opt(&cfg.mtls, &cfg.data_dir, cfg.mtls.create_ca)?;
+    if rotate {
+        match &mut manager {
+            Some(m) => {
+                m.rotate_node_cert()?;
+                println!("已轮转节点证书（CA 不变）");
+            }
+            None => bail!("本机尚无集群 CA（成员节点待领取），无法轮转"),
+        }
     }
 
     // 未指定任何动作标志时等价于 --show。
-    print_mtls_status(&cfg, &manager, config_path)?;
+    print_mtls_status(&cfg, manager.as_ref(), config_path)?;
     Ok(())
 }
 
 /// 打印 mTLS 当前状态与证书信息。
-fn print_mtls_status(cfg: &Config, manager: &mtls::MtlsManager, config_path: &Path) -> Result<()> {
-    let paths = manager.paths();
+fn print_mtls_status(
+    cfg: &Config,
+    manager: Option<&mtls::MtlsManager>,
+    config_path: &Path,
+) -> Result<()> {
     println!(
         "mTLS: {}",
         if cfg.mtls.enabled {
@@ -477,24 +521,43 @@ fn print_mtls_status(cfg: &Config, manager: &mtls::MtlsManager, config_path: &Pa
     );
     println!("  config:      {}", config_path.display());
     println!(
-        "  CA cert:     {}  sha256={}",
-        paths.ca_cert.display(),
-        manager.ca_fingerprint()?
+        "  role:        {}",
+        if cfg.mtls.create_ca {
+            "authority（可建 CA）"
+        } else {
+            "member（领取集群 CA）"
+        }
     );
-    println!("  CA key:      {}", paths.ca_key.display());
-    println!(
-        "  node cert:   {}  sha256={}",
-        paths.node_cert.display(),
-        manager.node_fingerprint()?
-    );
-    println!("  node key:    {}", paths.node_key.display());
-    println!("  node expiry: {}", format_unix(manager.node_expiry_unix()));
-    println!(
-        "  ttl:         {} 天（轮转窗口 {}s）",
-        cfg.mtls.cert_ttl_days, cfg.mtls.cert_rotate_interval_seconds
-    );
+    println!("  ca_sync:     {}", cfg.mtls.ca_sync);
+    match manager {
+        Some(m) => {
+            let paths = m.paths();
+            println!(
+                "  CA cert:     {}  sha256={}",
+                paths.ca_cert.display(),
+                m.ca_fingerprint()?
+            );
+            println!("  CA key:      {}", paths.ca_key.display());
+            println!(
+                "  node cert:   {}  sha256={}",
+                paths.node_cert.display(),
+                m.node_fingerprint()?
+            );
+            println!("  node key:    {}", paths.node_key.display());
+            println!("  node expiry: {}", format_unix(m.node_expiry_unix()));
+            println!(
+                "  ttl:         {} 天（轮转窗口 {}s）",
+                cfg.mtls.cert_ttl_days, cfg.mtls.cert_rotate_interval_seconds
+            );
+        }
+        None => {
+            println!("  CA:          未领取（成员节点，节点启动后经已认证链路自动领取）");
+        }
+    }
     if !cfg.mtls.enabled {
-        println!("\n开启: agentlink mtls --enable");
+        println!("\n开启: agentlink mtls --enable  （成员节点: agentlink mtls --enable --member）");
+    } else if manager.is_none() {
+        println!("\n启动节点即自动领取集群 CA: agentlink run");
     }
     Ok(())
 }
@@ -513,32 +576,44 @@ fn format_unix(unix: i64) -> String {
 async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
     let bind = format!("{}:{}", cfg.local_api.host, cfg.listen_port);
 
-    // v0.6 P1 mTLS：开启时确保内置 CA 与本机节点证书就绪（一键签发/轮转），
-    // 并构建双向 TLS 的服务端/客户端配置。任一步失败都只告警、退化明文，
-    // 不阻断启动（对齐“空态好过崩”）。
-    let mut mtls_server: Option<Arc<rustls::ServerConfig>> = None;
-    let mut mtls_client: Option<Arc<rustls::ClientConfig>> = None;
+    // v0.6 P1 mTLS：开启时装配运行态。权威节点（create_ca=true）就地建/载 CA；
+    // 成员节点（create_ca=false）无 CA 时进入「待领取」态，启动后经已认证的对等
+    // 链路自动领取集群 CA（CA 自动分发），领取到后热启动 TLS 监听。任一步失败
+    // 都只告警、退化明文，不阻断启动（对齐“空态好过崩”）。
+    let mut mtls_runtime: Option<Arc<mtls::MtlsRuntime>> = None;
     if cfg.mtls.enabled {
-        match mtls::MtlsManager::load_or_create(&cfg.mtls, &cfg.data_dir) {
-            Ok(m) => match (m.server_config(), m.client_config()) {
-                (Ok(server), Ok(client)) => {
+        let manager = match mtls::MtlsManager::load_or_create_opt(
+            &cfg.mtls,
+            &cfg.data_dir,
+            cfg.mtls.create_ca,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(error = %e, "mtls: certificate setup failed; awaiting CA sync");
+                None
+            }
+        };
+        match mtls::MtlsRuntime::new(cfg.mtls.clone(), cfg.data_dir.clone(), manager) {
+            Ok(rt) => {
+                if rt.is_ready() {
                     tracing::info!(
-                        ca_path = %m.paths().ca_cert.display(),
-                        ca_fingerprint = %m.ca_fingerprint().unwrap_or_default(),
-                        node_expiry_unix = m.node_expiry_unix(),
+                        ca_path = %rt.paths().ca_cert.display(),
+                        ca_fingerprint = %rt.ca_fingerprint().unwrap_or_default(),
                         mtls_port = cfg.mtls_listen_port(),
                         "mtls: certificates ready"
                     );
-                    mtls_server = Some(server);
-                    mtls_client = Some(client);
+                } else {
+                    tracing::warn!(
+                        mtls_port = cfg.mtls_listen_port(),
+                        "mtls: no cluster CA yet; awaiting CA 自动分发 from a peer \
+                         (create_ca=false)"
+                    );
                 }
-                _ => tracing::error!(
-                    "mtls: failed to build TLS configs; continuing without peer mTLS"
-                ),
-            },
+                mtls_runtime = Some(rt);
+            }
             Err(e) => tracing::error!(
                 error = %e,
-                "mtls: certificate setup failed; continuing without peer mTLS"
+                "mtls: failed to build TLS configs; peer mTLS disabled"
             ),
         }
     }
@@ -562,8 +637,8 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
     //   绝不炸进程）→ TaskStore 打开 + rebuild 灌表（引擎休眠：只恢复表，
     //   不起 reconcile loop——loop/总线派发/调度全在 M2/M3 接线）。
     state_inner.mesh = api::build_mesh(&state_inner.config, &state_inner.config_file);
-    // v0.6 P1 mTLS：把客户端 TLS 配置交给连接层（拨号时按需升级 wss://）。
-    state_inner.mtls_client = mtls_client.clone();
+    // v0.6 P1 mTLS：把运行态交给连接层（拨号按需升级 wss://；对等链路触发 CA 领取）。
+    state_inner.mtls = mtls_runtime.clone();
     let state = Arc::new(state_inner);
     // Restore the user's "forget this node" list (ghost-peer cleanup,
     // paired with DELETE /v1/peers/{node_id}).
@@ -638,32 +713,16 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
         })?;
 
     // v0.6 P1 mTLS：对等节点走独立 TLS 监听（本地 API/网页仍在 `bind` 上明文）。
-    // 仅当证书与服务端配置就绪时启动；失败只告警，节点继续以明文对外。
-    let mtls_task: Option<tokio::task::JoinHandle<()>> = if let Some(server_cfg) = mtls_server {
+    // 监听任务订阅运行态的「服务端 TLS 配置」：权威节点立即绑定；成员节点在
+    // 领取到集群 CA 后热绑定（CA 自动分发），无需重启进程。
+    let mtls_task: Option<tokio::task::JoinHandle<()>> = if let Some(rt) = mtls_runtime.clone() {
         let mtls_bind = format!("{}:{}", cfg.local_api.host, cfg.mtls_listen_port());
         match mtls_bind.parse::<std::net::SocketAddr>() {
             Ok(addr) => {
-                let tls = axum_server::tls_rustls::RustlsConfig::from_config(server_cfg);
+                let rx = rt.server_watch();
                 let peer_app = api::peer_router(state.clone());
-                let handle = axum_server::Handle::new();
-                let mut shutdown = shutdown_rx.clone();
-                let handle_for_shutdown = handle.clone();
-                tokio::spawn(async move {
-                    let _ = shutdown.changed().await;
-                    handle_for_shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
-                });
-                tracing::info!(bind = %mtls_bind, "mtls: peer TLS listener started");
-                Some(tokio::spawn(async move {
-                    if let Err(e) = axum_server::bind_rustls(addr, tls)
-                        .handle(handle)
-                        .serve(
-                            peer_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                        )
-                        .await
-                    {
-                        tracing::error!(error = %e, "mtls: peer TLS listener stopped");
-                    }
-                }))
+                let shutdown = shutdown_rx.clone();
+                Some(tokio::spawn(serve_mtls(addr, rx, peer_app, shutdown)))
             }
             Err(e) => {
                 tracing::error!(bind = %mtls_bind, error = %e, "mtls: invalid TLS bind address");
@@ -721,6 +780,44 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
 
     tracing::info!("agentlink node stopped");
     Ok(())
+}
+
+/// 对等节点 TLS 监听任务（v0.6 P1）：等待运行态提供「服务端 TLS 配置」后绑定。
+/// 权威节点启动即可用；成员节点在 CA 自动分发领取到 CA 后热绑定。
+async fn serve_mtls(
+    addr: std::net::SocketAddr,
+    mut rx: tokio::sync::watch::Receiver<Option<Arc<rustls::ServerConfig>>>,
+    app: axum::Router,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let server_cfg = loop {
+        if let Some(cfg) = rx.borrow().clone() {
+            break cfg;
+        }
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            res = rx.changed() => {
+                if res.is_err() {
+                    return;
+                }
+            }
+        }
+    };
+    let tls = axum_server::tls_rustls::RustlsConfig::from_config(server_cfg);
+    let handle = axum_server::Handle::new();
+    let handle_for_shutdown = handle.clone();
+    tokio::spawn(async move {
+        let _ = shutdown.changed().await;
+        handle_for_shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
+    });
+    tracing::info!(bind = %addr, "mtls: peer TLS listener started");
+    if let Err(e) = axum_server::bind_rustls(addr, tls)
+        .handle(handle)
+        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .await
+    {
+        tracing::error!(error = %e, "mtls: peer TLS listener stopped");
+    }
 }
 
 /// Resolve on Ctrl-C (or SIGTERM on Unix).

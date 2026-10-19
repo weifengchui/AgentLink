@@ -102,6 +102,15 @@ pub struct Hello {
     pub name: String,
     pub nonce: String,
     pub auth: String,
+    /// 本节点当前信任锚（集群 CA 证书）的 SHA-256 指纹；无 CA 时为 None。
+    /// 加性字段（v0.6 P1 CA 自动分发）：老节点忽略，新节点据此判断是否需要
+    /// 向对端推送集群 CA。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_fp: Option<String>,
+    /// 本节点是否参与 mTLS（`mtls.enabled`）。加性字段。用于区分「已开 mTLS
+    /// 但尚无 CA（等待领取）」与「未开 mTLS」——只有前者才应被推送 CA。
+    #[serde(default)]
+    pub mtls_enabled: bool,
 }
 
 impl Hello {
@@ -115,13 +124,59 @@ impl Hello {
             name: name.to_string(),
             auth: sign(token, node_id, &nonce, PROTOCOL_VERSION),
             nonce,
+            ca_fp: None,
+            mtls_enabled: false,
         }
+    }
+
+    /// 附加本节点的 mTLS 状态（CA 指纹 + 是否参与 mTLS）。
+    pub fn with_mtls(mut self, ca_fp: Option<String>, mtls_enabled: bool) -> Self {
+        self.ca_fp = ca_fp;
+        self.mtls_enabled = mtls_enabled;
+        self
     }
 
     /// Verify the peer proved knowledge of the shared cluster token.
     pub fn verify(&self, token: &str) -> bool {
         let expected = sign(token, &self.node_id, &self.nonce, self.v);
         constant_time_eq(self.auth.as_bytes(), expected.as_bytes())
+    }
+}
+
+// ---- CA distribution (v0.6 P1 自动分发) --------------------------------------
+
+/// 集群 CA 分发帧（`ctrl/ca_sync`）：把一个受信 CA（证书 + 私钥）推送给尚未
+/// 持有的对端。仅在 strict 模式、且对端已通过集群令牌握手后才会被接受；接收
+/// 方据指纹做冲突保护（已有不同 CA 时拒绝覆盖）。
+///
+/// 安全说明：本帧含 CA 私钥。仅发往完成了集群令牌握手的对端——即同一信任域。
+/// 与既有对称的 `cluster_token` 模型一致（持有令牌者本就可对任意 node_id 伪造
+/// 握手），故不引入额外的越权面。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaSync {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub action: String,
+    pub v: u32,
+    pub node_id: String,
+    pub ca_cert: String,
+    pub ca_key: String,
+    pub fingerprint: String,
+    pub ts: String,
+}
+
+impl CaSync {
+    pub fn new(node_id: &str, ca_cert: &str, ca_key: &str, fingerprint: &str) -> Self {
+        CaSync {
+            kind: "ctrl".to_string(),
+            action: "ca_sync".to_string(),
+            v: PROTOCOL_VERSION,
+            node_id: node_id.to_string(),
+            ca_cert: ca_cert.to_string(),
+            ca_key: ca_key.to_string(),
+            fingerprint: fingerprint.to_string(),
+            ts: now_rfc3339(),
+        }
     }
 }
 
@@ -320,5 +375,39 @@ mod tests {
         assert!(dumped.contains("\"mtls_port\":8766"));
         let back: DiscoveryMessage = serde_json::from_str(&dumped).unwrap();
         assert_eq!(back.mtls_port, Some(8766));
+    }
+
+    #[test]
+    fn hello_mtls_fields_are_additive() {
+        // 老节点握手帧（无 ca_fp / mtls_enabled）必须可解析，且安全回落。
+        let legacy = r#"{"type":"ctrl","action":"hello","v":1,"node_id":"a","name":"n",
+                         "nonce":"x","auth":"deadbeef"}"#;
+        let h: Hello = serde_json::from_str(legacy).unwrap();
+        assert_eq!(h.ca_fp, None);
+        assert!(!h.mtls_enabled);
+
+        // 新节点：with_mtls 携带指纹与开关；None 指纹不落 JSON。
+        let plain = Hello::new("a", "n", "tok");
+        assert!(serde_json::to_string(&plain)
+            .unwrap()
+            .contains("\"mtls_enabled\":false"));
+        assert!(!serde_json::to_string(&plain).unwrap().contains("ca_fp"));
+
+        let withfp = Hello::new("a", "n", "tok").with_mtls(Some("abc".into()), true);
+        let dumped = serde_json::to_string(&withfp).unwrap();
+        assert!(dumped.contains("\"ca_fp\":\"abc\""));
+        assert!(dumped.contains("\"mtls_enabled\":true"));
+        assert!(withfp.verify("tok"));
+    }
+
+    #[test]
+    fn ca_sync_roundtrip() {
+        let frame = CaSync::new("a", "CERT", "KEY", "fp");
+        let dumped = serde_json::to_string(&frame).unwrap();
+        let back: CaSync = serde_json::from_str(&dumped).unwrap();
+        assert_eq!(back.action, "ca_sync");
+        assert_eq!(back.ca_cert, "CERT");
+        assert_eq!(back.ca_key, "KEY");
+        assert_eq!(back.fingerprint, "fp");
     }
 }
