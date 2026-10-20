@@ -117,6 +117,16 @@ class BaseRunner:
         """task_cancel / task_rollback 到达时回调（可选：杀子进程等）。"""
         pass
 
+    def checkpoint(self, spec):
+        """SIGTERM/SIGINT 收敛钩子（可选）：返回断点 dict 或 None。
+
+        v0.7 §6.2：返回值会作为 `task_progress.checkpoint` 上报，引擎把它
+        原样带进下一次重投 spec（新执行方从 `spec["checkpoint"]` 读取）。
+        典型实现：把进度/中间结果落盘（或经文件通道上传）后返回
+        `{"offset": N, "artifact": "<文件通道地址>", "sha256": "..."}`。
+        """
+        return None
+
 
 # --------------------------------------------------------------------------
 # CommandRunner —— CLI 型宿主（claude_code / opencode）参考实现的公共底座
@@ -214,6 +224,7 @@ class TaskAdapter:
         self._rollback = {}                     # task_id -> True（经 task_rollback）
         self.seen = {}                          # (task_id, seq) -> True 幂等
         self.in_flight = {}                     # task_id -> spec（供 on_cancel）
+        self._reporters = {}                    # task_id -> (report, spec)
         self.stats = {"spec": 0, "dup": 0, "declined": 0, "succeeded": 0,
                       "failed": 0, "canceled": 0, "progress": 0}
 
@@ -272,6 +283,40 @@ class TaskAdapter:
                 pass
         for ev in self._canceled.values():
             ev.set()
+
+    def checkpoint_all(self):
+        """对所有在途任务调用 `runner.checkpoint` 并上报（SIGTERM 钩子）。
+
+        返回成功上报的条数；runner 抛异常/返回 None 视为该任务无断点。
+        """
+        sent = 0
+        for _tid, (report, spec) in list(self._reporters.items()):
+            try:
+                cp = self.runner.checkpoint(spec)
+            except Exception as e:
+                if self.log:
+                    self.log(f"[adapter {self.bus.agent}] checkpoint 异常: {e}")
+                cp = None
+            if cp:
+                report(stage="checkpoint", checkpoint=cp)
+                sent += 1
+        return sent
+
+    def install_signal_handlers(self):
+        """注册 SIGTERM/SIGINT：先 checkpoint 再 stop，然后退出进程。
+
+        `serve_forever()` 在宿主主线程运行时调用本方法即可获得
+        「SIGTERM 保存断点」语义；库本身不自动接管信号（避免侵入宿主）。
+        """
+        import signal
+
+        def _on_signal(_signum, _frame):
+            self.checkpoint_all()
+            self.stop()
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGINT, _on_signal)
 
     def handle_frame(self, env):
         """单帧处理（serve_forever 与冒烟共用）。未知 topic 忽略（向前兼容）。"""
@@ -345,13 +390,19 @@ class TaskAdapter:
         # 承接
         self._reply(origin, "task_accepted", tid, reply_to=reply_to)
         seq = [0]
+        seq_lock = threading.Lock()
 
         def report(**kw):
-            seq[0] += 1
+            # checkpoint_all 可能从信号线程并发上报：seq 分配串行化。
+            with seq_lock:
+                seq[0] += 1
+                n = seq[0]
             self.stats["progress"] += 1
-            p = {"topic": "task_progress", "task_id": tid, "seq": seq[0]}
+            p = {"topic": "task_progress", "task_id": tid, "seq": n}
             p.update({k: v for k, v in kw.items() if v is not None})
             self.bus.send(origin, p, reply_to=reply_to)
+
+        self._reporters[tid] = (report, spec)
         # 执行
         try:
             out = self.runner.run(spec, report, pen.is_set)
@@ -383,6 +434,7 @@ class TaskAdapter:
     def _finish(self, tid):
         self._canceled.pop(tid, None)
         self.in_flight.pop(tid, None)
+        self._reporters.pop(tid, None)
 
 
 def _past_deadline(dl):

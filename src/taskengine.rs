@@ -137,6 +137,10 @@ pub struct TaskRecord {
     pub message_count: u64,
     /// 轨迹中被 lockdown 拦截（未投递/转发）的帧数（v0.5 §4.5 薄档口径）。
     pub blocked_count: u64,
+    /// v0.7 §6.2 执行方上报的断点（不透明 JSON：offset/artifact/sha256 等），
+    /// 重投 spec 时原样带给新执行方。缺席 = 无断点。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<Value>,
     /// 最近一次 task_progress 的帧时间戳原文（maintain 心跳，drift 判定基线）。
     #[serde(default)]
     pub last_progress_ts: Option<String>,
@@ -178,6 +182,7 @@ impl TaskRecord {
             last_progress_ts: None,
             created_ts: ts.map(str::to_string),
             last_ts: ts.map(str::to_string),
+            checkpoint: None,
             last_spec_seq: None,
             next_retry_at: None,
             assignee_node: None,
@@ -333,6 +338,16 @@ pub fn apply_event(records: &mut TaskTable, frame: &Value) -> ApplyOutcome {
         }
         if rec.to_agent.is_none() {
             rec.to_agent = get_str("to_agent").map(str::to_string);
+        }
+    }
+
+    // ---- v0.7 §6.2 断点：任何未被拦截的任务帧都可携带 `checkpoint`，
+    // 后者覆盖前者；重投 spec 带回的 checkpoint 与已有值相同（幂等）。----
+    if !blocked {
+        if let Some(cp) = payload.get("checkpoint") {
+            if !cp.is_null() {
+                rec.checkpoint = Some(cp.clone());
+            }
         }
     }
 
@@ -814,5 +829,38 @@ mod tests {
         apply_event(&mut t, &frame(5, "task_accepted", "r", None));
         assert_eq!(t["r"].state, TaskState::Running);
         assert_eq!(t["r"].attempts, 2); // 复活再计一次
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ev(topic: &str, seq: u64, cp: Option<serde_json::Value>) -> Value {
+        let mut p = json!({"topic": topic, "task_id": "cp-1", "seq": seq});
+        if let Some(c) = cp {
+            p["checkpoint"] = c;
+        }
+        json!({"payload": p})
+    }
+
+    #[test]
+    fn checkpoint_is_sticky_and_last_write_wins() {
+        let mut t = TaskTable::new();
+        apply_event(&mut t, &ev("task_spec", 1, None));
+        assert!(t["cp-1"].checkpoint.is_none());
+        apply_event(&mut t, &ev("task_progress", 2, Some(json!({"offset": 50}))));
+        assert_eq!(t["cp-1"].checkpoint, Some(json!({"offset": 50})));
+        // 不带 checkpoint 的进度帧不擦除断点。
+        apply_event(&mut t, &ev("task_progress", 3, None));
+        assert_eq!(t["cp-1"].checkpoint, Some(json!({"offset": 50})));
+        // 新断点覆盖旧值；终态帧也可携带最终断点（审计/重放用）。
+        apply_event(&mut t, &ev("task_progress", 4, Some(json!({"offset": 70}))));
+        let mut failed = ev("task_failed", 5, Some(json!({"offset": 71})));
+        failed["payload"]["error"] = json!("boom");
+        apply_event(&mut t, &failed);
+        assert_eq!(t["cp-1"].state, TaskState::Failed);
+        assert_eq!(t["cp-1"].checkpoint, Some(json!({"offset": 71})));
     }
 }

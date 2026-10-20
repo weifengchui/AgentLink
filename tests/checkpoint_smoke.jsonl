@@ -1,0 +1,5 @@
+{"scenario": "S0 拓扑就绪（W1 执行器在线；W2 待 S1 启动）", "pass": true, "detail": {"peers_online": 1}}
+{"scenario": "S1 硬杀 W1：宽限后重派 W2，重投 spec 带 checkpoint 并续跑成功", "pass": true, "detail": {"state": "succeeded", "attempts": 1, "w2_checkpoint": {"artifact": "file:///tmp/ck-a.ckpt", "node": "540000000002", "offset": 50}}}
+{"scenario": "S2 优雅 SIGTERM + node_drain：<10s 换机并带断点续跑", "pass": true, "detail": {"elapsed_s": 0.41, "state": "succeeded", "attempts": 1, "w2_checkpoint": {"artifact": "file:///tmp/ck-b.ckpt", "node": "540000000002", "offset": 50}, "w1_offline": true}}
+{"scenario": "S3 S/W2 存活、日志无 panic", "pass": true, "detail": {"s_alive": true, "w2_alive": true, "panics": []}}
+{"scenario": "S4 Adapter SDK checkpoint 钩子：在途任务上报 offset=42", "pass": true, "detail": {"sent": 1, "checkpoints": [{"offset": 42, "artifact": "file:///tmp/sdk.ckpt"}]}}

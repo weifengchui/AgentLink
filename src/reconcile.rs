@@ -575,7 +575,13 @@ impl Engine {
                     continue;
                 }
                 let first = *since.entry(tid.clone()).or_insert(now);
-                if now.duration_since(first) >= grace {
+                // 优雅下线（node_drain）：不等宽限期，下一 tick 立即换机。
+                let node_grace = if self.router.is_draining(&node) {
+                    Duration::ZERO
+                } else {
+                    grace
+                };
+                if now.duration_since(first) >= node_grace {
                     due.push((tid.clone(), node, rec.attempts));
                 }
             }
@@ -963,6 +969,14 @@ impl Engine {
         spec_obj.insert("seq".to_string(), json!(seq));
         spec_obj.insert("from_agent".to_string(), json!("engine"));
         spec_obj.insert("to_agent".to_string(), json!(to_agent));
+        // v0.7 §6.2：把最新断点随重投 spec 带给新执行方（不透明 JSON）。
+        let checkpoint = {
+            let table = self.mesh.table.lock().unwrap();
+            table.get(task_id).and_then(|r| r.checkpoint.clone())
+        };
+        if let Some(cp) = checkpoint {
+            spec_obj.insert("checkpoint".to_string(), cp);
+        }
 
         let mut env = Envelope::business(
             self.router.node_id(),

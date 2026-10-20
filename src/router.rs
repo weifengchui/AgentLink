@@ -995,6 +995,9 @@ pub struct Router {
     standalone_after_secs: u64,
     /// 最近一次有直连对端（连接/断开）的时刻；standalone 计时起点。
     last_peer_seen: Mutex<Instant>,
+    /// v0.7 §6.2 正在优雅下线的节点（收到 node_drain）：不参与调度，
+    /// 在途任务跳过 reclaim 宽限期立即换机；重连注册即清除。
+    draining: Mutex<HashSet<String>>,
 }
 
 /// 一条中继学到的节点目录记录。
@@ -1147,6 +1150,7 @@ impl Router {
             read_only: AtomicBool::new(cfg.mesh.degraded.read_only),
             standalone_after_secs: cfg.mesh.degraded.standalone_after_seconds,
             last_peer_seen: Mutex::new(Instant::now()),
+            draining: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1360,6 +1364,7 @@ impl Router {
     pub fn register_peer(&self, sink: PeerSink) {
         self.registry.insert(sink.clone());
         *self.last_peer_seen.lock().unwrap() = Instant::now();
+        self.draining.lock().unwrap().remove(&sink.node_id);
         self.offline_nodes.lock().unwrap().remove(&sink.node_id);
         tracing::info!(peer = %sink.name, node_id = %sink.node_id, addr = %sink.addr, "router: peer registered");
         // v0.5 §7.1 structured twin (debug level: default text output of the
@@ -2662,6 +2667,10 @@ impl Router {
         if node_id == self.cfg.node_id {
             return true;
         }
+        // 已宣告 drain 的节点：即使 WS 还没断，也不再接受新派发/宽限。
+        if self.draining.lock().unwrap().contains(node_id) {
+            return false;
+        }
         if self.registry.get(node_id).is_some() || self.dir_online(node_id) {
             return true;
         }
@@ -2670,6 +2679,53 @@ impl Router {
             Some(at) => at.elapsed().as_secs() > OFFLINE_MEMORY_SECONDS,
             None => true,
         }
+    }
+
+    /// v0.7 §6.2：收到对端优雅下线通告。标记后立即不可调度、在途任务
+    /// 跳过 reclaim 宽限期；重连注册会清除。返回首次标记（重复通告幂等）。
+    pub fn on_node_drain(&self, node_id: &str) -> bool {
+        if node_id == self.cfg.node_id {
+            return false;
+        }
+        let first = self.draining.lock().unwrap().insert(node_id.to_string());
+        self.mark_node_offline(node_id);
+        if first {
+            tracing::info!(node_id, "router: peer drain announced（graceful shutdown）");
+            self.audit_event(
+                "node.drain",
+                "peer",
+                serde_json::json!({ "node_id": node_id, "at": crate::store::now_wall() }),
+            );
+            self.notify(
+                "node_draining",
+                serde_json::json!({ "node_id": node_id, "at": crate::store::now_wall() }),
+            );
+        }
+        first
+    }
+
+    pub fn is_draining(&self, node_id: &str) -> bool {
+        self.draining.lock().unwrap().contains(node_id)
+    }
+
+    /// v0.7 §6.2：进程退出前向所有直连 peer 宣告 drain（尽力而为，
+    /// 失败不影响退出）。控制面帧按既有规则签名。
+    pub fn broadcast_drain(&self) {
+        let mut env = Envelope::business(
+            &self.cfg.node_id,
+            "*",
+            "ctrl",
+            "node_drain",
+            serde_json::json!({ "node_id": self.cfg.node_id }),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        self.sign_control(&mut env);
+        self.broadcast_envelope(&env);
+        tracing::info!("router: drain announced to peers（graceful shutdown）");
     }
 
     /// 标记节点离线（直连断开时调用；重连注册会清除）。chaos 冒烟也用它
@@ -3369,6 +3425,36 @@ mod mode_tests {
         assert_eq!(r.mesh_mode(), MeshMode::ReadOnly);
         r.set_read_only(false);
         assert_eq!(r.mesh_mode(), MeshMode::Normal);
+    }
+
+    #[test]
+    fn drain_marks_offline_and_reconnect_clears() {
+        use super::PeerSink;
+        use tokio::sync::mpsc;
+
+        let r = router_with(0, false);
+        let (tx, _rx) = mpsc::channel(4);
+        r.register_peer(PeerSink {
+            node_id: "n2".to_string(),
+            name: "n2".to_string(),
+            addr: "127.0.0.1:2".to_string(),
+            tx,
+        });
+        assert!(r.node_online("n2"));
+        assert!(r.on_node_drain("n2"));
+        assert!(!r.node_online("n2"), "drain 后不再参与调度");
+        assert!(r.is_draining("n2"));
+        assert!(!r.on_node_drain("n2"), "重复通告幂等");
+        // 重连注册清除 draining。
+        let (tx2, _rx2) = mpsc::channel(4);
+        r.register_peer(PeerSink {
+            node_id: "n2".to_string(),
+            name: "n2".to_string(),
+            addr: "127.0.0.1:2".to_string(),
+            tx: tx2,
+        });
+        assert!(!r.is_draining("n2"));
+        assert!(r.node_online("n2"));
     }
 
     #[test]

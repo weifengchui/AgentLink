@@ -1002,6 +1002,10 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
     )
     .with_graceful_shutdown(async move {
         shutdown_signal().await;
+        // v0.7 §6.2：先宣告 drain，让对端立即回收/换机，再停服务。
+        router.broadcast_drain();
+        // 给 drain 帧一个刷出窗口（send 是 fire-and-forget tokio 任务）。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let _ = shutdown_tx.send(true);
     })
     .await

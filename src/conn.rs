@@ -621,6 +621,38 @@ async fn handle_text(
             true
         }
 
+        // v0.7 §6.2：对端优雅下线（SIGTERM 前广播）。立即标记不可调度，
+        // 在途任务跳过 reclaim 宽限期换机；多级拓扑经 spine 继续扩散。
+        "node_drain" => {
+            let Ok(env) = serde_json::from_value::<Envelope>(value.clone()) else {
+                return true;
+            };
+            if !state.router.verify_control(&env) {
+                tracing::warn!(from = %env.from, "conn: node_drain rejected (control signature)");
+                state.router.notify(
+                    "audit_alert",
+                    serde_json::json!({
+                        "kind": "control_frame_rejected",
+                        "action": "node_drain",
+                        "from": env.from,
+                        "msg_id": env.msg_id,
+                    }),
+                );
+                return true;
+            }
+            let target = env
+                .payload
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(env.from.as_str())
+                .to_string();
+            state.router.on_node_drain(&target);
+            if cfg.relay.enabled {
+                state.router.relay_control(&env, peer_id.as_deref()).await;
+            }
+            true
+        }
+
         // v0.7 第二波：节点目录中继（spine 周期推送 / 新 peer 注册即推）。
         "node_dir" => {
             let Ok(env) = serde_json::from_value::<Envelope>(value.clone()) else {
