@@ -58,17 +58,29 @@ POST /v1/tasks
   `retry_after_seconds: 60`），不含任务 payload。
 - 审计 `quota.reject` 字段：`namespace`、`reason`、`limit`、`current`、
   `inflight`、`task_id`；webhook `quota_alert` 同源但无 task_id（降噪）。
-- `GET /v1/mesh/quota`（Admin）返回：
-  ```jsonc
-  { "ok": true, "enabled": true,
-    "defaults": {"max_open":0,"max_inflight":0,"max_submit_per_minute":0},
-    "namespaces": [
-      {"namespace":"team-a","max_open":2,"max_inflight":1,
-       "max_submit_per_minute":10,"open":2,"inflight":1,"submit_last_minute":3}
-    ] }
-  ```
-  包含配置里列出的 namespace + 当前表里出现的 namespace。
-- Operator 调 `/v1/mesh/quota` → 403（与 `/v1/mesh/status` 同口径）。
+- `GET /v1/mesh/quota`：
+  - Admin 返回全局视图（省略 `scope`）：
+    ```jsonc
+    { "ok": true, "enabled": true,
+      "defaults": {"max_open":0,"max_inflight":0,"max_submit_per_minute":0},
+      "namespaces": [
+        {"namespace":"team-a","max_open":2,"max_inflight":1,
+         "max_submit_per_minute":10,"open":2,"inflight":1,"submit_last_minute":3}
+      ] }
+    ```
+    包含配置里列出的 namespace + 当前表里出现的 namespace。
+  - namespace 绑定 token（Operator/Viewer）返回 `scope` + **仅本租户一行**，
+    便于租户自助看用量，不暴露其他租户的任务数/速率：
+    ```jsonc
+    { "ok": true, "enabled": true, "scope": "team-a",
+      "defaults": {"max_open":0,"max_inflight":0,"max_submit_per_minute":0},
+      "namespaces": [
+        {"namespace":"team-a","max_open":2,"max_inflight":1,
+         "max_submit_per_minute":10,"open":2,"inflight":1,"submit_last_minute":3}
+      ] }
+    ```
+- **未绑定** namespace 的 Operator 调 `/v1/mesh/quota` → 403（与
+  `/v1/mesh/status` 同口径）；绑定 token 只能看本行，不能看全局/其他租户。
 
 ## 3. 改动面
 
@@ -82,7 +94,7 @@ POST /v1/tasks
   `namespace_inflight` 并调用带配额调度。
 - `src/api.rs`：`MeshRuntime.quota_rate`；`tasks_post` 准入（429/审计/
   webhook）；`GET /v1/mesh/quota` 视图与路由。
-- 单测 175/175。
+- 单测 183/183（当前累计；配额包自身 +5）。
 
 ## 4. 验证
 
@@ -93,11 +105,11 @@ rate=10，team-rate rate=1，default 全 0。
 
 | 场景 | 结论 |
 |---|---|
-| S0 `/v1/mesh/quota` 配置视图正确；Operator 403 | PASS |
+| S0 配置视图正确；未绑定 Operator 403；绑定 operator 仅本租户 200 | PASS |
 | S1 A running + B pending 后第 3 个提交 429 `open_quota`，未入表（GET 404） | PASS |
 | S2 inflight=1：A 在跑时 B 保持 pending 且未派发；release A 后 B 才 running | PASS |
 | S3 team-rate 第 2 次提交 429 `rate_limited` 且未入表；default 仍 202 | PASS |
-| S4 用量面：team-a open=1/inflight=1/rate=3；team-rate rate=1；default 用量正确 | PASS |
+| S4 用量面：team-a open=1/inflight=1/rate=3；team-rate rate=1；default 用量正确；绑定 token 只返回 team-a 一行 | PASS |
 | S5 release B 后终态，team-a open/inflight 归零 | PASS |
 | S6 两进程存活、日志无 panic | PASS |
 
@@ -106,10 +118,11 @@ rate=10，team-rate rate=1，default 全 0。
 ### 零回归
 
 `cargo fmt --check` 全绿 · `cargo clippy -- -D warnings`（default + mdns）零 ·
-`cargo test 175/175`；acceptance 5/5（200/200）、chaos 6/6、checkpoint 5/5、
-abac 6/6、namespace 9/9、guardrails 9/9、degraded 6/6、audit 7/7、slo 7/7、
-adapter-sdk 10/10、relay-cascade 10/10、engine 27/27、tasks 17/17、events
-20/20、streaming 5/5、gitops 10/10、webhook 7/7、warmpool 6/6、circuit 3/3。
+`cargo test 183/183`；acceptance 5/5（200/200）、chaos kill-node 6/6、chaos
+注入 8/8、checkpoint 5/5、abac 6/6、namespace 9/9、guardrails 9/9、degraded
+6/6、audit 7/7、slo 7/7、oidc 9/9、adapter-sdk 10/10、relay-cascade 10/10、
+engine 27/27、tasks 17/17、events 20/20、streaming 5/5、gitops 10/10、
+webhook 7/7、warmpool 6/6、circuit 3/3。
 
 ## 5. 边界与残留
 
@@ -121,12 +134,15 @@ adapter-sdk 10/10、relay-cascade 10/10、engine 27/27、tasks 17/17、events
 3. **只做任务数 + 提交速率**：时长配额（可按 deadline 派生）、磁盘配额
    （需要文件归属 namespace）、LLM token 计量（需要执行方上报 usage）尚未
    实现。
-4. **重启清空速率窗口**：60 秒窗口是进程内 `Instant` 队列；任务计数从
+4. **租户自助视图无历史**：`/v1/mesh/quota` 只给当前 open/inflight 与 60s
+   速率窗口，不提供按小时/天趋势；`defaults` 仍会暴露全局默认策略（不是
+   其他租户数据）。审计/SLO 仍按全局治理面，租户不可见。
+5. **重启清空速率窗口**：60 秒窗口是进程内 `Instant` 队列；任务计数从
    journal 重建，不丢。重启瞬间速率归零是可接受的保护语义。
-5. **重试复活**：`failed` 视为终态不占 open；若随后被 `task_accepted`
+6. **重试复活**：`failed` 视为终态不占 open；若随后被 `task_accepted`
    复活为 running，open 可能短暂超过上限（派发仍受 inflight 约束）。
-6. **预热池/重派**：warmpool 任务默认 namespace，会计入 default 配额；
+7. **预热池/重派**：warmpool 任务默认 namespace，会计入 default 配额；
    重试/回收换机不重新走准入（同一任务行），但占用 inflight。
-7. **429 无 `Retry-After` 头**：响应体给 `retry_after_seconds`，未加 HTTP
+8. **429 无 `Retry-After` 头**：响应体给 `retry_after_seconds`，未加 HTTP
    头；客户端应按响应体退避。
-8. **无按 agent / task_type 的细分配额**；namespace 是唯一维度。
+9. **无按 agent / task_type 的细分配额**；namespace 是唯一维度。

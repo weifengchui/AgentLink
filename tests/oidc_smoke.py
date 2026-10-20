@@ -258,13 +258,16 @@ def main():
         # ---- S1 OIDC operator ----------------------------------------------
         st_tasks, _ = api(PORT_S, "/v1/tasks", token="oidc-ops", bearer=True)
         st_status, _ = api(PORT_S, "/v1/mesh/status", token="oidc-ops", bearer=True)
-        st_quota, _ = api(PORT_S, "/v1/mesh/quota", token="oidc-ops", bearer=True)
+        st_quota, quota_view = api(PORT_S, "/v1/mesh/quota", token="oidc-ops", bearer=True)
         st_x, _ = api(PORT_S, "/v1/tasks", token="oidc-ops")  # X-Auth-Token 也支持
-        record("S1 OIDC operator（role_map ops）可读任务、治理面 403",
+        quota_rows = [r.get("namespace") for r in quota_view.get("namespaces") or []]
+        record("S1 OIDC operator（role_map ops）：任务 200、治理面 403、配额仅本租户 200",
                st_tasks == 200 and st_x == 200 and st_status == 403
-               and st_quota == 403,
+               and st_quota == 200 and quota_view.get("scope") == "team-a"
+               and quota_rows == ["team-a"],
                {"tasks": st_tasks, "x_auth": st_x, "status": st_status,
-                "quota": st_quota})
+                "quota": st_quota, "scope": quota_view.get("scope"),
+                "quota_rows": quota_rows})
 
         # ---- S2 OIDC admin --------------------------------------------------
         st_admin, _ = api(PORT_S, "/v1/mesh/status", token="oidc-admin", bearer=True)

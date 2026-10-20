@@ -8,7 +8,7 @@
   default   : 全 0（不限制）
 
 场景：
-  S0 /v1/mesh/quota 配置视图；Operator 403
+  S0 /v1/mesh/quota 配置视图；未绑定 Operator 403；绑定 operator 只看本租户
   S1 open 上限：A running + B pending 后 C → 429 open_quota 且不落表
   S2 in-flight 截流：A 在跑时 B 不派发；release A 后 B 才上线
   S3 速率：team-rate 第 2 次提交 429 rate_limited；default 不受影响
@@ -38,6 +38,7 @@ ROOT = os.path.expanduser("~/.hermes/profiles/agentlink/cache/scratch/quota-sim"
 CLUSTER = "q-cluster"
 ADMIN = "q-admin"
 OP = "q-op"
+TEAM_OP = "q-team"
 PORT_S, PORT_W1 = 18963, 18964
 NODE_S, NODE_W1 = "580000000001", "580000000002"
 EVIDENCE = []
@@ -90,7 +91,8 @@ def kill_stale():
                 pass
 
 
-def write_cfg(name, port, node_id, peers, *, mesh=False, quota=None, tokens=None):
+def write_cfg(name, port, node_id, peers, *, mesh=False, quota=None, tokens=None,
+              token_namespaces=None):
     cfg = {
         "v": 1, "node_id": node_id, "name": name, "listen_port": port,
         "data_dir": os.path.join(ROOT, f"data{port}"),
@@ -109,6 +111,8 @@ def write_cfg(name, port, node_id, peers, *, mesh=False, quota=None, tokens=None
     }
     if tokens:
         cfg["auth"] = {"tokens": tokens}
+    if token_namespaces:
+        cfg.setdefault("auth", {})["token_namespaces"] = token_namespaces
     if quota is not None:
         cfg["mesh"]["quota"] = quota
     path = os.path.join(ROOT, f"{name}.json")
@@ -265,7 +269,8 @@ def main():
     ex = None
     try:
         cfg_s = write_cfg("s", PORT_S, NODE_S, [PORT_W1], mesh=True,
-                          quota=quota, tokens={OP: "operator"})
+                          quota=quota, tokens={OP: "operator", TEAM_OP: "operator"},
+                          token_namespaces={TEAM_OP: "team-a"})
         cfg_w = write_cfg("w1", PORT_W1, NODE_W1, [PORT_S])
         procs["s"] = start(cfg_s, "s.log")
         assert wait_for(lambda: probe(PORT_S), 25), "S 未启动"
@@ -279,12 +284,17 @@ def main():
         # ---- S0 配置视图 + RBAC --------------------------------------------
         rows, view = quota_rows()
         st_op, _ = api(PORT_S, "/v1/mesh/quota", token=OP)
+        st_team, team_view = api(PORT_S, "/v1/mesh/quota", token=TEAM_OP)
+        team_rows = [r.get("namespace") for r in team_view.get("namespaces") or []]
         ta = rows.get("team-a") or {}
-        record("S0 quota 视图正确；Operator 403",
+        record("S0 quota 视图正确；未绑定 Operator 403；绑定 operator 只看本租户",
                view.get("enabled") is True
                and ta.get("max_open") == 2 and ta.get("max_inflight") == 1
-               and ta.get("max_submit_per_minute") == 10 and st_op == 403,
-               {"team-a": ta, "operator": st_op})
+               and ta.get("max_submit_per_minute") == 10 and st_op == 403
+               and st_team == 200 and team_rows == ["team-a"]
+               and team_view.get("scope") == "team-a",
+               {"team-a": ta, "operator": st_op, "team": st_team,
+                "team_rows": team_rows})
 
         # ---- S1 open 上限 ---------------------------------------------------
         st_a, _ = submit("qta1", "team-a")
@@ -334,12 +344,18 @@ def main():
         ta4 = rows4.get("team-a") or {}
         tr4 = rows4.get("team-rate") or {}
         df4 = rows4.get("default") or {}
-        record("S4 用量面：team-a open/inflight、team-rate rate、default 用量",
+        st_team4, team4 = api(PORT_S, "/v1/mesh/quota", token=TEAM_OP)
+        team4_rows = team4.get("namespaces") or []
+        record("S4 用量面：team-a open/inflight、team-rate rate、default 用量；绑定 token 只看本行",
                ta4.get("open") == 1 and ta4.get("inflight") == 1
                and ta4.get("submit_last_minute") == 3
                and tr4.get("open") == 1 and tr4.get("submit_last_minute") == 1
-               and df4.get("open") == 1 and df4.get("max_open") == 0,
-               {"team-a": ta4, "team-rate": tr4, "default": df4})
+               and df4.get("open") == 1 and df4.get("max_open") == 0
+               and st_team4 == 200 and len(team4_rows) == 1
+               and team4_rows[0].get("namespace") == "team-a"
+               and team4_rows[0].get("open") == 1,
+               {"team-a": ta4, "team-rate": tr4, "default": df4,
+                "team_rows": team4_rows})
 
         # ---- S5 收尾：release B --------------------------------------------
         ex.release("qta2")

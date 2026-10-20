@@ -1,5 +1,5 @@
 {"scenario": "S0 静态 local/operator token 行为不变；无 token 401", "pass": true, "detail": {"local": 200, "op_tasks": 200, "op_status": 403, "none": 401}}
-{"scenario": "S1 OIDC operator（role_map ops）可读任务、治理面 403", "pass": true, "detail": {"tasks": 200, "x_auth": 200, "status": 403, "quota": 403}}
+{"scenario": "S1 OIDC operator（role_map ops）：任务 200、治理面 403、配额仅本租户 200", "pass": true, "detail": {"tasks": 200, "x_auth": 200, "status": 403, "quota": 200, "scope": "team-a", "quota_rows": ["team-a"]}}
 {"scenario": "S2 OIDC admin 可读治理面", "pass": true, "detail": {"status": 200}}
 {"scenario": "S3 inactive/未知/伪造内部头 401；有效 OIDC + 伪造 admin 仍 operator", "pass": true, "detail": {"inactive": 401, "unknown": 401, "spoof_unknown": 401, "spoof_valid_status": 403, "spoof_none": 401}}
 {"scenario": "S4 5s 缓存：同 token 两次请求只打一次 introspection", "pass": true, "detail": {"before": 0, "after": 1, "calls": 1}}

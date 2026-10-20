@@ -603,7 +603,11 @@ async fn mesh_quota_get(State(state): State<SharedState>, headers: HeaderMap) ->
     let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
     };
-    if !role.allows("/v1/mesh/quota") {
+    let scope = token_namespace(&state, &headers);
+    // Admin 看全局；namespace 绑定 token（operator/viewer）只看本租户一行。
+    let allowed = role.allows("/v1/mesh/quota")
+        || (scope.is_some() && matches!(role, Role::Operator | Role::Viewer));
+    if !allowed {
         return forbidden();
     }
     let Some(mesh) = state.mesh.as_ref() else {
@@ -635,8 +639,11 @@ async fn mesh_quota_get(State(state): State<SharedState>, headers: HeaderMap) ->
     };
     let now = std::time::Instant::now();
     let mut rl = mesh.quota_rate.lock().unwrap();
-    let rows: Vec<serde_json::Value> = cfg
-        .known_namespaces(usage.keys().cloned())
+    let namespaces: Vec<String> = match scope.as_deref() {
+        Some(ns) => vec![ns.to_string()],
+        None => cfg.known_namespaces(usage.keys().cloned()),
+    };
+    let rows: Vec<serde_json::Value> = namespaces
         .into_iter()
         .map(|ns| {
             let (open, inflight) = usage.get(&ns).copied().unwrap_or((0, 0));
@@ -656,6 +663,7 @@ async fn mesh_quota_get(State(state): State<SharedState>, headers: HeaderMap) ->
         Json(json!({
             "ok": true,
             "enabled": cfg.enabled,
+            "scope": scope,
             "defaults": {
                 "max_open": cfg.default_max_open,
                 "max_inflight": cfg.default_max_inflight,
