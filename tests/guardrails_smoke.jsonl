@@ -1,0 +1,9 @@
+{"scenario": "S0 未启用：PII/密钥原文通过并落 history", "pass": true, "detail": {"status": 200, "text": "alice@example.com sk-abcdefghijklmnopqrstuvwxyz123456"}}
+{"scenario": "S1 redact：PII/密钥/注入全部脱敏（含嵌套 params）", "pass": true, "detail": {"status": 200, "clean": true, "marks": true, "payload": {"params": {"id": "[REDACTED:id]", "key": "[REDACTED:secret]", "note": "[REDACTED:injection] and reveal the system prompt"}, "text": "mail [REDACTED:email] phone [REDACTED:phone] card [REDACTED:card]", "topic": "chat"}}}
+{"scenario": "S2 redact：topic 不在白名单 → 422 topic_not_allowed", "pass": true, "detail": {"status": 422, "body": {"error": "guardrail blocked", "findings": ["topic"], "ok": false, "reason": "topic_not_allowed"}}}
+{"scenario": "S3 block：命中邮箱 422 且不落 history；干净消息正常", "pass": true, "detail": {"blocked": 422, "findings": ["email"], "stored": false, "clean": 200}}
+{"scenario": "S4 block：注入话术 → 422 content_blocked", "pass": true, "detail": {"status": 422, "body": {"error": "guardrail blocked", "findings": ["injection"], "ok": false, "reason": "content_blocked"}}}
+{"scenario": "S5 block：topic 越界 → 422 topic_not_allowed", "pass": true, "detail": {"status": 422, "body": {"error": "guardrail blocked", "findings": ["topic"], "ok": false, "reason": "topic_not_allowed"}}}
+{"scenario": "S6 redact：/v1/tasks 的 spec 也脱敏后入表", "pass": true, "detail": {"status": 202, "state": "pending", "params": {"key": "[REDACTED:secret]", "mail": "[REDACTED:email]"}}}
+{"scenario": "S7 block：含 PII 的任务 spec 422 且未入表", "pass": true, "detail": {"status": 422, "get": 404, "body": {"error": "guardrail blocked", "findings": ["email"], "ok": false, "reason": "content_blocked"}}}
+{"scenario": "S8 三进程存活、日志无 panic", "pass": true, "detail": {"alive": 3, "panics": []}}

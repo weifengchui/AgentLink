@@ -428,6 +428,9 @@ pub struct SecurityConfig {
     /// ABAC 策略（v0.7 §4.2）。缺省 enabled=false：所有候选节点放行。
     #[serde(default)]
     pub abac: crate::abac::AbacConfig,
+    /// 消息护栏（v0.7 §4.3）。缺省 enabled=false：不扫描、不改写。
+    #[serde(default)]
+    pub guardrails: crate::guardrails::GuardrailsConfig,
 }
 
 /// 不可变审计日志配置：hash 链 append-only，落 `<data_dir>/audit/audit.jsonl`。
@@ -945,6 +948,7 @@ impl Default for SecurityConfig {
             control_auth: false,
             audit: AuditConfig::default(),
             abac: crate::abac::AbacConfig::default(),
+            guardrails: crate::guardrails::GuardrailsConfig::default(),
         }
     }
 }
@@ -1069,6 +1073,7 @@ impl Config {
                 control_auth: false,
                 audit: AuditConfig::default(),
                 abac: crate::abac::AbacConfig::default(),
+                guardrails: crate::guardrails::GuardrailsConfig::default(),
             },
             local_api: LocalApiConfig {
                 host: default_local_host(),
@@ -1177,6 +1182,7 @@ impl Config {
             anyhow::bail!("log.format must be 'text' or 'json'");
         }
         crate::abac::validate(&self.security.abac)?;
+        crate::guardrails::validate(&self.security.guardrails)?;
         // v0.7 §4.2 多租户：绑定 token 不能是 Admin（Admin 是集群级角色），
         // 也不能是 local_api.token（WS/全局管理入口必须保持全局）。
         for (token, ns) in &self.auth.token_namespaces {

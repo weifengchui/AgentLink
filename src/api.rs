@@ -1045,6 +1045,14 @@ async fn status(State(state): State<SharedState>, headers: HeaderMap) -> impl In
             "active_transfers": state.files.active(),
             "mode": state.router.mesh_mode().as_str(),
             "read_only": state.router.is_read_only(),
+            "guardrails": {
+                "enabled": state.config.security.guardrails.enabled,
+                "action": state.config.security.guardrails.action,
+                "pii": state.config.security.guardrails.pii,
+                "secrets": state.config.security.guardrails.secrets,
+                "injection": state.config.security.guardrails.injection,
+                "topics_enabled": state.config.security.guardrails.topics.enabled,
+            },
         })),
     )
 }
@@ -1198,11 +1206,63 @@ async fn send(
             );
         }
     };
-    let payload = if req.payload.is_null() {
+    let mut payload = if req.payload.is_null() {
         json!({})
     } else {
         req.payload
     };
+    // v0.7 §4.3：发送护栏（PII / API Key / 注入 / topic 白名单）。
+    // 只扫本地 API 发送路径；引擎内部帧与节点间转发不重复扫描。
+    if state.config.security.guardrails.enabled {
+        let outcome = crate::guardrails::inspect(&state.config.security.guardrails, &payload);
+        if !outcome.allowed {
+            state.router.audit_event(
+                "guardrail.blocked",
+                role.as_str(),
+                json!({
+                    "from_agent": req.from_agent,
+                    "to_agent": req.to_agent,
+                    "type": req.kind,
+                    "action": req.action,
+                    "reason": outcome.report.reason,
+                    "findings": outcome.report.findings,
+                    "topic": payload.get("topic").and_then(|v| v.as_str()),
+                }),
+            );
+            state.router.notify(
+                "guardrail_alert",
+                json!({
+                    "kind": "blocked",
+                    "source": "send",
+                    "findings": outcome.report.findings,
+                }),
+            );
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "ok": false,
+                    "error": "guardrail blocked",
+                    "reason": outcome.report.reason,
+                    "findings": outcome.report.categories(),
+                })),
+            );
+        }
+        if outcome.report.redacted {
+            state.router.audit_event(
+                "guardrail.redacted",
+                role.as_str(),
+                json!({
+                    "from_agent": req.from_agent,
+                    "to_agent": req.to_agent,
+                    "type": req.kind,
+                    "action": req.action,
+                    "findings": outcome.report.findings,
+                    "topic": payload.get("topic").and_then(|v| v.as_str()),
+                }),
+            );
+            payload = outcome.payload;
+        }
+    }
     let mut env = Envelope::business(
         &state.config.node_id,
         &to,
@@ -1903,6 +1963,55 @@ async fn tasks_post(
                     obj.insert("namespace".to_string(), json!(scope));
                 }
             }
+        }
+    }
+    // v0.7 §4.3：任务 spec 也过护栏（PII/密钥/注入；无 payload.topic，跳过
+    // topic 白名单）。命中即 422，脱敏后的 spec 才进入引擎表/journal。
+    if state.config.security.guardrails.enabled {
+        let outcome =
+            crate::guardrails::inspect_with_topics(&state.config.security.guardrails, &body, false);
+        if !outcome.allowed {
+            state.router.audit_event(
+                "guardrail.blocked",
+                role.as_str(),
+                json!({
+                    "source": "task",
+                    "task_id": body.get("task_id").and_then(|v| v.as_str()),
+                    "type": body.get("type").and_then(|v| v.as_str()),
+                    "reason": outcome.report.reason,
+                    "findings": outcome.report.findings,
+                }),
+            );
+            state.router.notify(
+                "guardrail_alert",
+                json!({
+                    "kind": "blocked",
+                    "source": "task",
+                    "findings": outcome.report.findings,
+                }),
+            );
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "ok": false,
+                    "error": "guardrail blocked",
+                    "reason": outcome.report.reason,
+                    "findings": outcome.report.categories(),
+                })),
+            );
+        }
+        if outcome.report.redacted {
+            state.router.audit_event(
+                "guardrail.redacted",
+                role.as_str(),
+                json!({
+                    "source": "task",
+                    "task_id": body.get("task_id").and_then(|v| v.as_str()),
+                    "type": body.get("type").and_then(|v| v.as_str()),
+                    "findings": outcome.report.findings,
+                }),
+            );
+            body = outcome.payload;
         }
     }
     // 协议 §2 必填门：task_id / type 为非空字符串。其余字段（requires、

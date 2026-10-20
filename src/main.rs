@@ -14,6 +14,7 @@ mod conn;
 mod discovery;
 mod file;
 mod gitops;
+mod guardrails;
 mod lease;
 mod license;
 mod load;
