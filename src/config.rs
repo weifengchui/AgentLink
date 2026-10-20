@@ -556,6 +556,9 @@ pub struct AuthConfig {
     /// Admin 角色也不例外（要全局视角请用未绑定 token）。
     #[serde(default)]
     pub token_namespaces: std::collections::HashMap<String, String>,
+    /// v0.7 OIDC SSO（token introspection）。缺省关闭，静态 token 零变化。
+    #[serde(default)]
+    pub oidc: crate::oidc::OidcConfig,
 }
 
 fn default_auth_fallback_role() -> Role {
@@ -1188,6 +1191,7 @@ impl Config {
         crate::abac::validate(&self.security.abac)?;
         crate::guardrails::validate(&self.security.guardrails)?;
         crate::quota::validate(&self.mesh.quota)?;
+        crate::oidc::validate(&self.auth.oidc)?;
         // v0.7 §4.2 多租户：绑定 token 不能是 Admin（Admin 是集群级角色），
         // 也不能是 local_api.token（WS/全局管理入口必须保持全局）。
         for (token, ns) in &self.auth.token_namespaces {

@@ -1,0 +1,9 @@
+{"scenario": "S0 静态 local/operator token 行为不变；无 token 401", "pass": true, "detail": {"local": 200, "op_tasks": 200, "op_status": 403, "none": 401}}
+{"scenario": "S1 OIDC operator（role_map ops）可读任务、治理面 403", "pass": true, "detail": {"tasks": 200, "x_auth": 200, "status": 403, "quota": 403}}
+{"scenario": "S2 OIDC admin 可读治理面", "pass": true, "detail": {"status": 200}}
+{"scenario": "S3 inactive/未知/伪造内部头 401；有效 OIDC + 伪造 admin 仍 operator", "pass": true, "detail": {"inactive": 401, "unknown": 401, "spoof_unknown": 401, "spoof_valid_status": 403, "spoof_none": 401}}
+{"scenario": "S4 5s 缓存：同 token 两次请求只打一次 introspection", "pass": true, "detail": {"before": 0, "after": 1, "calls": 1}}
+{"scenario": "S5 namespace claim：自动注入 team-a、跨租户 404、越界 403、Admin 全局可见", "pass": true, "detail": {"submit": 202, "get": 200, "task_namespace": "team-a", "default_submit": 202, "cross_get": 404, "cross_submit": 403, "bound_ops_cross": 404, "admin_global": 200}}
+{"scenario": "S6 Admin + namespace claim 拒绝（防止租户 token 拥有全局权）", "pass": true, "detail": {"status": 401}}
+{"scenario": "S7 introspection 超时 fail-closed（2s 超时，<4s 返回 401）", "pass": true, "detail": {"status": 401, "elapsed_s": 2.0}}
+{"scenario": "S8 进程存活、日志无 panic", "pass": true, "detail": {"alive": true, "panic": false}}

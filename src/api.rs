@@ -17,6 +17,7 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::Path as UrlPath;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{async_trait, Extension, Json, Router as AxRouter};
@@ -75,6 +76,10 @@ pub struct AppState {
     /// Lease 差异上报的出站差异状态（v0.6 P1）。仅 `lease.enabled=true` 时
     /// 有对应任务在跑；关闭态只是闲置内存（零流量）。
     pub lease: crate::lease::LeaseState,
+    /// v0.7 OIDC SSO：introspection 结果缓存（key=token 的 sha256）。
+    pub oidc_cache: Mutex<crate::oidc::Cache>,
+    /// introspection 专用 HTTP 客户端（rustls，超时来自 auth.oidc）。
+    pub oidc_http: reqwest::Client,
 }
 
 impl AppState {
@@ -91,6 +96,12 @@ impl AppState {
             name: config.name.clone(),
             tags: config.tags.clone(),
         };
+        let oidc_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                config.auth.oidc.timeout_seconds.clamp(1, 30),
+            ))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         AppState {
             config,
             config_file,
@@ -104,6 +115,8 @@ impl AppState {
             mtls: None,
             hw_fp: String::new(),
             lease: crate::lease::LeaseState::new(),
+            oidc_cache: Mutex::new(crate::oidc::Cache::default()),
+            oidc_http,
         }
     }
 
@@ -383,7 +396,8 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/peer/ws", get(peer_ws))
         .route("/peer/file/ws", get(file_ws))
         .merge(upload_route)
-        .with_state(state)
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(state, oidc_middleware))
 }
 
 /// 仅对等节点使用的路由（v0.6 P1 mTLS）：只挂 peer 消息与文件通道。
@@ -4207,16 +4221,150 @@ where
     }
 }
 
-/// 鉴权并返回调用者角色（v0.6 P0 RBAC）。
+/// 从 `X-Auth-Token` 或 `Authorization: Bearer` 取令牌。
+fn header_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(t) = headers.get("x-auth-token").and_then(|v| v.to_str().ok()) {
+        let t = t.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    let auth = headers.get("authorization")?.to_str().ok()?.trim();
+    let (scheme, value) = auth.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("bearer") && !value.trim().is_empty() {
+        Some(value.trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn token_cache_key(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+/// RFC 7662 introspection（fail-closed；不缓存失败）。
+async fn introspect_oidc(state: &AppState, token: &str) -> Result<crate::oidc::Resolved, String> {
+    let cfg = &state.config.auth.oidc;
+    let resp = state
+        .oidc_http
+        .post(&cfg.introspection_url)
+        .basic_auth(&cfg.client_id, Some(&cfg.client_secret))
+        .form(&[("token", token), ("token_type_hint", "access_token")])
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                "introspection timeout".to_string()
+            } else {
+                format!("introspection transport: {e}")
+            }
+        })?;
+    if !resp.status().is_success() {
+        return Err(format!("introspection status {}", resp.status().as_u16()));
+    }
+    let claims: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("introspection json: {e}"))?;
+    crate::oidc::resolve(cfg, &claims)
+}
+
+/// v0.7 OIDC SSO 中间件：静态 token 直接放行；未知 token 走 introspection，
+/// 成功后把可信角色/namespace 注入内部头，供同步的 `authorized_role` /
+/// `token_namespace` 读取。客户端伪造的两个内部头在入口一律剥除。
+///
+/// 公开路径（health/web/starmap/ws/peer）不触发 introspection，保持旧行为。
+async fn oidc_middleware(
+    State(state): State<SharedState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    req.headers_mut().remove("x-agentlink-oidc-role");
+    req.headers_mut().remove("x-agentlink-oidc-namespace");
+
+    let path = req.uri().path();
+    let public = path == "/v1/health"
+        || path == "/web"
+        || path == "/v1/web"
+        || path == "/v1/starmap"
+        || path == "/web/setup"
+        || path == "/v1/ws"
+        || path.starts_with("/peer/");
+    if public || !state.config.auth.oidc.enabled {
+        return next.run(req).await;
+    }
+    let Some(token) = header_token(req.headers()) else {
+        return next.run(req).await;
+    };
+    if state.config.auth.tokens.contains_key(&token)
+        || constant_time_eq(token.as_bytes(), state.config.local_api.token.as_bytes())
+    {
+        return next.run(req).await;
+    }
+
+    let key = token_cache_key(&token);
+    let cached = { state.oidc_cache.lock().unwrap().get(&key) };
+    let resolved = match cached {
+        Some(r) => Some(r),
+        None => match introspect_oidc(&state, &token).await {
+            Ok(r) => {
+                let ttl = std::time::Duration::from_secs(
+                    state.config.auth.oidc.cache_seconds.clamp(1, 3600),
+                );
+                state
+                    .oidc_cache
+                    .lock()
+                    .unwrap()
+                    .put(key.clone(), r.clone(), ttl);
+                Some(r)
+            }
+            Err(reason) => {
+                let short: String = reason.chars().take(200).collect();
+                state.router.audit_event(
+                    "auth.oidc_reject",
+                    "oidc",
+                    json!({
+                        "reason": short,
+                        "token_hash": &key[..12],
+                    }),
+                );
+                None
+            }
+        },
+    };
+    let Some(resolved) = resolved else {
+        return unauthorized().into_response();
+    };
+    if let Ok(v) = HeaderValue::from_str(resolved.role.as_str()) {
+        req.headers_mut().insert("x-agentlink-oidc-role", v);
+    }
+    if let Some(ns) = resolved.namespace.as_deref() {
+        if let Ok(v) = HeaderValue::from_str(ns) {
+            req.headers_mut().insert("x-agentlink-oidc-namespace", v);
+        }
+    }
+    next.run(req).await
+}
+
+/// 鉴权并返回调用者角色（v0.6 P0 RBAC；v0.7 支持 OIDC 中间件注入）。
 /// - 未提供 token 或 token 不匹配 -> None (401)
+/// - OIDC 中间件校验成功 -> 注入的可信角色
 /// - 匹配 `local_api.token` 但不在 `auth.tokens` 中 -> fallback_role (缺省 Admin，兼容 0.5.9)
 /// - 在 `auth.tokens` 中 -> 对应角色
 fn authorized_role(state: &AppState, headers: &HeaderMap) -> Option<Role> {
-    let token = headers.get("x-auth-token").and_then(|v| v.to_str().ok())?;
+    // 仅由 OIDC 中间件在校验成功后写入；入口已剥除同名客户端头。
+    if let Some(v) = headers
+        .get("x-agentlink-oidc-role")
+        .and_then(|v| v.to_str().ok())
+    {
+        return crate::oidc::parse_role(v);
+    }
+    let token = header_token(headers)?;
     let auth = &state.config.auth;
 
     // 优先匹配显式配置的 token -> 角色
-    if let Some(role) = auth.tokens.get(token) {
+    if let Some(role) = auth.tokens.get(&token) {
         return Some(*role);
     }
 
@@ -4230,12 +4378,19 @@ fn authorized_role(state: &AppState, headers: &HeaderMap) -> Option<Role> {
 
 /// v0.7 §4.2：token 绑定的 namespace（未绑定 → None，即全局）。
 fn token_namespace(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    let token = headers.get("x-auth-token").and_then(|v| v.to_str().ok())?;
+    if let Some(ns) = headers
+        .get("x-agentlink-oidc-namespace")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(ns.to_string());
+    }
+    let token = header_token(headers)?;
     state
         .config
         .auth
         .token_namespaces
-        .get(token)
+        .get(&token)
         .cloned()
         .filter(|s| !s.is_empty())
 }

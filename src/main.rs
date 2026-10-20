@@ -22,6 +22,7 @@ mod logging;
 #[cfg(feature = "mdns")]
 mod mdns;
 mod mtls;
+mod oidc;
 mod peer;
 mod proto;
 mod quota;
