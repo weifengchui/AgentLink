@@ -1,0 +1,6 @@
+{"scenario": "S0 mesh 视图暴露 ABAC 启用与规则名", "pass": true, "detail": {"enabled": true, "rules": ["finance-not-low", "secret-high-only"]}}
+{"scenario": "S1 finance 任务只落 W2（zone:high），W1 收不到", "pass": true, "detail": {"state": "succeeded", "w1": false, "w2": true}}
+{"scenario": "S2 无 label 任务不受策略影响（正常完成）", "pass": true, "detail": {"state": "succeeded", "w1": true, "w2": false}}
+{"scenario": "S3 deny：W2 离线时 finance2 保持 pending 且 W1 收不到；W2 回来即完成", "pass": true, "detail": {"pending": true, "w1_got": false, "state": "succeeded", "w2": true}}
+{"scenario": "S4 allow：W2 离线时 secret1 保持 pending 且 W1 收不到；W2 回来即完成", "pass": true, "detail": {"pending": true, "w1_got": false, "state": "succeeded", "w2": true}}
+{"scenario": "S5 三进程存活、日志无 panic", "pass": true, "detail": {"alive": 3, "panics": []}}

@@ -514,6 +514,17 @@ async fn mesh_status_get(
                     "warmpool": warmpool,
                     "mode": state.router.mesh_mode().as_str(),
                     "standalone_after_seconds": state.router.standalone_after_secs(),
+                    "abac": {
+                        "enabled": state.config.security.abac.enabled,
+                        "rules": state
+                            .config
+                            .security
+                            .abac
+                            .rules
+                            .iter()
+                            .map(|r| r.name.as_str())
+                            .collect::<Vec<_>>(),
+                    },
                 })),
             )
         }

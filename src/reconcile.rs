@@ -218,10 +218,11 @@ impl Engine {
     ) -> tokio::task::JoinHandle<()> {
         let mesh = state.mesh.clone().expect("engine requires mesh");
         let params = EngineParams::from(&state.config.mesh.engine);
-        let scheduler = Scheduler::new(
+        let mut scheduler = Scheduler::new(
             state.config.mesh.engine.max_concurrent_per_node,
             0, // max_inflight：0=不限制，M3 后续由配额/护栏决定
         );
+        scheduler.abac = state.config.security.abac.clone();
         let local_tags = state.config.tags.clone();
         // v0.6 P2 wake-kit 收敛：复用 Router 上的同一 webhook 客户端
         // （同 config 实例化两次只会重复打启动日志，无其他差异）。
@@ -777,8 +778,9 @@ impl Engine {
             return Ok(());
         }
 
-        // 构建 node_tags：本节点 tags（远端节点 tags 暂不纳入，M3 后续补全）
-        let mut node_tags: HashMap<String, Vec<String>> = HashMap::new();
+        // 构建 node_tags：本节点 tags + 远端节点 tags（v0.7 §4.2 随
+        // agents_update 同步），供 exclude_tags 与 ABAC 共同使用。
+        let mut node_tags = self.router.peer_tags();
         node_tags.insert(self.router.node_id().to_string(), self.local_tags.clone());
 
         // 计算各节点当前负载（scheduler 口径：已派发但尚未 accepted 的

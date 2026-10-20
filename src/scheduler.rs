@@ -25,6 +25,8 @@ pub struct Scheduler {
     pub max_concurrent_per_node: usize,
     /// 全局最大 in-flight 任务数（0 = 不限制，协议 §5.5）。
     pub max_inflight: usize,
+    /// v0.7 §4.2 ABAC 策略（缺省 enabled=false，零影响）。
+    pub abac: crate::abac::AbacConfig,
 }
 
 impl Scheduler {
@@ -32,6 +34,7 @@ impl Scheduler {
         Self {
             max_concurrent_per_node,
             max_inflight,
+            abac: crate::abac::AbacConfig::default(),
         }
     }
 
@@ -77,6 +80,25 @@ impl Scheduler {
                 // 所在节点 tags 不命中 exclude_tags
                 let tags = node_tags.get(&a.node_id).cloned().unwrap_or_default();
                 !exclude_tags.iter().any(|et| tags.iter().any(|t| t == et))
+            })
+            .collect()
+    }
+
+    /// v0.7 §4.2：在 requires/exclude_tags 之上再按 ABAC 规则过滤。
+    fn candidates_abac<'a>(
+        spec: &Value,
+        agents: &'a [AgentRecord],
+        node_tags: &HashMap<String, Vec<String>>,
+        abac: &crate::abac::AbacConfig,
+    ) -> Vec<&'a AgentRecord> {
+        if !abac.enabled || abac.rules.is_empty() {
+            return Self::candidates(spec, agents, node_tags);
+        }
+        Self::candidates(spec, agents, node_tags)
+            .into_iter()
+            .filter(|a| {
+                let tags = node_tags.get(&a.node_id).cloned().unwrap_or_default();
+                crate::abac::evaluate(abac, spec, &tags).allowed
             })
             .collect()
     }
@@ -163,7 +185,7 @@ impl Scheduler {
                 .unwrap_or("")
                 .to_string();
 
-            let cands = Self::candidates(&spec, agents, node_tags);
+            let cands = Self::candidates_abac(&spec, agents, node_tags, &self.abac);
             if let Some(chosen) = Self::select_agent(&cands, loads, self.max_concurrent_per_node) {
                 loads.entry(chosen.node_id.clone()).or_insert(0);
                 *loads.get_mut(&chosen.node_id).unwrap() += 1;
@@ -381,6 +403,58 @@ mod tests {
         ];
         let result = sched.schedule_batch(&tasks, &agents, &node_tags, &mut loads, 1);
         assert_eq!(result.len(), 0, "已达全局 in-flight 上限应不调度");
+    }
+
+    #[test]
+    fn abac_filters_candidates_by_task_labels_and_node_tags() {
+        use crate::abac::{AbacConfig, AbacRule};
+        use std::collections::BTreeMap;
+
+        let mut sched = Scheduler::new(2, 0);
+        sched.abac = AbacConfig {
+            enabled: true,
+            rules: vec![AbacRule {
+                name: "secret-high-only".to_string(),
+                effect: "allow".to_string(),
+                task_labels: BTreeMap::from([("class".to_string(), "secret".to_string())]),
+                node_tags: vec!["zone:high".to_string()],
+            }],
+        };
+        let agents = vec![
+            agent("n-low", "a1", &["cap:file"], true),
+            agent("n-high", "a2", &["cap:file"], true),
+        ];
+        let mut node_tags: HashMap<String, Vec<String>> = HashMap::new();
+        node_tags.insert("n-low".to_string(), vec!["zone:low".to_string()]);
+        node_tags.insert("n-high".to_string(), vec!["zone:high".to_string()]);
+        let mut loads: HashMap<String, usize> = HashMap::new();
+
+        let mut secret = spec(&["cap:file"], 100, "2026-01-01T00:00:00Z");
+        secret
+            .as_object_mut()
+            .unwrap()
+            .insert("labels".to_string(), json!({"class": "secret"}));
+        let out = sched.schedule_batch(
+            &[("t-secret".to_string(), secret)],
+            &agents,
+            &node_tags,
+            &mut loads,
+            0,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, "n-high", "secret 只允许 zone:high");
+
+        // 未命中 allow 规则 task_labels 的任务不受约束。
+        let public = spec(&["cap:file"], 100, "2026-01-01T00:00:00Z");
+        loads.clear();
+        let out = sched.schedule_batch(
+            &[("t-public".to_string(), public)],
+            &agents,
+            &node_tags,
+            &mut loads,
+            0,
+        );
+        assert_eq!(out.len(), 1);
     }
 
     #[test]

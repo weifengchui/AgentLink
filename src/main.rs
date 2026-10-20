@@ -3,6 +3,7 @@
 //! Each machine runs one `agentlink` node. Agents on that machine talk to it
 //! over the local HTTP/WS API; nodes talk to each other over WebSocket.
 
+mod abac;
 mod admission;
 mod api;
 mod audit;

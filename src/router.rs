@@ -998,6 +998,8 @@ pub struct Router {
     /// v0.7 §6.2 正在优雅下线的节点（收到 node_drain）：不参与调度，
     /// 在途任务跳过 reclaim 宽限期立即换机；重连注册即清除。
     draining: Mutex<HashSet<String>>,
+    /// v0.7 §4.2 远端节点 tags（随 agents_update 同步）：ABAC 调度过滤用。
+    peer_tags: Mutex<HashMap<String, Vec<String>>>,
 }
 
 /// 一条中继学到的节点目录记录。
@@ -1151,6 +1153,7 @@ impl Router {
             standalone_after_secs: cfg.mesh.degraded.standalone_after_seconds,
             last_peer_seen: Mutex::new(Instant::now()),
             draining: Mutex::new(HashSet::new()),
+            peer_tags: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1434,6 +1437,7 @@ impl Router {
         let removed = self.registry.remove(node_id).is_some();
         if removed {
             self.mark_node_offline(node_id);
+            self.peer_tags.lock().unwrap().remove(node_id);
             // standalone 计时从最后一个直连对端断开起算。
             *self.last_peer_seen.lock().unwrap() = Instant::now();
         }
@@ -2526,11 +2530,33 @@ impl Router {
     }
 
     /// Cache the agent list reported by a peer node.
+    /// 兼容旧调用（仅测试/嵌入方）：等价于空 tags 的 with_tags。
+    #[allow(dead_code)]
     pub fn on_agents_update(&self, from_node: &str, agents: Vec<AgentRecord>) {
+        self.on_agents_update_with_tags(from_node, agents, Vec::new());
+    }
+
+    /// v0.7 §4.2：agent 表与节点 tags 一起同步（旧节点 payload 无 tags →
+    /// 空标签；tag 型 deny 不命中，tag 型 allow 会拒绝——见 abac 模块注释）。
+    pub fn on_agents_update_with_tags(
+        &self,
+        from_node: &str,
+        agents: Vec<AgentRecord>,
+        tags: Vec<String>,
+    ) {
         self.fleet_agents
             .lock()
             .unwrap()
             .insert(from_node.to_string(), agents);
+        self.peer_tags
+            .lock()
+            .unwrap()
+            .insert(from_node.to_string(), tags);
+    }
+
+    /// 远端节点 tags 快照（node_id → tags）。
+    pub fn peer_tags(&self) -> HashMap<String, Vec<String>> {
+        self.peer_tags.lock().unwrap().clone()
     }
 
     /// An `agents_update` envelope addressed to `to` (None if no agents here).
@@ -2539,7 +2565,10 @@ impl Router {
         if agents.is_empty() {
             return None;
         }
-        let payload = serde_json::json!({ "agents": agents });
+        let payload = serde_json::json!({
+            "agents": agents,
+            "tags": self.cfg.tags,
+        });
         let mut env = Envelope::agents_update(&self.cfg.node_id, to, payload, None, None);
         self.sign_control(&mut env);
         Some(env)

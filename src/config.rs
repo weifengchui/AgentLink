@@ -425,6 +425,9 @@ pub struct SecurityConfig {
     /// 不可变审计日志（v0.7 §4.4）。缺省 false：不建目录、不落盘。
     #[serde(default)]
     pub audit: AuditConfig,
+    /// ABAC 策略（v0.7 §4.2）。缺省 enabled=false：所有候选节点放行。
+    #[serde(default)]
+    pub abac: crate::abac::AbacConfig,
 }
 
 /// 不可变审计日志配置：hash 链 append-only，落 `<data_dir>/audit/audit.jsonl`。
@@ -936,6 +939,7 @@ impl Default for SecurityConfig {
             admission: AdmissionConfig::default(),
             control_auth: false,
             audit: AuditConfig::default(),
+            abac: crate::abac::AbacConfig::default(),
         }
     }
 }
@@ -1059,6 +1063,7 @@ impl Config {
                 admission: AdmissionConfig::default(),
                 control_auth: false,
                 audit: AuditConfig::default(),
+                abac: crate::abac::AbacConfig::default(),
             },
             local_api: LocalApiConfig {
                 host: default_local_host(),
@@ -1166,6 +1171,7 @@ impl Config {
         if self.log.format != "text" && self.log.format != "json" {
             anyhow::bail!("log.format must be 'text' or 'json'");
         }
+        crate::abac::validate(&self.security.abac)?;
         Ok(())
     }
 }

@@ -609,8 +609,13 @@ async fn handle_text(
                 .payload
                 .get("agents")
                 .and_then(|a| serde_json::from_value(a.clone()).ok());
+            let tags: Vec<String> = env
+                .payload
+                .get("tags")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
             if let (Some(agents), false) = (agents, from.is_empty()) {
-                state.router.on_agents_update(from, agents);
+                state.router.on_agents_update_with_tags(from, agents, tags);
             }
             // v0.7 spine/relay：spine 把收到的 agent 表扩散给其它直连 peer
             // （保留原 from）——叶子据此看到非直连节点的 agent，引擎才能跨
