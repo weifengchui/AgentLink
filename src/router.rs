@@ -962,6 +962,10 @@ pub struct Router {
     /// `DIR_TTL_SECONDS`，由中继节点每 `DIR_SYNC_INTERVAL_SECS` 刷新）。
     /// 只用于 `/v1/peers` 展示与 fleet 的 node_online 判定，不参与拨号。
     dir: Mutex<HashMap<String, DirEntry>>,
+    /// v0.7 chaos：最近断开过的直连节点（node_id → 断开时刻）。用于把
+    /// `node_online` 从「不在 peer 表」细化为「明确离线」，避免未知节点
+    /// 被误判离线；重连即清除。
+    offline_nodes: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// 一条中继学到的节点目录记录。
@@ -985,6 +989,8 @@ struct DirEntry {
 const DIR_TTL_SECONDS: u64 = 30;
 /// 中继目录推送周期（秒；与 maintenance 的 1s tick 对齐）。
 const DIR_SYNC_INTERVAL_SECS: u64 = 5;
+/// 「最近断开」记忆时长（秒）：超过后节点重新按未知处理。
+const OFFLINE_MEMORY_SECONDS: u64 = 300;
 
 /// 路由层 Prometheus 指标。
 #[derive(Debug, Clone, Default)]
@@ -1103,6 +1109,7 @@ impl Router {
             webhook: crate::api::WebhookClient::new(&cfg.webhook).map(Arc::new),
             relay: cfg.relay.clone(),
             dir: Mutex::new(HashMap::new()),
+            offline_nodes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1315,6 +1322,7 @@ impl Router {
 
     pub fn register_peer(&self, sink: PeerSink) {
         self.registry.insert(sink.clone());
+        self.offline_nodes.lock().unwrap().remove(&sink.node_id);
         tracing::info!(peer = %sink.name, node_id = %sink.node_id, addr = %sink.addr, "router: peer registered");
         // v0.5 §7.1 structured twin (debug level: default text output of the
         // existing fleet stays byte-identical). `from` carries the peer node.
@@ -1353,6 +1361,9 @@ impl Router {
 
     pub fn unregister_peer(&self, node_id: &str) {
         let removed = self.registry.remove(node_id).is_some();
+        if removed {
+            self.mark_node_offline(node_id);
+        }
         // A node that left takes its agent list with it: drop the cached
         // fleet view for it so ghosts never linger on /web.
         let cached = self
@@ -2539,6 +2550,34 @@ impl Router {
             .unwrap_or(false)
     }
 
+    /// 节点级在线判定（v0.7 chaos reclaim）：
+    /// - 本机恒在线；直连 peer 表/中继目录新鲜 → 在线；
+    /// - **最近断开过的直连节点**（5 分钟记忆）→ 明确离线；
+    /// - 其余未知节点按在线处理（保持既有调度语义；真死访存交由发送侧
+    ///   离线队列/目录 TTL 兜底）。
+    pub fn node_online(&self, node_id: &str) -> bool {
+        if node_id == self.cfg.node_id {
+            return true;
+        }
+        if self.registry.get(node_id).is_some() || self.dir_online(node_id) {
+            return true;
+        }
+        let offline = self.offline_nodes.lock().unwrap();
+        match offline.get(node_id) {
+            Some(at) => at.elapsed().as_secs() > OFFLINE_MEMORY_SECONDS,
+            None => true,
+        }
+    }
+
+    /// 标记节点离线（直连断开时调用；重连注册会清除）。chaos 冒烟也用它
+    /// 模拟「节点已死但引擎尚未从 peer 表观测到」的边界。
+    pub fn mark_node_offline(&self, node_id: &str) {
+        self.offline_nodes
+            .lock()
+            .unwrap()
+            .insert(node_id.to_string(), std::time::Instant::now());
+    }
+
     /// `/v1/peers` 的加性视图：经中继学到的节点（`relayed=true`、`via`）。
     pub fn dir_snapshot(&self) -> Vec<crate::peer::PeerView> {
         let d = self.dir.lock().unwrap();
@@ -3119,6 +3158,35 @@ mod relay_tests {
             &signed.ts,
         ));
         assert!(r.verify_control(&signed));
+    }
+
+    #[tokio::test]
+    async fn node_online_semantics_local_unknown_offline_dir() {
+        let (_cfg, r) = router_with(true, "", 2);
+        assert!(r.node_online(r.node_id()), "本机恒在线");
+        assert!(
+            r.node_online("never-seen"),
+            "未知节点按在线处理（保持既有语义）"
+        );
+        r.mark_node_offline("gone-node");
+        assert!(!r.node_online("gone-node"), "明确离线");
+        // 目录新鲜 → 在线（中继叶子）。
+        let env = Envelope::business(
+            "spine1",
+            "*",
+            "ctrl",
+            "node_dir",
+            json!({"nodes": [{"node_id": "leaf9", "name": "leaf9", "addr": "x",
+                              "via": "spine1", "hops": 1,
+                              "expires": crate::store::now_wall() + 30}]}),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(r.on_node_dir(&env, None));
+        assert!(r.node_online("leaf9"));
     }
 
     #[tokio::test]

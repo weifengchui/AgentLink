@@ -183,6 +183,47 @@ pub struct EngineConfig {
     /// 零流量，`/v1/tasks` 面板不见任何池行。
     #[serde(default)]
     pub warmpool: WarmpoolConfig,
+    /// 节点失联任务回收（v0.7 chaos 第一波）。缺省关闭——调度行为零变化。
+    #[serde(default)]
+    pub reclaim: ReclaimConfig,
+}
+
+/// 节点失联任务回收参数（v0.7 chaos / kill-node）。
+///
+/// 只回收**所在节点已离线**的 Running 任务：等宽限期（给心跳/目录收敛留
+/// 余量）→ 置 Failed + 立即到期，复用既有 `max_retries` backoff 重投路径
+/// 换机重派；`attempts` 达上限则保持 Failed 终态。执行方唯一状态权威不变：
+/// 引擎不伪造 task_result，只做「失联超时」判定。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReclaimConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 节点离线多久后判定失联（秒）。下限 1；缺省 10（> heartbeat 3s +
+    /// offline_timeout 6s 的默认收敛窗口）。
+    #[serde(default = "default_reclaim_grace_secs")]
+    pub grace_seconds: u64,
+    /// 节点失联重派次数上限（独立于 `max_retries`——节点死亡不是执行方
+    /// 业务失败，不该占用执行方的重试预算）。缺省 3；达上限保持 failed。
+    #[serde(default = "default_reclaim_max_attempts")]
+    pub max_attempts: u32,
+}
+
+impl Default for ReclaimConfig {
+    fn default() -> Self {
+        ReclaimConfig {
+            enabled: false,
+            grace_seconds: default_reclaim_grace_secs(),
+            max_attempts: default_reclaim_max_attempts(),
+        }
+    }
+}
+
+fn default_reclaim_grace_secs() -> u64 {
+    10
+}
+
+fn default_reclaim_max_attempts() -> u32 {
+    3
 }
 
 /// 预热池参数（v0.6 P2）。把「常驻桥 = agent warmpool」形式化为引擎内置
@@ -924,6 +965,7 @@ impl Default for EngineConfig {
             max_concurrent_per_node: default_engine_max_concurrent(),
             circuit: CircuitConfig::default(),
             warmpool: WarmpoolConfig::default(),
+            reclaim: ReclaimConfig::default(),
         }
     }
 }

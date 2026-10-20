@@ -54,7 +54,7 @@
 - 资源配额（每 namespace token/时长/磁盘）；进程隔离 Linux=cgroups v2、Windows=Job Objects【§5.4】
 - 任务迁移 + checkpoint（SIGTERM 保存、他机恢复，工件走现有文件通道）【§6.2】
 - 降级：控制面故障 read-only 模式；工作节点本地队列自治 Standalone【§6.3】
-- chaos 套件：kill-node / latency / disk-fill【§6.4】
+- chaos 套件：kill-node / latency / disk-fill【§6.4】——kill-node 第一波已交付（2026-10-20，`docs/chaos-验证-2026-10-20.md`：`mesh.engine.reclaim{enabled,grace_seconds=10,max_attempts=3}` 加性缺省关；`Router::node_online`（直连/目录/最近断开记忆）+ 派发按节点在线过滤 + 负载计入「已派发未 accepted」；失联宽限后任务回 pending 换机重派（独立重试预算、超限 failed 终态），`TaskRecord.assignee_node` 加性绑定；单测 2 + 六进程冒烟 6/6（kill W1/W2/W3、6/6 succeeded、reclaim 日志 3 条、零崩溃），零回归；latency/disk-fill 与 20 机实机版后续）
 - SLO 告警 + 历史基线异常检测（耗时 +30% 类趋势）【§7.2】
 - OIDC SSO（企业采购门槛，先做 SSO 不做 HSM/FIPS）
 - 流式结果前端逐字渲染（WS 通道已有，补 /web 侧）【§5.3】——已交付（2026-10-19，`docs/流式前端逐字渲染-验证-2026-10-19.md`：`/web` 星图页新增「任务流式视图」浮层——复用无 client 观察者 WS，`alStreamReduce`（seq 收敛/乱序丢弃/幂等重放/终态判定）与 `alStreamStep`（逐字单调不越界）为可提取纯函数，24ms/拍打屏；冒烟 5/5：页面标记静态检查 + node --check 全页语法 + 14 项纯逻辑单测（node 跑页面真实函数）+ 真节点/适配器端到端帧喂入逐字打满）

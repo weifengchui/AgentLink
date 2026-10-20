@@ -153,6 +153,10 @@ pub struct TaskRecord {
     /// M2 P2-3 backoff 重投依据；None 表示不计重试或已达上限。
     #[serde(default)]
     pub next_retry_at: Option<i64>,
+    /// 当前派发目标的节点（v0.7 chaos reclaim）：节点失联时据此判定回收，
+    /// 不依赖 agent 记录的在线缓存。纯加性字段（缺省不存在）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee_node: Option<String>,
 }
 
 impl TaskRecord {
@@ -176,6 +180,7 @@ impl TaskRecord {
             last_ts: ts.map(str::to_string),
             last_spec_seq: None,
             next_retry_at: None,
+            assignee_node: None,
             message_count: 0,
             blocked_count: 0,
         }

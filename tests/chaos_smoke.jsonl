@@ -1,0 +1,6 @@
+{"scenario": "K0 组网（S 见 5 个在线 peer + 5 个在线 agent）", "pass": true, "detail": {"peers": 5, "agents": 5}}
+{"scenario": "K1 6 个慢任务已派发（≥5 个 worker 在飞）", "pass": true, "detail": {"accepted": 6, "started_per_worker": {"w1": ["chaos-00"], "w2": ["chaos-01"], "w3": ["chaos-02"], "w4": ["chaos-03"], "w5": ["chaos-04"]}}}
+{"scenario": "K2 依次 kill W1/W2/W3（每个都持有在飞任务）", "pass": true, "detail": {"killed": {"w1": ["chaos-00"], "w2": ["chaos-01"], "w3": ["chaos-00"]}}}
+{"scenario": "K3/K4 kill-node×3 后全部收敛（6/6 succeeded、无残留）", "pass": true, "detail": {"by_state": {"succeeded": 6}, "tasks_total": 6, "pending": 0, "running": 0}}
+{"scenario": "K5 自动回收证据（重跑 attempts≥1 + 引擎 reclaim 日志 ≥3）", "pass": true, "detail": {"moved": {"chaos-00": ["w4"], "chaos-01": ["w5"]}, "attempts": {"chaos-00": 2, "chaos-01": 1}, "reclaim_log_lines": 3}}
+{"scenario": "K6 幸存者无崩溃 / 被 kill 进程已退出", "pass": true, "detail": {"alive": 3, "panics": []}}

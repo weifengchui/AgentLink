@@ -37,6 +37,10 @@ pub struct EngineParams {
     #[allow(dead_code)]
     // P2-4 历史对齐后由 spec.reconcile.interval_s 补全；当前以 backoff_secs 作为兜底基线
     pub drift_alert_only: bool,
+    /// v0.7 chaos：节点失联回收开关与宽限期（秒）。
+    pub reclaim_enabled: bool,
+    pub reclaim_grace_secs: u64,
+    pub reclaim_max_attempts: u32,
 }
 
 // ---- 内部任务声明入口（v0.6 P1 GitOps 与 HTTP `/v1/tasks` 共用） -------------
@@ -150,6 +154,9 @@ impl From<&EngineConfig> for EngineParams {
             max_retries: c.max_retries,
             backoff_secs: c.backoff_secs,
             drift_alert_only: c.drift_alert_only,
+            reclaim_enabled: c.reclaim.enabled,
+            reclaim_grace_secs: c.reclaim.grace_seconds,
+            reclaim_max_attempts: c.reclaim.max_attempts,
         }
     }
 }
@@ -186,6 +193,9 @@ pub struct Engine {
     warmpool_cfg: crate::config::WarmpoolConfig,
     /// 预热池下一次 sweep 时刻（到点才派发 keep-warm）。
     warm_next: std::sync::Mutex<std::time::Instant>,
+    /// v0.7 chaos：Running 任务「所在节点首次观测到离线」的单调时刻，
+    /// 用于宽限期判定；任务离开 Running 或节点恢复即清除。
+    reclaim_since: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl Engine {
@@ -224,6 +234,7 @@ impl Engine {
             circuit_cfg,
             warmpool_cfg,
             warm_next,
+            reclaim_since: std::sync::Mutex::new(HashMap::new()),
         };
         tokio::spawn(async move {
             if let Err(e) = engine.run(shutdown_rx).await {
@@ -381,6 +392,9 @@ impl Engine {
     async fn tick_once(&self) -> Result<()> {
         let now_epoch = now_wall();
 
+        // ---- 0. 节点失联回收（v0.7 chaos kill-node）----
+        self.reclaim_offline_tasks(now_epoch)?;
+
         // ---- 1. deadline → expired（拍板：仅引擎表+告警，不动协议）----
         let expired_ids: Vec<String> = {
             let mut table = self.mesh.table.lock().unwrap();
@@ -480,6 +494,110 @@ impl Engine {
         Ok(())
     }
 
+    /// v0.7 chaos：回收「所在节点已离线」的 Running 任务。
+    ///
+    /// 只做失联超时判定，不伪造执行方状态：宽限期到点后置 Failed + 立即到期，
+    /// 复用既有 backoff 重投换机；`attempts` 达 `max_retries` 则保持 Failed
+    /// 终态（`next_retry_at` 不再被重投步骤消费）。
+    fn reclaim_offline_tasks(&self, _now_epoch: i64) -> Result<()> {
+        if !self.params.reclaim_enabled {
+            return Ok(());
+        }
+        let grace = Duration::from_secs(self.params.reclaim_grace_secs.max(1));
+        let now = std::time::Instant::now();
+        let mut reclaimed: Vec<(String, String, u64)> = Vec::new();
+        {
+            let mut table = self.mesh.table.lock().unwrap();
+            let mut since = self.reclaim_since.lock().unwrap();
+            // 只跟踪仍在途的任务（Running，或已派发但尚未被执行方 accepted 的
+            // Pending——两者都占着目标节点），避免观察表无限增长。
+            let running: std::collections::HashSet<String> = table
+                .iter()
+                .filter(|(_, r)| {
+                    r.state == taskengine::TaskState::Running
+                        || (r.state == taskengine::TaskState::Pending && r.to_agent.is_some())
+                })
+                .map(|(tid, _)| tid.clone())
+                .collect();
+            since.retain(|tid, _| running.contains(tid));
+
+            let mut due = Vec::new();
+            for (tid, rec) in table.iter() {
+                let in_flight = rec.state == taskengine::TaskState::Running
+                    || (rec.state == taskengine::TaskState::Pending && rec.to_agent.is_some());
+                if !in_flight {
+                    continue;
+                }
+                // 节点绑定优先用派发时写入的 assignee_node（不依赖 agent 在线
+                // 缓存）；旧行回退到 agent→node 反查。
+                let node = rec.assignee_node.clone().or_else(|| {
+                    rec.to_agent
+                        .as_deref()
+                        .and_then(|a| self.router.find_agent_node(a))
+                });
+                let Some(node) = node else { continue };
+                if self.router.node_online(&node) {
+                    since.remove(tid);
+                    continue;
+                }
+                let first = *since.entry(tid.clone()).or_insert(now);
+                if now.duration_since(first) >= grace {
+                    due.push((tid.clone(), node, rec.attempts));
+                }
+            }
+            for (tid, node, _attempts) in due {
+                if let Some(rec) = table.get_mut(&tid) {
+                    // 每次失联重派记一次 attempts（与协议「重投 spec +1」同口径）。
+                    // 节点死亡不是执行方业务失败：不进 failed/backoff，而是回
+                    // pending 队列换机重派；达独立预算才置 failed 终态。
+                    rec.attempts = rec.attempts.saturating_add(1);
+                    let retryable = rec.attempts <= self.params.reclaim_max_attempts as u64;
+                    rec.state = if retryable {
+                        taskengine::TaskState::Pending
+                    } else {
+                        taskengine::TaskState::Failed
+                    };
+                    rec.to_agent = None;
+                    rec.assignee_node = None;
+                    rec.next_retry_at = None;
+                    let attempts = rec.attempts;
+                    let rec_json = serde_json::to_value(rec)?;
+                    let rev = self.mesh.next_rev();
+                    self.mesh
+                        .store
+                        .append(&TaskEvent::up(&tid, rev, rec_json))?;
+                    since.remove(&tid);
+                    reclaimed.push((tid, node, attempts));
+                }
+            }
+        }
+        if reclaimed.is_empty() {
+            return Ok(());
+        }
+        self.mesh.maybe_snapshot();
+        for (tid, node, attempts) in reclaimed {
+            let retryable = attempts <= self.params.reclaim_max_attempts as u64;
+            tracing::warn!(
+                task_id = %tid,
+                node = %node,
+                attempts,
+                retryable,
+                "engine: 节点失联，回收任务（chaos reclaim）"
+            );
+            self.router.notify(
+                "task_reclaimed",
+                serde_json::json!({
+                    "task_id": tid,
+                    "node_id": node,
+                    "attempts": attempts,
+                    "retryable": retryable,
+                    "engine": self.node_id,
+                }),
+            );
+        }
+        Ok(())
+    }
+
     /// P3-2：把表中 pending 且未分配的任务通过调度器派发到 candidate 节点。
     async fn dispatch_pending(&self, _now_epoch: i64) -> Result<()> {
         // 收集 pending 且无 assignee（to_agent 为空）的任务
@@ -507,16 +625,23 @@ impl Engine {
         let mut node_tags: HashMap<String, Vec<String>> = HashMap::new();
         node_tags.insert(self.router.node_id().to_string(), self.local_tags.clone());
 
-        // 计算各节点当前负载（running 任务数，按 assignee 所在节点归集）
+        // 计算各节点当前负载（scheduler 口径：已派发但尚未 accepted 的
+        // Pending 任务也占额度——否则 executor 慢确认时会被重复派发、
+        // 压过 max_concurrent_per_node）。
         let mut loads: HashMap<String, usize> = HashMap::new();
         {
             let table = self.mesh.table.lock().unwrap();
             for rec in table.values() {
-                if rec.state == TaskState::Running {
-                    if let Some(ref agent_id) = rec.to_agent {
-                        if let Some(node_id) = self.router.find_agent_node(agent_id) {
-                            *loads.entry(node_id).or_insert(0) += 1;
-                        }
+                let in_flight = rec.state == TaskState::Running
+                    || (rec.state == TaskState::Pending && rec.to_agent.is_some());
+                if !in_flight {
+                    continue;
+                }
+                if let Some(ref agent_id) = rec.to_agent {
+                    if let Some(node_id) = self.router.find_agent_node(agent_id) {
+                        *loads.entry(node_id).or_insert(0) += 1;
+                    } else if let Some(ref node_id) = rec.assignee_node {
+                        *loads.entry(node_id.clone()).or_insert(0) += 1;
                     }
                 }
             }
@@ -532,6 +657,17 @@ impl Engine {
             .fleet_agents()
             .into_iter()
             .filter(|a| {
+                // v0.7 chaos：fleet 缓存里的 agent 可能比节点存活更久
+                // （agents_update 不随断链失效），派发前必须按节点在线过滤，
+                // 否则任务会被派给死节点、只能等 reclaim 再兜回。
+                let node_up = self.router.node_online(&a.node_id);
+                if !node_up {
+                    tracing::debug!(
+                        node = %a.node_id,
+                        agent = %a.agent_id,
+                        "engine: 节点离线，fleet 缓存 agent 不参与派发"
+                    );
+                }
                 let blocked = self
                     .mesh
                     .circuit
@@ -544,7 +680,7 @@ impl Engine {
                         "engine: 熔断节点不参与派发（unschedulable）"
                     );
                 }
-                !blocked
+                node_up && !blocked
             })
             .collect();
 
@@ -572,8 +708,8 @@ impl Engine {
                 }
             }
 
-            // 标记任务已分配（写入表 + journal，防止重复调度）
-            self.mark_assigned(task_id, to_agent)?;
+            // 标记任务已分配（写入 to_agent + assignee_node + journal，防止重复调度）
+            self.mark_assigned(task_id, node_id, to_agent)?;
 
             // 记录已调度节点（M3 P3-4 node_quota 统计）
             self.mesh
@@ -960,14 +1096,15 @@ impl Engine {
         Ok(())
     }
 
-    /// 标记任务已分配（写入 to_agent + journal，防止重复调度）。
-    fn mark_assigned(&self, task_id: &str, to_agent: &str) -> Result<()> {
+    /// 标记任务已分配（写入 to_agent + assignee_node + journal，防止重复调度）。
+    fn mark_assigned(&self, task_id: &str, node_id: &str, to_agent: &str) -> Result<()> {
         let mut table = self.mesh.table.lock().unwrap();
         let rec = match table.get_mut(task_id) {
             Some(r) => r,
             None => return Err(anyhow!("task {task_id} 不在表中，无法标记分配")),
         };
         rec.to_agent = Some(to_agent.to_string());
+        rec.assignee_node = Some(node_id.to_string());
         let rec_json = serde_json::to_value(rec)?;
         let rev = self.mesh.next_rev();
         drop(table);
@@ -1035,6 +1172,7 @@ mod tests {
                     max_concurrent_per_node: 2,
                     circuit: Default::default(),
                     warmpool: Default::default(),
+                    reclaim: Default::default(),
                 },
             },
             auth: AuthConfig::default(),
@@ -1089,6 +1227,7 @@ mod tests {
                         cfg.mesh.engine.warmpool.interval_secs.clamp(5, 3600_u64),
                     ),
             ),
+            reclaim_since: std::sync::Mutex::new(HashMap::new()),
         };
         (state, mesh, engine)
     }
@@ -1356,6 +1495,9 @@ mod tests {
             max_retries: 2,
             backoff_secs: 0,
             drift_alert_only: true,
+            reclaim_enabled: false,
+            reclaim_grace_secs: 10,
+            reclaim_max_attempts: 3,
         };
 
         // 建一个 failed 任务
@@ -1410,5 +1552,60 @@ mod tests {
         assert_eq!(c.backoff_secs, 30); // 拍板：固定 30s
         assert!(c.drift_alert_only); // 拍板：drift 只告警
         assert_eq!(c.tick_ms, 200); // P99 <500ms 推论
+    }
+
+    #[tokio::test]
+    async fn reclaim_requeues_offline_node_task_after_grace() {
+        let (_state, mesh, engine) = test_mesh();
+        let mut engine = engine;
+        engine.params.reclaim_enabled = true;
+        engine.params.reclaim_grace_secs = 1;
+        engine.params.reclaim_max_attempts = 2;
+        engine.router.mark_node_offline("ghost-node");
+        {
+            let mut table = mesh.table.lock().unwrap();
+            let mut rec = taskengine::TaskRecord::new("t-reclaim", Some("2026-10-20T00:00:00Z"));
+            rec.state = taskengine::TaskState::Running;
+            rec.to_agent = Some("ghost-worker".to_string());
+            rec.assignee_node = Some("ghost-node".to_string());
+            rec.attempts = 1;
+            table.insert("t-reclaim".to_string(), rec);
+        }
+        // 首拍只记录「首次观测离线」时刻，宽限期内不动。
+        engine
+            .reclaim_offline_tasks(crate::store::now_wall())
+            .unwrap();
+        assert_eq!(
+            mesh.table.lock().unwrap()["t-reclaim"].state,
+            taskengine::TaskState::Running
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let before = crate::store::now_wall();
+        engine.reclaim_offline_tasks(before).unwrap();
+        let table = mesh.table.lock().unwrap();
+        let rec = &table["t-reclaim"];
+        assert_eq!(rec.state, taskengine::TaskState::Pending, "回到待调度队列");
+        assert!(rec.assignee_node.is_none(), "回收后解除节点绑定");
+        assert!(rec.to_agent.is_none(), "清空死节点上的执行方");
+        assert!(rec.next_retry_at.is_none(), "不占用 failed/backoff 通道");
+        assert_eq!(rec.attempts, 2, "每次失联重派 +1（1→2）");
+        drop(table);
+
+        // 重派后再次失联：独立预算耗尽（attempts 3 > max_attempts 2）→ failed 终态。
+        {
+            let mut table = mesh.table.lock().unwrap();
+            let rec = table.get_mut("t-reclaim").unwrap();
+            rec.state = taskengine::TaskState::Running;
+            rec.to_agent = Some("ghost-worker2".to_string());
+            rec.assignee_node = Some("ghost-node".to_string());
+        }
+        engine.reclaim_offline_tasks(before).unwrap(); // 首次观测离线
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        engine.reclaim_offline_tasks(before).unwrap();
+        let table = mesh.table.lock().unwrap();
+        let rec = &table["t-reclaim"];
+        assert_eq!(rec.state, taskengine::TaskState::Failed);
+        assert_eq!(rec.attempts, 3);
+        assert!(rec.next_retry_at.is_none(), "终态不再重投");
     }
 }
