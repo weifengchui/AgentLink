@@ -15,7 +15,7 @@ use std::time::Instant;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::Path as UrlPath;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Form, FromRequest, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -364,7 +364,11 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/health", get(health))
         .route("/v1/auth/oidc/status", get(oidc_status))
         .route("/v1/auth/oidc/login", get(oidc_login))
-        .route("/v1/auth/oidc/callback", get(oidc_callback))
+        .route(
+            "/v1/auth/oidc/callback",
+            get(oidc_callback).post(oidc_callback_post),
+        )
+        .route("/v1/auth/oidc/refresh", post(oidc_refresh))
         .route("/v1/auth/logout", post(oidc_logout))
         .route("/v1/status", get(status))
         .route("/v1/peers", get(peers))
@@ -3954,8 +3958,11 @@ function needToken(){TOKEN='';$('modal').classList.remove('hidden');$('app').cla
 function enter(){$('modal').classList.add('hidden');$('app').classList.remove('hidden');
  const lb=$('logout-btn');if(lb)lb.hidden=!TOKEN.startsWith('al_sess_');
  refresh();loadConfig();}
-async function doLogout(){try{await fetch('/v1/auth/logout',{method:'POST',headers:HDR()});}catch(e){}
- try{sessionStorage.removeItem(LS_KEY);}catch(e){}TOKEN='';location.reload();}
+async function doLogout(){let d={};try{const r=await fetch('/v1/auth/logout',{method:'POST',headers:HDR()});d=await r.json();}catch(e){}
+ try{sessionStorage.removeItem(LS_KEY);}catch(e){}TOKEN='';
+ // RP-initiated logout：服务端给了 IdP 登出地址就跳过去（IdP 侧会话一并失效）
+ if(d&&d.end_session_url){location.href=d.end_session_url;return;}
+ location.reload();}
 async function boot(){
  // OIDC 回调：#token=... 只进 sessionStorage，随后从地址栏抹掉（不发给服务端/Referer）
  try{
@@ -3981,7 +3988,12 @@ async function boot(){
  $('modal').classList.remove('hidden');
 }
 boot();
-async function j(p,opt){const o=opt||{};const h={...HDR(),...(o.headers||{})};if(o.body&&typeof o.body==='string'&&!h['Content-Type']&&!h['content-type'])h['Content-Type']='application/json';const r=await fetch(p,{...o,headers:h});const txt=await r.text();let d={};try{d=txt?JSON.parse(txt):{};}catch{d={error:txt.slice(0,300)};}if(r.status===401){sessionStorage.removeItem(LS_KEY);needToken();throw new Error('401');}if(!r.ok)throw new Error('HTTP '+r.status+' '+((d&&(d.error||d.err))||txt.slice(0,200)||r.statusText));return d;}
+async function j(p,opt){const o=opt||{};const h={...HDR(),...(o.headers||{})};if(o.body&&typeof o.body==='string'&&!h['Content-Type']&&!h['content-type'])h['Content-Type']='application/json';const r=await fetch(p,{...o,headers:h});const txt=await r.text();let d={};try{d=txt?JSON.parse(txt):{};}catch{d={error:txt.slice(0,300)};}if(r.status===401){
+ // SSO session 过期：先用服务端保存的 refresh token 静默续期一次，再重试原请求
+ if(!o.__retried&&TOKEN&&TOKEN.startsWith('al_sess_')){
+  try{const rr=await fetch('/v1/auth/oidc/refresh',{method:'POST',headers:HDR()});
+   if(rr.ok){const rd=await rr.json();if(rd&&rd.ok)return await j(p,{...o,__retried:true});}}catch(e){}}
+ sessionStorage.removeItem(LS_KEY);needToken();throw new Error('401');}if(!r.ok)throw new Error('HTTP '+r.status+' '+((d&&(d.error||d.err))||txt.slice(0,200)||r.statusText));return d;}
 function show(panel){document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.p===panel));document.querySelectorAll('.content>section').forEach(s=>s.classList.add('hidden'));$('p-'+panel).classList.remove('hidden');if(panel==='config')renderColorCfg();if(panel==='tasks')loadTasks(true);}
 function input(id){return ($(id)&&$(id).value||'').trim();}
 function el(id){return document.getElementById(id);}
@@ -4574,8 +4586,25 @@ async fn oidc_middleware(
     };
     if state.config.auth.tokens.contains_key(&token)
         || constant_time_eq(token.as_bytes(), state.config.local_api.token.as_bytes())
-        || session_from_token(&state, &token).is_some()
     {
+        return next.run(req).await;
+    }
+    // refresh 续期：允许**已过期但仍在宽限窗内**的浏览器 session 通过，
+    // 由 refresh 端点自己判定（续期成功才恢复该 token）。
+    if path == "/v1/auth/oidc/refresh" {
+        if token.starts_with("al_sess_")
+            && state
+                .oidc_sessions
+                .lock()
+                .unwrap()
+                .get_for_refresh(&token)
+                .is_some()
+        {
+            return next.run(req).await;
+        }
+        return unauthorized().into_response();
+    }
+    if session_from_token(&state, &token).is_some() {
         return next.run(req).await;
     }
     // 过期/已 logout 的浏览器 session 直接 401，不再拿它去自省/JWKS。
@@ -4636,13 +4665,13 @@ async fn resolve_oidc_token(
             introspect_oidc(state, token).await.map(|r| (r, fixed_ttl))
         }
         crate::oidc::OidcMode::Jwt => {
-            let (r, exp, _sub) = verify_oidc_jwt(state, token, None).await?;
+            let (r, exp, _sub, _alg) = verify_oidc_jwt(state, token, None).await?;
             Ok((r, jwt_cache_ttl(exp, cfg.cache_seconds)))
         }
         crate::oidc::OidcMode::Hybrid => {
             if token.matches('.').count() == 2 {
                 match verify_oidc_jwt(state, token, None).await {
-                    Ok((r, exp, _sub)) => Ok((r, jwt_cache_ttl(exp, cfg.cache_seconds))),
+                    Ok((r, exp, _sub, _alg)) => Ok((r, jwt_cache_ttl(exp, cfg.cache_seconds))),
                     Err(e) => {
                         // hybrid：本地验签失败不直接放行，回落 IdP 自省（仍 fail-closed）。
                         tracing::debug!(reason = %e, "oidc: jwt verify failed, falling back to introspection");
@@ -4702,20 +4731,22 @@ async fn fetch_jwks(state: &AppState) -> Result<(), String> {
     state.oidc_jwks.lock().unwrap().set(&keys)
 }
 
-/// RS256 JWT 本地验签：kid 选 key → JWKS 缓存/刷新 → 验签 → iss/aud/exp/nonce
-/// → 角色/namespace。返回 `(resolved, exp, sub)`。
+/// JWT 本地验签：alg 白名单 → kid 选 key → JWKS 缓存/刷新 → 验签 →
+/// iss/aud/exp/nonce → 角色/namespace。返回 `(resolved, exp, sub, alg)`。
 async fn verify_oidc_jwt(
     state: &AppState,
     token: &str,
     expected_nonce: Option<&str>,
-) -> Result<(crate::oidc::Resolved, i64, String), String> {
+) -> Result<(crate::oidc::Resolved, i64, String, String), String> {
     let cfg = &state.config.auth.oidc;
     let parts = crate::oidc::split_jwt(token)?;
+    crate::oidc::check_alg(cfg, &parts.alg)?;
     let kid = parts.kid.clone();
+    let alg = parts.alg.clone();
     let ttl = cfg.jwks_cache_seconds.clamp(1, 86_400);
     let (mut key, fresh) = {
         let cache = state.oidc_jwks.lock().unwrap();
-        (cache.get(kid.as_deref()), cache.fresh(ttl))
+        (cache.get(kid.as_deref(), &alg), cache.fresh(ttl))
     };
     if !fresh || key.is_none() {
         let refresh = {
@@ -4730,11 +4761,11 @@ async fn verify_oidc_jwt(
         };
         if refresh {
             fetch_jwks(state).await?;
-            key = state.oidc_jwks.lock().unwrap().get(kid.as_deref());
+            key = state.oidc_jwks.lock().unwrap().get(kid.as_deref(), &alg);
         }
     }
     let key = key.ok_or_else(|| "jwt: no matching JWKS key".to_string())?;
-    crate::oidc::verify_rs256(&key, &parts.signing_input, &parts.signature)?;
+    crate::oidc::verify_signature(&alg, &key.key, &parts.signing_input, &parts.signature)?;
     let (resolved, exp) =
         crate::oidc::validate_jwt_claims(cfg, &parts.claims, expected_nonce, unix_now())?;
     let sub = parts
@@ -4743,7 +4774,7 @@ async fn verify_oidc_jwt(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    Ok((resolved, exp, sub))
+    Ok((resolved, exp, sub, alg))
 }
 
 /// 浏览器登录状态（公开、无敏感信息）：Web UI 据此显示 SSO 按钮。
@@ -4753,6 +4784,9 @@ async fn oidc_status(State(state): State<SharedState>) -> Response {
         "enabled": cfg.enabled,
         "browser_login": cfg.enabled && cfg.browser_login,
         "mode": cfg.mode,
+        "response_mode": cfg.response_mode,
+        "allowed_algs": cfg.allowed_algs,
+        "rp_logout": cfg.enabled && cfg.end_session_endpoint.is_some(),
     }))
     .into_response();
     resp.headers_mut()
@@ -4810,19 +4844,31 @@ async fn oidc_login(State(state): State<SharedState>) -> Response {
         q.append_pair("nonce", &nonce);
         q.append_pair("code_challenge", &challenge);
         q.append_pair("code_challenge_method", "S256");
+        if cfg.response_mode == crate::oidc::ResponseMode::FormPost {
+            q.append_pair("response_mode", "form_post");
+        }
     }
     let mut resp = Redirect::temporary(url.as_str()).into_response();
     resp.headers_mut()
         .insert("cache-control", HeaderValue::from_static("no-store"));
     // state 同时绑定到 HttpOnly cookie，阻止登录 CSRF（攻击者把别人的
     // callback URL 塞给受害者）。cookie 只回传 callback 路径。
-    let secure = cfg
+    //
+    // form_post 是**跨站 POST**：SameSite=Lax 的 cookie 不会随 POST 发送，
+    // 因此改用 SameSite=None; Secure（Secure 是 SameSite=None 的硬要求，
+    // 回环 http 下现代浏览器按 trustworthy origin 放行）。
+    let https_cb = cfg
         .redirect_uri
         .as_deref()
         .is_some_and(|u| u.starts_with("https://"));
+    let (samesite, secure) = match cfg.response_mode {
+        crate::oidc::ResponseMode::FormPost => ("SameSite=None", "; Secure"),
+        crate::oidc::ResponseMode::Query => {
+            ("SameSite=Lax", if https_cb { "; Secure" } else { "" })
+        }
+    };
     let cookie = format!(
-        "al_oidc_state={state_param}; Path=/v1/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=300{}",
-        if secure { "; Secure" } else { "" }
+        "al_oidc_state={state_param}; Path=/v1/auth/oidc/callback; HttpOnly; {samesite}; Max-Age=300{secure}",
     );
     if let Ok(v) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().append("set-cookie", v);
@@ -4840,6 +4886,9 @@ struct OidcCallbackParams {
     error: Option<String>,
     #[serde(default)]
     error_description: Option<String>,
+    /// hybrid 流程的 code 摘要（OIDC Core §3.2.2.9）；存在即校验。
+    #[serde(default)]
+    c_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4848,6 +4897,8 @@ struct OidcTokenResponse {
     id_token: Option<String>,
     #[serde(default)]
     access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
     #[serde(default)]
     token_type: Option<String>,
 }
@@ -4876,10 +4927,29 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 /// 签发本节点短期 session token，并 303 回 `/web#token=...`。
 ///
 /// 原始 IdP access/ID token 不交给浏览器；session token 只存在 sessionStorage。
+/// 支持 query 与 form_post 两种回传（`response_mode`）。
 async fn oidc_callback(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Query(q): Query<OidcCallbackParams>,
+) -> Response {
+    oidc_callback_finish(state, headers, q).await
+}
+
+/// `response_mode=form_post`：IdP 以 `application/x-www-form-urlencoded` POST
+/// 授权码（跨站提交，state cookie 用 SameSite=None; Secure）。
+async fn oidc_callback_post(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Form(q): Form<OidcCallbackParams>,
+) -> Response {
+    oidc_callback_finish(state, headers, q).await
+}
+
+async fn oidc_callback_finish(
+    state: SharedState,
+    headers: HeaderMap,
+    q: OidcCallbackParams,
 ) -> Response {
     let cfg = state.config.auth.oidc.clone();
     if !cfg.enabled || !cfg.browser_login {
@@ -4951,21 +5021,49 @@ async fn oidc_callback(
     let Some(id_token) = tr.id_token.as_deref().filter(|s| !s.is_empty()) else {
         return oidc_login_failed(&state, "callback: id_token missing");
     };
-    let (resolved, exp, sub) = match verify_oidc_jwt(&state, id_token, Some(&pending.nonce)).await {
-        Ok(v) => v,
-        Err(e) => return oidc_login_failed(&state, &format!("callback: {e}")),
-    };
+    // c_hash：授权响应里带了就必须与 code 摘要一致（防 code 替换）。
+    // 摘要算法取自 ID token header（未验签，仅用于选算法；不匹配即拒绝）。
+    if let Some(c_hash) = q.c_hash.as_deref().filter(|s| !s.is_empty()) {
+        let alg = match crate::oidc::split_jwt(id_token) {
+            Ok(p) => p.alg,
+            Err(e) => return oidc_login_failed(&state, &format!("callback: id_token parse: {e}")),
+        };
+        if let Err(e) = crate::oidc::verify_token_hash(&alg, &code, c_hash) {
+            return oidc_login_failed(&state, &format!("callback: {e}"));
+        }
+    }
+    let (resolved, exp, sub, alg) =
+        match verify_oidc_jwt(&state, id_token, Some(&pending.nonce)).await {
+            Ok(v) => v,
+            Err(e) => return oidc_login_failed(&state, &format!("callback: {e}")),
+        };
+    // at_hash：ID token 带了就必须与 access token 摘要一致。
+    if let Some(at_hash) = crate::oidc::peek_claim(id_token, "at_hash") {
+        let Some(access_token) = tr.access_token.as_deref().filter(|s| !s.is_empty()) else {
+            return oidc_login_failed(&state, "callback: at_hash present but no access_token");
+        };
+        if let Err(e) = crate::oidc::verify_token_hash(&alg, access_token, &at_hash) {
+            return oidc_login_failed(&state, &format!("callback: {e}"));
+        }
+    }
     if sub.is_empty() {
         return oidc_login_failed(&state, "callback: id_token sub missing");
     }
     let remaining = (exp - unix_now()).max(1) as u64;
     let ttl = std::time::Duration::from_secs(cfg.session_seconds.min(remaining).max(1));
-    let session_token = state.oidc_sessions.lock().unwrap().issue(
-        resolved.role,
-        resolved.namespace.clone(),
-        ttl,
-        sub.clone(),
-    );
+    let session_token = state
+        .oidc_sessions
+        .lock()
+        .unwrap()
+        .issue(crate::oidc::SessionIssue {
+            role: resolved.role,
+            namespace: resolved.namespace.clone(),
+            sub: sub.clone(),
+            ttl,
+            // IdP token 只留服务端内存（登出 id_token_hint / refresh 续期）。
+            id_token: Some(id_token.to_string()),
+            refresh_token: tr.refresh_token.clone(),
+        });
     let sub_hash = token_cache_key(&sub);
     state.router.audit_event(
         "auth.oidc_login",
@@ -4977,6 +5075,8 @@ async fn oidc_callback(
             "ttl_seconds": ttl.as_secs(),
             "token_type": tr.token_type,
             "has_access_token": tr.access_token.is_some(),
+            "has_refresh_token": tr.refresh_token.is_some(),
+            "alg": alg,
         }),
     );
     let location = format!("{}#token={}", cfg.post_login_path, session_token);
@@ -4988,14 +5088,26 @@ async fn oidc_callback(
 }
 
 /// 退出浏览器 session（静态 token/local token 调用为 no-op）。
+///
+/// 配置了 `auth.oidc.end_session_endpoint` 时，返回 `end_session_url`
+/// 让浏览器跳到 IdP 登出端点（带 `id_token_hint`），实现 RP-initiated
+/// logout——IdP 侧会话一并失效。
 async fn oidc_logout(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     if authorized_role(&state, &headers).is_none() {
         return unauthorized().into_response();
     }
+    let cfg = &state.config.auth.oidc;
     let removed =
         header_token(&headers).and_then(|t| state.oidc_sessions.lock().unwrap().remove(&t));
+    let mut end_session_url: Option<String> = None;
     if let Some(session) = removed {
         let sub_hash = token_cache_key(&session.sub);
+        if let (Some(ep), Some(id_token)) = (
+            cfg.end_session_endpoint.as_deref(),
+            session.id_token.as_deref(),
+        ) {
+            end_session_url = build_end_session_url(cfg, ep, id_token);
+        }
         state.router.audit_event(
             "auth.logout",
             "oidc",
@@ -5003,10 +5115,175 @@ async fn oidc_logout(State(state): State<SharedState>, headers: HeaderMap) -> Re
                 "role": session.role.as_str(),
                 "namespace": session.namespace,
                 "sub_hash": &sub_hash[..12],
+                "rp_initiated": end_session_url.is_some(),
             }),
         );
     }
-    Json(json!({"ok": true})).into_response()
+    Json(json!({
+        "ok": true,
+        "end_session_url": end_session_url,
+    }))
+    .into_response()
+}
+
+/// 组装 IdP 登出 URL（`id_token_hint` + `post_logout_redirect_uri` + client_id）。
+fn build_end_session_url(
+    cfg: &crate::oidc::OidcConfig,
+    endpoint: &str,
+    id_token: &str,
+) -> Option<String> {
+    let mut url = reqwest::Url::parse(endpoint).ok()?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("id_token_hint", id_token);
+        if !cfg.client_id.is_empty() {
+            q.append_pair("client_id", &cfg.client_id);
+        }
+        if let Some(r) = cfg.post_logout_redirect_uri.as_deref() {
+            q.append_pair("post_logout_redirect_uri", r);
+        }
+    }
+    Some(url.to_string())
+}
+
+/// refresh 续期：用服务端保存的 IdP refresh token 换新 ID token，验签后
+/// **原地延长**本节点 session（浏览器持有的 token 不变）。
+///
+/// refresh token 只留在服务端内存，绝不下发浏览器。
+async fn oidc_refresh(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let cfg = &state.config.auth.oidc.clone();
+    if !cfg.enabled || !cfg.browser_login {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "oidc refresh disabled"})),
+        )
+            .into_response();
+    }
+    let Some(token) = header_token(&headers) else {
+        return unauthorized().into_response();
+    };
+    // 已过期但在续期宽限窗内的 session 也允许续期。
+    let Some(session) = state.oidc_sessions.lock().unwrap().get_for_refresh(&token) else {
+        return unauthorized().into_response();
+    };
+    let Some(refresh_token) = session.refresh_token.clone().filter(|t| !t.is_empty()) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "no refresh token for this session"})),
+        )
+            .into_response();
+    };
+    let Some(token_endpoint) = cfg.token_endpoint.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "token_endpoint not configured"})),
+        )
+            .into_response();
+    };
+    let mut form: Vec<(&str, &str)> = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &refresh_token),
+    ];
+    if cfg.client_secret.is_empty() {
+        form.push(("client_id", &cfg.client_id));
+    }
+    let mut rb = state.oidc_http.post(token_endpoint).form(&form);
+    if !cfg.client_secret.is_empty() {
+        rb = rb.basic_auth(&cfg.client_id, Some(&cfg.client_secret));
+    }
+    let resp = match rb.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("refresh transport: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    if !resp.status().is_success() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": format!("refresh status {}", resp.status().as_u16())
+            })),
+        )
+            .into_response();
+    }
+    let tr: OidcTokenResponse = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("refresh response: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    let Some(id_token) = tr.id_token.as_deref().filter(|s| !s.is_empty()) else {
+        // IdP 未返回新 ID token：不能续期（fail-closed）。
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "refresh response has no id_token"})),
+        )
+            .into_response();
+    };
+    // 续期不做 nonce 校验（nonce 只绑定首次授权）。
+    let (resolved, exp, sub, _alg) = match verify_oidc_jwt(&state, id_token, None).await {
+        Ok(v) => v,
+        Err(e) => {
+            state.router.audit_event(
+                "auth.oidc_refresh_reject",
+                "oidc",
+                json!({"reason": e.chars().take(120).collect::<String>()}),
+            );
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "refresh id_token verification failed"})),
+            )
+                .into_response();
+        }
+    };
+    // 角色/namespace 不允许在续期时被 IdP 悄悄改宽——必须与原会话一致。
+    if resolved.role != session.role || resolved.namespace != session.namespace {
+        state.router.audit_event(
+            "auth.oidc_refresh_reject",
+            "oidc",
+            json!({"reason": "role/namespace changed on refresh"}),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "refresh changed the session identity"})),
+        )
+            .into_response();
+    }
+    let remaining = (exp - unix_now()).max(1) as u64;
+    let ttl = std::time::Duration::from_secs(cfg.session_seconds.min(remaining).max(1));
+    let ok = state.oidc_sessions.lock().unwrap().extend(
+        &token,
+        ttl,
+        Some(id_token.to_string()),
+        tr.refresh_token.clone(),
+    );
+    if !ok {
+        return unauthorized().into_response();
+    }
+    let sub_hash = token_cache_key(&sub);
+    state.router.audit_event(
+        "auth.oidc_refresh",
+        "oidc",
+        json!({
+            "sub_hash": &sub_hash[..12],
+            "role": resolved.role.as_str(),
+            "ttl_seconds": ttl.as_secs(),
+        }),
+    );
+    Json(json!({
+        "ok": true,
+        "expires_in": ttl.as_secs(),
+        "role": resolved.role.as_str(),
+    }))
+    .into_response()
 }
 
 /// 仅当 OIDC 浏览器登录开启时，session token 才有效（配置关闭即失效）。

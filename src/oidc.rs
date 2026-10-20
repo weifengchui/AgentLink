@@ -1,25 +1,37 @@
 //! OIDC SSO（v0.7 §4.2）：token introspection（第一波）+ JWT/JWKS 本地验签 /
-//! Authorization Code + PKCE 浏览器登录（第二波）。
+//! Authorization Code + PKCE 浏览器登录（第二波）+ IdP 兼容硬化（第三波）。
 //!
 //! 两种 API token 验证路径：
 //! - `introspection`（缺省）：RFC 7662，兼容 opaque/JWT access token；
-//! - `jwt`：RS256 JWT 本地验签（JWKS 缓存），IdP 短时故障不影响已缓存公钥；
+//! - `jwt`：JWT 本地验签（JWKS 缓存），IdP 短时故障不影响已缓存公钥；
 //! - `hybrid`：JWT 优先，非 JWT/验签失败再走 introspection（fail-closed）。
 //!
-//! 浏览器登录只走 Authorization Code + PKCE（S256），ID token 必须 RS256
-//! 本地验签（iss/aud/exp/nbf/nonce），成功后签发**本节点短期 opaque session
+//! 浏览器登录只走 Authorization Code + PKCE（S256），ID token 必须本地验签
+//! （iss/aud/exp/nbf/nonce），成功后签发**本节点短期 opaque session
 //! token**，不把 IdP access/ID token 交给 Web UI。
 //!
-//! 依赖保持纯 Rust：`rsa`/`sha2`/`base64`/`rand`，无 C/openssl。缺省
-//! `auth.oidc.enabled=false`、静态 token/旧配置行为不变。
+//! 第三波（IdP 兼容硬化）：
+//! - 签名算法白名单 `auth.oidc.allowed_algs`（缺省 `["RS256"]`）：支持
+//!   RS256 / PS256 / ES256(ECDSA P-256) / EdDSA(Ed25519)，**算法与 JWK 类型
+//!   必须匹配**（杜绝 alg confusion），`none`/`HS*` 永不支持；
+//! - `at_hash` / `c_hash` 校验（OIDC Core §3.3.2.11 / §3.2.2.9）；
+//! - 回调 `response_mode=form_post`（默认仍是 query）；
+//! - RP-initiated logout（`end_session_endpoint` + `id_token_hint`）；
+//! - refresh token 续期（refresh token 只留在服务端内存，不进浏览器）。
+//!
+//! 依赖保持纯 Rust：`rsa`/`p256`/`ed25519-compact`/`sha2`/`base64`/`rand`，
+//! 无 C/openssl。缺省 `auth.oidc.enabled=false`、静态 token/旧配置行为不变。
 
 use crate::config::Role;
 use base64::Engine;
+use ed25519_compact::PublicKey as Ed25519PublicKey;
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature as EcdsaSignature, VerifyingKey as EcdsaVerifyingKey};
 use rand::RngCore;
-use rsa::{BigUint, Pkcs1v15Sign, RsaPublicKey};
+use rsa::{BigUint, Pkcs1v15Sign, Pss, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
@@ -30,6 +42,9 @@ const B64_PAD: base64::engine::general_purpose::GeneralPurpose =
 const LOGIN_TTL: Duration = Duration::from_secs(300);
 const MAX_LOGINS: usize = 1024;
 const MAX_SESSIONS: usize = 4096;
+/// session 过期后的**续期宽限窗**：期间仍可用 refresh token 换新 session
+/// （浏览器 401 -> 静默续期 -> 重试）。宽限窗外才真正丢弃。
+const REFRESH_GRACE: Duration = Duration::from_secs(900);
 
 /// API token 验证模式。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,11 +53,25 @@ pub enum OidcMode {
     /// RFC 7662 introspection（缺省，兼容 opaque token）。
     #[default]
     Introspection,
-    /// 仅 RS256 JWT 本地验签（JWKS）。
+    /// 仅 JWT 本地验签（JWKS）。
     Jwt,
     /// JWT 本地验签优先，非 JWT 或失败再走 introspection。
     Hybrid,
 }
+
+/// 浏览器登录回调的响应模式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseMode {
+    /// 授权码走 query string（缺省，兼容所有 IdP）。
+    #[default]
+    Query,
+    /// 授权码走 `application/x-www-form-urlencoded` 表单回传（`form_post`）。
+    FormPost,
+}
+
+/// 支持的签名算法（`auth.oidc.allowed_algs` 白名单取值）。
+pub const SUPPORTED_ALGS: [&str; 4] = ["RS256", "PS256", "ES256", "EdDSA"];
 
 /// `auth.oidc` 配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +144,22 @@ pub struct OidcConfig {
     /// 浏览器会话 token 有效期秒数（1-86400，缺省 8h）；不会超过 ID token exp。
     #[serde(default = "default_session_seconds")]
     pub session_seconds: u64,
+    /// 允许的 JWT 签名算法白名单（缺省 `["RS256"]`，第二波行为不变）。
+    /// 可选：`RS256` / `PS256` / `ES256` / `EdDSA`；`none`/`HS*` 永不支持。
+    /// 算法必须与 JWKS 中 JWK 的类型匹配（RSA→RS256/PS256、EC P-256→ES256、
+    /// OKP Ed25519→EdDSA），杜绝 alg confusion。
+    #[serde(default = "default_allowed_algs")]
+    pub allowed_algs: Vec<String>,
+    /// 浏览器登录回调响应模式：query（缺省）/ form_post。
+    #[serde(default)]
+    pub response_mode: ResponseMode,
+    /// IdP 登出端点（RP-initiated logout）。配置后「退出 SSO」会 302 到该
+    /// 端点并带 `id_token_hint`，让 IdP 侧会话一并失效。
+    #[serde(default)]
+    pub end_session_endpoint: Option<String>,
+    /// 登出后回跳地址：https URL 或站内绝对路径（缺省不回跳）。
+    #[serde(default)]
+    pub post_logout_redirect_uri: Option<String>,
 }
 
 fn default_role_claim() -> String {
@@ -149,6 +194,10 @@ fn default_session_seconds() -> u64 {
     8 * 3600
 }
 
+fn default_allowed_algs() -> Vec<String> {
+    vec!["RS256".to_string()]
+}
+
 impl Default for OidcConfig {
     fn default() -> Self {
         OidcConfig {
@@ -175,6 +224,10 @@ impl Default for OidcConfig {
             post_login_path: default_post_login_path(),
             scopes: default_scopes(),
             session_seconds: default_session_seconds(),
+            allowed_algs: default_allowed_algs(),
+            response_mode: ResponseMode::default(),
+            end_session_endpoint: None,
+            post_logout_redirect_uri: None,
         }
     }
 }
@@ -284,6 +337,8 @@ pub fn resolve_claims(cfg: &OidcConfig, claims: &Value) -> Result<Resolved, Stri
 #[derive(Debug, Clone)]
 pub struct JwtParts {
     pub kid: Option<String>,
+    /// JWT header 的 `alg`（未校验白名单，由调用方 `check_alg` 判定）。
+    pub alg: String,
     pub claims: Value,
     pub signing_input: String,
     pub signature: Vec<u8>,
@@ -295,7 +350,8 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("base64url: {e}"))
 }
 
-/// 拆分/解码 JWT；只接受 `alg=RS256`（拒绝 none/HS*/PS*/ES*）。
+/// 拆分/解码 JWT。`alg` 只做基本排除（`none`/空），**是否允许由调用方
+/// 按 `auth.oidc.allowed_algs` 判定**（`none`/`HS*` 永不支持）。
 pub fn split_jwt(token: &str) -> Result<JwtParts, String> {
     let mut parts = token.split('.');
     let h = parts.next().ok_or("jwt: missing header")?;
@@ -311,8 +367,8 @@ pub fn split_jwt(token: &str) -> Result<JwtParts, String> {
         .and_then(|v| v.as_str())
         .ok_or("jwt: header.alg missing")?
         .to_string();
-    if alg != "RS256" {
-        return Err(format!("jwt: unsupported alg {alg:?} (only RS256)"));
+    if alg.is_empty() || alg.eq_ignore_ascii_case("none") {
+        return Err("jwt: alg none is not allowed".to_string());
     }
     if header.get("crit").is_some() {
         return Err("jwt: critical header extensions are not supported".to_string());
@@ -333,10 +389,31 @@ pub fn split_jwt(token: &str) -> Result<JwtParts, String> {
     }
     Ok(JwtParts {
         kid,
+        alg,
         claims,
         signing_input: format!("{h}.{p}"),
         signature,
     })
+}
+
+/// 判断 JWT 的 `alg` 是否在配置白名单内（fail-closed）。
+pub fn check_alg(cfg: &OidcConfig, alg: &str) -> Result<(), String> {
+    if cfg.allowed_algs.iter().any(|a| a == alg) {
+        return Ok(());
+    }
+    Err(format!(
+        "jwt: alg {alg:?} is not in auth.oidc.allowed_algs ({})",
+        cfg.allowed_algs.join(",")
+    ))
+}
+
+/// **不验签**地读取 JWT payload 里的字符串 claim（只用于 `at_hash` 这类
+/// 预校验；最终结论仍以验签后的 claim 为准）。
+pub fn peek_claim(token: &str, claim: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = b64_decode(payload).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    value.get(claim)?.as_str().map(str::to_string)
 }
 
 fn claim_i64(v: &Value) -> Option<i64> {
@@ -421,67 +498,174 @@ pub fn validate_jwt_claims(
     Ok((resolve_claims(cfg, claims)?, exp))
 }
 
-/// JWKS 中的 RSA 公钥（未构建 RsaPublicKey）。
+/// 签名公钥（按 JWK 类型）。
 #[derive(Debug, Clone)]
-pub struct RsaJwk {
-    pub kid: Option<String>,
-    pub n: Vec<u8>,
-    pub e: Vec<u8>,
+pub enum SigningKey {
+    /// RSA（RS256 / PS256）。
+    Rsa(RsaPublicKey),
+    /// ECDSA P-256（ES256）。
+    EcdsaP256(EcdsaVerifyingKey),
+    /// Ed25519（EdDSA）。
+    Ed25519(Ed25519PublicKey),
 }
 
-impl RsaJwk {
-    pub fn to_public_key(&self) -> Result<RsaPublicKey, String> {
-        // 现代 IdP 至少 2048-bit；拒绝弱密钥（< 256 字节模长）。
-        if self.n.len() < 256 {
-            return Err("jwk: RSA modulus shorter than 2048 bits".to_string());
+/// JWK 密钥类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyType {
+    Rsa,
+    EcdsaP256,
+    Ed25519,
+}
+
+/// JWKS 中的一把验签公钥。
+#[derive(Debug, Clone)]
+pub struct Jwk {
+    pub kid: Option<String>,
+    pub kty: KeyType,
+    /// JWK 自声明的 `alg`（缺省则按 kty 推断）。
+    pub alg: Option<String>,
+    pub key: SigningKey,
+}
+
+impl Jwk {
+    /// 该 key 是否可用于给定算法——**算法与密钥类型必须匹配**（防 alg confusion）。
+    pub fn accepts_alg(&self, alg: &str) -> bool {
+        match self.alg.as_deref() {
+            Some(a) => a == alg,
+            None => match self.kty {
+                KeyType::Rsa => alg == "RS256" || alg == "PS256",
+                KeyType::EcdsaP256 => alg == "ES256",
+                KeyType::Ed25519 => alg == "EdDSA",
+            },
         }
-        RsaPublicKey::new(
-            BigUint::from_bytes_be(&self.n),
-            BigUint::from_bytes_be(&self.e),
-        )
-        .map_err(|e| format!("jwk: invalid RSA key: {e}"))
     }
 }
 
-/// 解析 JWKS：只保留 `kty=RSA`、`use=sig`（或未声明）、`alg=RS256`
-/// （或未声明）且 n/e 合法的 key。
-pub fn parse_jwks(v: &Value) -> Result<Vec<RsaJwk>, String> {
+/// 从 JWKS JSON 解析出一把可验签公钥。
+///
+/// 材料非法（弱 RSA、坐标不在曲线上、长度不对）的 key **跳过**（不拖垮整份
+/// JWKS）；整份 JWKS 一把可用 key 都没有时由 `parse_jwks` 报错。
+fn build_jwk(k: &Value) -> Result<Option<Jwk>, String> {
+    let kty = k.get("kty").and_then(|x| x.as_str()).unwrap_or("");
+    let kid = k
+        .get("kid")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let alg = k
+        .get("alg")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    match kty {
+        "RSA" => {
+            let n = match k.get("n").and_then(|x| x.as_str()) {
+                Some(s) => b64_decode(s)?,
+                None => return Ok(None),
+            };
+            let e = match k.get("e").and_then(|x| x.as_str()) {
+                Some(s) => b64_decode(s)?,
+                None => return Ok(None),
+            };
+            // 现代 IdP 至少 2048-bit；拒绝弱密钥（< 256 字节模长）。
+            if n.len() < 256 {
+                return Ok(None);
+            }
+            let key =
+                match RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from_bytes_be(&e)) {
+                    Ok(k) => k,
+                    Err(_) => return Ok(None),
+                };
+            Ok(Some(Jwk {
+                kid,
+                kty: KeyType::Rsa,
+                alg,
+                key: SigningKey::Rsa(key),
+            }))
+        }
+        "EC" => {
+            let crv = k.get("crv").and_then(|x| x.as_str()).unwrap_or("");
+            if crv != "P-256" {
+                return Ok(None);
+            }
+            let x = match k.get("x").and_then(|x| x.as_str()) {
+                Some(s) => b64_decode(s)?,
+                None => return Ok(None),
+            };
+            let y = match k.get("y").and_then(|x| x.as_str()) {
+                Some(s) => b64_decode(s)?,
+                None => return Ok(None),
+            };
+            if x.len() != 32 || y.len() != 32 {
+                return Ok(None);
+            }
+            let mut sec1 = Vec::with_capacity(65);
+            sec1.push(0x04u8);
+            sec1.extend_from_slice(&x);
+            sec1.extend_from_slice(&y);
+            let key = match EcdsaVerifyingKey::from_sec1_bytes(&sec1) {
+                Ok(k) => k,
+                Err(_) => return Ok(None),
+            };
+            Ok(Some(Jwk {
+                kid,
+                kty: KeyType::EcdsaP256,
+                alg,
+                key: SigningKey::EcdsaP256(key),
+            }))
+        }
+        "OKP" => {
+            let crv = k.get("crv").and_then(|x| x.as_str()).unwrap_or("");
+            if crv != "Ed25519" {
+                return Ok(None);
+            }
+            let x = match k.get("x").and_then(|x| x.as_str()) {
+                Some(s) => b64_decode(s)?,
+                None => return Ok(None),
+            };
+            if x.len() != 32 {
+                return Ok(None);
+            }
+            let key = match Ed25519PublicKey::from_slice(&x) {
+                Ok(k) => k,
+                Err(_) => return Ok(None),
+            };
+            Ok(Some(Jwk {
+                kid,
+                kty: KeyType::Ed25519,
+                alg,
+                key: SigningKey::Ed25519(key),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// 解析 JWKS：只保留 `use=sig`（或未声明）且密钥材料合法的 key。
+/// `alg` 缺省时按 kty 推断；显式声明的 `alg` 只允许受支持的算法。
+pub fn parse_jwks(v: &Value) -> Result<Vec<Jwk>, String> {
     let keys = v
         .get("keys")
         .and_then(|k| k.as_array())
         .ok_or("jwks: keys array missing")?;
     let mut out = Vec::new();
     for k in keys {
-        if k.get("kty").and_then(|x| x.as_str()) != Some("RSA") {
-            continue;
-        }
         if let Some(use_) = k.get("use").and_then(|x| x.as_str()) {
             if use_ != "sig" {
                 continue;
             }
         }
         if let Some(alg) = k.get("alg").and_then(|x| x.as_str()) {
-            if alg != "RS256" {
+            if !SUPPORTED_ALGS.contains(&alg) {
                 continue;
             }
         }
-        let n = match k.get("n").and_then(|x| x.as_str()) {
-            Some(s) => b64_decode(s)?,
-            None => continue,
-        };
-        let e = match k.get("e").and_then(|x| x.as_str()) {
-            Some(s) => b64_decode(s)?,
-            None => continue,
-        };
-        let kid = k
-            .get("kid")
-            .and_then(|x| x.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        out.push(RsaJwk { kid, n, e });
+        if let Some(jwk) = build_jwk(k)? {
+            out.push(jwk);
+        }
     }
     if out.is_empty() {
-        return Err("jwks: no usable RS256 signing keys".to_string());
+        return Err("jwks: no usable signing keys".to_string());
     }
     Ok(out)
 }
@@ -489,7 +673,7 @@ pub fn parse_jwks(v: &Value) -> Result<Vec<RsaJwk>, String> {
 /// JWKS 内存缓存（不保存私钥/原始 JWT）。
 #[derive(Debug, Default)]
 pub struct JwksCache {
-    keys: Vec<(Option<String>, RsaPublicKey)>,
+    keys: Vec<Jwk>,
     fetched: Option<Instant>,
 }
 
@@ -499,30 +683,34 @@ impl JwksCache {
             .is_some_and(|t| t.elapsed() < Duration::from_secs(ttl_seconds.clamp(1, 86_400)))
     }
 
-    pub fn get(&self, kid: Option<&str>) -> Option<RsaPublicKey> {
+    /// 按 kid（可空）+ 算法取 key。
+    /// - 有 kid：必须存在**且类型匹配**该算法；
+    /// - 无 kid：只有唯一一把匹配该算法的 key 才可安全选择。
+    pub fn get(&self, kid: Option<&str>, alg: &str) -> Option<Jwk> {
+        let matched = |j: &Jwk| j.accepts_alg(alg);
         match kid {
             Some(k) => self
                 .keys
                 .iter()
-                .find(|(kid, _)| kid.as_deref() == Some(k))
-                .map(|(_, key)| key.clone()),
-            // 无 kid 时只有唯一 key 才可安全选择。
-            None if self.keys.len() == 1 => Some(self.keys[0].1.clone()),
-            None => None,
+                .find(|j| j.kid.as_deref() == Some(k) && matched(j))
+                .cloned(),
+            None => {
+                let mut it = self.keys.iter().filter(|j| matched(j));
+                let first = it.next()?;
+                if it.next().is_some() {
+                    None
+                } else {
+                    Some(first.clone())
+                }
+            }
         }
     }
 
-    pub fn set(&mut self, jwks: &[RsaJwk]) -> Result<(), String> {
-        let mut keys = Vec::new();
-        for jwk in jwks {
-            if let Ok(key) = jwk.to_public_key() {
-                keys.push((jwk.kid.clone(), key));
-            }
+    pub fn set(&mut self, jwks: &[Jwk]) -> Result<(), String> {
+        if jwks.is_empty() {
+            return Err("jwks: no usable public keys".to_string());
         }
-        if keys.is_empty() {
-            return Err("jwks: no usable RSA public keys".to_string());
-        }
-        self.keys = keys;
+        self.keys = jwks.to_vec();
         self.fetched = Some(Instant::now());
         Ok(())
     }
@@ -533,15 +721,75 @@ impl JwksCache {
     }
 }
 
-/// 验签 RS256 签名（signing_input 原文，签名已 base64url 解码）。
-pub fn verify_rs256(
-    key: &RsaPublicKey,
+/// 按算法验签（signing_input 原文，签名已 base64url 解码）。
+/// 算法与密钥类型不匹配一律失败（fail-closed）。
+pub fn verify_signature(
+    alg: &str,
+    key: &SigningKey,
     signing_input: &str,
     signature: &[u8],
 ) -> Result<(), String> {
-    let hashed = Sha256::digest(signing_input.as_bytes());
-    key.verify(Pkcs1v15Sign::new::<Sha256>(), hashed.as_slice(), signature)
-        .map_err(|_| "jwt: signature verification failed".to_string())
+    let msg = signing_input.as_bytes();
+    match (alg, key) {
+        ("RS256", SigningKey::Rsa(k)) => {
+            let hashed = Sha256::digest(msg);
+            k.verify(Pkcs1v15Sign::new::<Sha256>(), hashed.as_slice(), signature)
+                .map_err(|_| "jwt: signature verification failed".to_string())
+        }
+        ("PS256", SigningKey::Rsa(k)) => {
+            let hashed = Sha256::digest(msg);
+            k.verify(Pss::new::<Sha256>(), hashed.as_slice(), signature)
+                .map_err(|_| "jwt: signature verification failed".to_string())
+        }
+        ("ES256", SigningKey::EcdsaP256(k)) => {
+            let sig = EcdsaSignature::from_slice(signature)
+                .map_err(|_| "jwt: invalid ES256 signature encoding".to_string())?;
+            k.verify(msg, &sig)
+                .map_err(|_| "jwt: signature verification failed".to_string())
+        }
+        ("EdDSA", SigningKey::Ed25519(k)) => {
+            let sig = ed25519_compact::Signature::from_slice(signature)
+                .map_err(|_| "jwt: invalid EdDSA signature encoding".to_string())?;
+            k.verify(msg, &sig)
+                .map_err(|_| "jwt: signature verification failed".to_string())
+        }
+        _ => Err("jwt: alg/key type mismatch".to_string()),
+    }
+}
+
+/// 签名算法对应的摘要算法（OIDC Core §3.3.2.11：RS/ES/PS→SHA-256，
+/// EdDSA→SHA-512）。
+fn digest_for_alg(alg: &str) -> Option<&'static str> {
+    match alg {
+        "RS256" | "PS256" | "ES256" => Some("sha-256"),
+        "EdDSA" => Some("sha-512"),
+        _ => None,
+    }
+}
+
+/// `at_hash` / `c_hash` = 摘要左半部分（base64url，无 padding）。
+pub fn token_hash(alg: &str, token: &str) -> Result<String, String> {
+    match digest_for_alg(alg) {
+        Some("sha-256") => {
+            let d = Sha256::digest(token.as_bytes());
+            Ok(B64.encode(&d[..d.len() / 2]))
+        }
+        Some("sha-512") => {
+            let d = Sha512::digest(token.as_bytes());
+            Ok(B64.encode(&d[..d.len() / 2]))
+        }
+        _ => Err(format!("jwt: unsupported alg {alg:?} for token hash")),
+    }
+}
+
+/// 校验 `at_hash` / `c_hash`（claim 存在才校验；不匹配即拒绝）。
+pub fn verify_token_hash(alg: &str, token: &str, expected: &str) -> Result<(), String> {
+    let got = token_hash(alg, token)?;
+    if got == expected {
+        Ok(())
+    } else {
+        Err("jwt: token hash mismatch".to_string())
+    }
 }
 
 /// PKCE S256 challenge = base64url(sha256(verifier))，无 padding。
@@ -614,12 +862,30 @@ impl LoginStore {
 }
 
 /// 浏览器登录成功后签发的本节点短期会话（不持久化）。
+///
+/// `id_token` / `refresh_token` 只留在**服务端内存**（供 RP-initiated logout
+/// 与 refresh 续期），永不下发给浏览器。
 #[derive(Debug, Clone)]
 pub struct Session {
     pub role: Role,
     pub namespace: Option<String>,
     pub sub: String,
     pub expires: Instant,
+    /// IdP ID token（仅服务端；用于 `id_token_hint` 登出）。
+    pub id_token: Option<String>,
+    /// IdP refresh token（仅服务端；用于静默续期）。
+    pub refresh_token: Option<String>,
+}
+
+/// 签发会话所需的参数。
+#[derive(Debug, Clone)]
+pub struct SessionIssue {
+    pub role: Role,
+    pub namespace: Option<String>,
+    pub sub: String,
+    pub ttl: Duration,
+    pub id_token: Option<String>,
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -628,13 +894,7 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    pub fn issue(
-        &mut self,
-        role: Role,
-        namespace: Option<String>,
-        ttl: Duration,
-        sub: String,
-    ) -> String {
+    pub fn issue(&mut self, issue: SessionIssue) -> String {
         self.purge();
         if self.entries.len() >= MAX_SESSIONS {
             if let Some(k) = self.entries.keys().next().cloned() {
@@ -645,19 +905,30 @@ impl SessionStore {
         self.entries.insert(
             token.clone(),
             Session {
-                role,
-                namespace,
-                sub,
-                expires: Instant::now() + ttl,
+                role: issue.role,
+                namespace: issue.namespace,
+                sub: issue.sub,
+                expires: Instant::now() + issue.ttl,
+                id_token: issue.id_token,
+                refresh_token: issue.refresh_token,
             },
         );
         token
     }
 
+    /// 取**未过期**的会话。过期会话不立即丢弃（留给 refresh 续期宽限窗），
+    /// 由 `purge` 统一回收。
     pub fn get(&mut self, token: &str) -> Option<Session> {
         let now = Instant::now();
+        self.entries.get(token).filter(|s| s.expires > now).cloned()
+    }
+
+    /// 取会话用于 **refresh 续期**：已过期但在宽限窗内也返回（续期成功后
+    /// 原地延长）。超出宽限窗的会话直接丢弃。
+    pub fn get_for_refresh(&mut self, token: &str) -> Option<Session> {
+        let now = Instant::now();
         match self.entries.get(token) {
-            Some(s) if s.expires > now => Some(s.clone()),
+            Some(s) if s.expires + REFRESH_GRACE > now => Some(s.clone()),
             Some(_) => {
                 self.entries.remove(token);
                 None
@@ -670,9 +941,32 @@ impl SessionStore {
         self.entries.remove(token)
     }
 
+    /// refresh 续期：原地延长会话有效期并更新 IdP 侧 token（浏览器 token 不变）。
+    pub fn extend(
+        &mut self,
+        token: &str,
+        ttl: Duration,
+        id_token: Option<String>,
+        refresh_token: Option<String>,
+    ) -> bool {
+        match self.entries.get_mut(token) {
+            Some(s) => {
+                s.expires = Instant::now() + ttl;
+                if id_token.is_some() {
+                    s.id_token = id_token;
+                }
+                if refresh_token.is_some() {
+                    s.refresh_token = refresh_token;
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     fn purge(&mut self) {
         let now = Instant::now();
-        self.entries.retain(|_, s| s.expires > now);
+        self.entries.retain(|_, s| s.expires + REFRESH_GRACE > now);
     }
 
     #[cfg(test)]
@@ -825,6 +1119,39 @@ pub fn validate(cfg: &OidcConfig) -> anyhow::Result<()> {
     if !(1..=86_400).contains(&cfg.session_seconds) {
         anyhow::bail!("auth.oidc.session_seconds must be 1-86400");
     }
+    if cfg.allowed_algs.is_empty() {
+        anyhow::bail!("auth.oidc.allowed_algs must not be empty");
+    }
+    for alg in &cfg.allowed_algs {
+        if !SUPPORTED_ALGS.contains(&alg.as_str()) {
+            anyhow::bail!(
+                "auth.oidc.allowed_algs: {alg:?} is not supported (RS256/PS256/ES256/EdDSA)"
+            );
+        }
+    }
+    if cfg.response_mode == ResponseMode::FormPost && !cfg.browser_login {
+        anyhow::bail!("auth.oidc.response_mode=form_post requires browser_login");
+    }
+    if let Some(ep) = cfg.end_session_endpoint.as_deref() {
+        if ep.trim().is_empty() {
+            anyhow::bail!("auth.oidc.end_session_endpoint must not be empty when set");
+        }
+        check_http_url("auth.oidc.end_session_endpoint", ep)?;
+    }
+    if let Some(u) = cfg.post_logout_redirect_uri.as_deref() {
+        if u.trim().is_empty() {
+            anyhow::bail!("auth.oidc.post_logout_redirect_uri must not be empty when set");
+        }
+        if u.starts_with('/') {
+            if u.starts_with("//") || u.contains('#') {
+                anyhow::bail!(
+                    "auth.oidc.post_logout_redirect_uri must be a site-relative path or https URL"
+                );
+            }
+        } else {
+            check_http_url("auth.oidc.post_logout_redirect_uri", u)?;
+        }
+    }
     Ok(())
 }
 
@@ -939,15 +1266,171 @@ mod tests {
     }
 
     #[test]
-    fn jwt_split_rejects_none_and_accepts_rs256() {
+    fn jwt_split_rejects_none_and_reports_alg() {
         let h = B64.encode(br#"{"alg":"none","typ":"JWT"}"#);
         let p = B64.encode(br#"{"sub":"u"}"#);
         assert!(split_jwt(&format!("{h}.{p}.")).is_err());
-        let h = B64.encode(br#"{"alg":"RS256","kid":"k1"}"#);
+        let h = B64.encode(br#"{"alg":"HS256","kid":"k1"}"#);
         let p = B64.encode(br#"{"sub":"u","iss":"https://idp"}"#);
+        assert!(
+            split_jwt(&format!("{h}.{p}.c2ln")).is_ok(),
+            "拆分不拦 HS*，由白名单拦"
+        );
+        let h = B64.encode(br#"{"alg":"RS256","kid":"k1"}"#);
         let parts = split_jwt(&format!("{h}.{p}.c2ln")).unwrap();
         assert_eq!(parts.kid.as_deref(), Some("k1"));
+        assert_eq!(parts.alg, "RS256");
         assert_eq!(parts.signature, b"sig");
+        // crit 头一律拒绝
+        let h = B64.encode(br#"{"alg":"RS256","crit":["x"]}"#);
+        assert!(split_jwt(&format!("{h}.{p}.c2ln")).is_err());
+    }
+
+    #[test]
+    fn allowed_algs_gate_keeps_rs256_default() {
+        let c = cfg();
+        assert_eq!(c.allowed_algs, vec!["RS256".to_string()]);
+        assert!(check_alg(&c, "RS256").is_ok());
+        assert!(check_alg(&c, "ES256").is_err());
+        assert!(check_alg(&c, "none").is_err());
+        assert!(check_alg(&c, "HS256").is_err());
+        let mut c2 = c.clone();
+        c2.allowed_algs = vec!["RS256".to_string(), "ES256".to_string()];
+        assert!(check_alg(&c2, "ES256").is_ok());
+    }
+
+    #[test]
+    fn jwk_alg_must_match_key_type() {
+        // RSA key 不接受 ES256；EC key 不接受 RS256（防 alg confusion）。
+        let n = B64.encode(vec![1u8; 256]);
+        let e = B64.encode([1u8, 0, 1]);
+        let v = json!({"keys":[
+            {"kty":"RSA","kid":"rsa","use":"sig","alg":"RS256","n":n,"e":e}
+        ]});
+        let keys = parse_jwks(&v).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].accepts_alg("RS256"));
+        assert!(
+            !keys[0].accepts_alg("PS256"),
+            "JWK 显式声明 RS256 时不接受 PS256"
+        );
+        assert!(!keys[0].accepts_alg("ES256"));
+    }
+
+    #[test]
+    fn jwks_parses_rsa_ec_and_okp_keys() {
+        // RSA（占位模长，只测解析/过滤）
+        let n = B64.encode(vec![1u8; 256]);
+        let e = B64.encode([1u8, 0, 1]);
+        // EC P-256：真实坐标（secp256r1 上的有效点）
+        let (x, y) = {
+            use p256::ecdsa::SigningKey;
+            use p256::elliptic_curve::sec1::ToEncodedPoint;
+            let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
+            let pt = sk.verifying_key().to_encoded_point(false);
+            let x = pt.x().unwrap().to_vec();
+            let y = pt.y().unwrap().to_vec();
+            (x, y)
+        };
+        let ec = json!({
+            "kty":"EC","crv":"P-256","kid":"ec1","use":"sig","alg":"ES256",
+            "x":B64.encode(x),"y":B64.encode(y)
+        });
+        let okp = json!({
+            "kty":"OKP","crv":"Ed25519","kid":"ed1","use":"sig",
+            "x":B64.encode([3u8; 32])
+        });
+        let v = json!({"keys":[
+            {"kty":"EC","crv":"P-384","kid":"p384"},
+            {"kty":"RSA","kid":"enc","use":"enc","n":n,"e":e},
+            ec, okp,
+            {"kty":"RSA","kid":"rsa","use":"sig","alg":"RS256","n":n,"e":e}
+        ]});
+        let keys = parse_jwks(&v).unwrap();
+        let kids: Vec<&str> = keys.iter().filter_map(|k| k.kid.as_deref()).collect();
+        assert!(kids.contains(&"ec1"));
+        assert!(kids.contains(&"ed1"));
+        assert!(kids.contains(&"rsa"));
+        assert!(!kids.contains(&"p384"), "P-384 不支持");
+        assert!(!kids.contains(&"enc"), "use=enc 跳过");
+        let mut cache = JwksCache::default();
+        cache.set(&keys).unwrap();
+        assert_eq!(cache.len(), 3);
+        assert!(cache.fresh(60));
+        // kid 命中且算法匹配
+        assert!(cache.get(Some("ec1"), "ES256").is_some());
+        assert!(cache.get(Some("ec1"), "RS256").is_none());
+        assert!(cache.get(Some("ed1"), "EdDSA").is_some());
+        // 未知 kid -> None（触发刷新）
+        assert!(cache.get(Some("nope"), "RS256").is_none());
+    }
+
+    #[test]
+    fn verifies_rs256_ps256_es256_eddsa() {
+        let msg = "header.payload";
+        // RS256
+        let rsa = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+        let rsa_pub = rsa::RsaPublicKey::from(&rsa);
+        let hashed = Sha256::digest(msg.as_bytes());
+        let sig = rsa.sign(Pkcs1v15Sign::new::<Sha256>(), &hashed).unwrap();
+        let key = SigningKey::Rsa(rsa_pub.clone());
+        assert!(verify_signature("RS256", &key, msg, &sig).is_ok());
+        // 用错算法（PS256 对同一签名）必须失败
+        assert!(verify_signature("PS256", &key, msg, &sig).is_err());
+        // PS256
+        let pss_sk = rsa::pss::SigningKey::<Sha256>::new(rsa.clone());
+        let pss = rsa::signature::RandomizedSigner::sign_with_rng(
+            &pss_sk,
+            &mut rand::rngs::OsRng,
+            msg.as_bytes(),
+        );
+        let pss_bytes = rsa::signature::SignatureEncoding::to_bytes(&pss);
+        assert!(verify_signature("PS256", &key, msg, &pss_bytes).is_ok());
+        // ES256
+        let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let es: p256::ecdsa::Signature = p256::ecdsa::signature::Signer::sign(&sk, msg.as_bytes());
+        let es_key = SigningKey::EcdsaP256(*sk.verifying_key());
+        assert!(verify_signature("ES256", &es_key, msg, &es.to_bytes()).is_ok());
+        // EdDSA
+        let kp = ed25519_compact::KeyPair::generate();
+        let ed = kp.sk.sign(msg.as_bytes(), None);
+        let ed_key = SigningKey::Ed25519(kp.pk);
+        assert!(verify_signature("EdDSA", &ed_key, msg, ed.as_ref()).is_ok());
+        // 算法与 key 类型不匹配 -> 失败
+        assert!(verify_signature("ES256", &key, msg, &es.to_bytes()).is_err());
+        assert!(verify_signature("EdDSA", &es_key, msg, ed.as_ref()).is_err());
+        // 篡改签名 -> 失败
+        let mut bad = es.to_bytes();
+        bad[0] ^= 0xff;
+        assert!(verify_signature("ES256", &es_key, msg, &bad).is_err());
+    }
+
+    #[test]
+    fn token_hash_matches_oidc_spec() {
+        // OIDC Core §3.3.2.11 示例：RS256 -> base64url(左半 SHA-256)
+        assert_eq!(
+            token_hash("RS256", "jHkWEdUXMU1BwAsC4vtUsZwnNvTIxEl0z9K3vx5KF0Y").unwrap(),
+            "77QmUPtjPfzWtF2AnpK9RQ"
+        );
+        // EdDSA -> 左半 SHA-512
+        let d = Sha512::digest(b"abc");
+        let expect = B64.encode(&d[..d.len() / 2]);
+        assert_eq!(token_hash("EdDSA", "abc").unwrap(), expect);
+        // 不匹配的 hash 必须报错
+        assert!(verify_token_hash("RS256", "abc", "wrong").is_err());
+        assert!(verify_token_hash("RS256", "abc", &token_hash("RS256", "abc").unwrap()).is_ok());
+        // 不支持的算法
+        assert!(token_hash("HS256", "abc").is_err());
+    }
+
+    #[test]
+    fn peek_claim_reads_payload_without_verification() {
+        let h = B64.encode(br#"{"alg":"RS256"}"#);
+        let p = B64.encode(br#"{"sub":"u1","at_hash":"abc"}"#);
+        let tok = format!("{h}.{p}.c2ln");
+        assert_eq!(peek_claim(&tok, "at_hash").as_deref(), Some("abc"));
+        assert_eq!(peek_claim(&tok, "sub").as_deref(), Some("u1"));
+        assert!(peek_claim(&tok, "nope").is_none());
     }
 
     #[test]
@@ -1029,25 +1512,66 @@ mod tests {
     #[test]
     fn sessions_expire_and_revoke() {
         let mut s = SessionStore::default();
-        let t = s.issue(
-            Role::Operator,
-            Some("team-a".to_string()),
-            Duration::from_millis(50),
-            "sub".to_string(),
-        );
+        let t = s.issue(SessionIssue {
+            role: Role::Operator,
+            namespace: Some("team-a".to_string()),
+            sub: "sub".to_string(),
+            ttl: Duration::from_millis(50),
+            id_token: Some("id-token".to_string()),
+            refresh_token: Some("refresh-token".to_string()),
+        });
         assert!(t.starts_with("al_sess_"));
-        assert_eq!(s.get(&t).unwrap().role, Role::Operator);
+        let got = s.get(&t).unwrap();
+        assert_eq!(got.role, Role::Operator);
+        assert_eq!(got.id_token.as_deref(), Some("id-token"));
+        assert_eq!(got.refresh_token.as_deref(), Some("refresh-token"));
         assert!(s.remove(&t).is_some());
         assert!(s.get(&t).is_none());
-        let t = s.issue(
-            Role::Viewer,
-            None,
-            Duration::from_millis(30),
-            "sub".to_string(),
-        );
+        let t = s.issue(SessionIssue {
+            role: Role::Viewer,
+            namespace: None,
+            sub: "sub".to_string(),
+            ttl: Duration::from_millis(30),
+            id_token: None,
+            refresh_token: None,
+        });
         std::thread::sleep(Duration::from_millis(50));
-        assert!(s.get(&t).is_none());
-        assert_eq!(s.len(), 0);
+        assert!(s.get(&t).is_none(), "过期会话不可用于鉴权");
+        assert!(s.get_for_refresh(&t).is_some(), "宽限窗内仍可 refresh 续期");
+        assert_eq!(s.len(), 1, "过期会话在宽限窗内暂不丢弃");
+    }
+
+    #[test]
+    fn session_extend_keeps_token_and_updates_idp_tokens() {
+        let mut s = SessionStore::default();
+        let t = s.issue(SessionIssue {
+            role: Role::Operator,
+            namespace: Some("team-a".to_string()),
+            sub: "sub".to_string(),
+            ttl: Duration::from_millis(30),
+            id_token: Some("old-id".to_string()),
+            refresh_token: Some("old-refresh".to_string()),
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(s.get(&t).is_none(), "过期会话不可续期");
+        let t2 = s.issue(SessionIssue {
+            role: Role::Operator,
+            namespace: Some("team-a".to_string()),
+            sub: "sub".to_string(),
+            ttl: Duration::from_millis(30),
+            id_token: Some("old-id".to_string()),
+            refresh_token: Some("old-refresh".to_string()),
+        });
+        assert!(s.extend(
+            &t2,
+            Duration::from_secs(600),
+            Some("new-id".to_string()),
+            Some("new-refresh".to_string())
+        ));
+        let got = s.get(&t2).unwrap();
+        assert_eq!(got.id_token.as_deref(), Some("new-id"));
+        assert_eq!(got.refresh_token.as_deref(), Some("new-refresh"));
+        assert!(!s.extend("al_sess_unknown", Duration::from_secs(1), None, None));
     }
 
     #[test]
@@ -1098,5 +1622,44 @@ mod tests {
         c.introspection_url = "https://idp.example.com/introspect".to_string();
         c.client_secret = "secret".to_string();
         assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn validate_third_wave_fields() {
+        let mut c = cfg();
+        c.mode = OidcMode::Jwt;
+        c.client_id = "id".to_string();
+        c.issuer = Some("https://idp.example.com".to_string());
+        c.jwks_uri = Some("https://idp.example.com/jwks".to_string());
+        // 算法白名单
+        c.allowed_algs = vec!["RS256".to_string(), "ES256".to_string()];
+        assert!(validate(&c).is_ok());
+        c.allowed_algs = vec!["none".to_string()];
+        assert!(validate(&c).is_err(), "none 不允许");
+        c.allowed_algs = vec!["HS256".to_string()];
+        assert!(validate(&c).is_err(), "HS* 不允许");
+        c.allowed_algs = vec![];
+        assert!(validate(&c).is_err(), "白名单不能为空");
+        c.allowed_algs = vec!["RS256".to_string()];
+        // form_post 需要浏览器登录
+        c.response_mode = ResponseMode::FormPost;
+        assert!(validate(&c).is_err());
+        c.browser_login = true;
+        c.authorization_endpoint = Some("https://idp.example.com/authorize".to_string());
+        c.token_endpoint = Some("https://idp.example.com/token".to_string());
+        c.redirect_uri = Some("https://al.example.com/v1/auth/oidc/callback".to_string());
+        assert!(validate(&c).is_ok());
+        // 登出端点
+        c.end_session_endpoint = Some("https://idp.example.com/logout".to_string());
+        c.post_logout_redirect_uri = Some("/web".to_string());
+        assert!(validate(&c).is_ok());
+        c.post_logout_redirect_uri = Some("//evil.example.com".to_string());
+        assert!(validate(&c).is_err(), "回跳地址不能是 //host");
+        c.post_logout_redirect_uri = Some("https://al.example.com/web".to_string());
+        assert!(validate(&c).is_ok());
+        c.end_session_endpoint = Some("http://idp.example.com/logout".to_string());
+        assert!(validate(&c).is_err(), "非回环 http 拒绝");
+        c.end_session_endpoint = Some("  ".to_string());
+        assert!(validate(&c).is_err());
     }
 }

@@ -52,6 +52,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 # 节点间 TLS 监听（对等 WS 专用端口）。用 no-provider 变体，provider 由上面的
 # rustls `ring` feature 提供；`tls-rustls` 会强拉 aws-lc-rs，故不用。
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+# v0.7.2 OIDC 第三波：ES256（ECDSA P-256）本地验签。纯 Rust（elliptic-curve），
+# 无 C 依赖；EdDSA 复用已引入的 ed25519-compact。
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [dev-dependencies]
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
