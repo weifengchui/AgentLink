@@ -366,6 +366,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/config", get(config_get).put(config_put))
         .route("/v1/mesh/status", get(mesh_status_get))
         .route("/v1/mesh/slo", get(mesh_slo_get))
+        .route("/v1/mesh/mode", get(mesh_mode_get).post(mesh_mode_post))
         .route("/v1/audit/verify", get(audit_verify_get))
         .route("/v1/audit/export", get(audit_export_get))
         .route("/v1/metrics", get(metrics_get))
@@ -511,6 +512,8 @@ async fn mesh_status_get(
                     "by_state": by_state,
                     "circuit_taints": circuit_taints,
                     "warmpool": warmpool,
+                    "mode": state.router.mesh_mode().as_str(),
+                    "standalone_after_seconds": state.router.standalone_after_secs(),
                 })),
             )
         }
@@ -564,6 +567,95 @@ async fn audit_export_get(
     let mut body = state.router.audit_export(q.limit.unwrap_or(500));
     body["ok"] = json!(true);
     Json(body).into_response()
+}
+
+/// v0.7 §6.3：只读模式下的写面拒绝（统一 503，读面与在途任务不受影响）。
+fn read_only_guard(state: &AppState) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if state.router.is_read_only() {
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": "read_only",
+                "mode": "read_only",
+                "hint": "节点处于只读维护模式；POST /v1/mesh/mode {\"mode\":\"normal\"} 退出",
+            })),
+        ));
+    }
+    None
+}
+
+/// `GET /v1/mesh/mode` — 降级模式视图（只读）。
+async fn mesh_mode_get(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized().into_response();
+    };
+    if !role.allows("/v1/mesh/mode") {
+        return forbidden().into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "mode": state.router.mesh_mode().as_str(),
+        "read_only": state.router.is_read_only(),
+        "standalone_after_seconds": state.router.standalone_after_secs(),
+        "peers_online": state.router.peers_online(),
+        "peer_silence_seconds": state.router.last_peer_seen_secs(),
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct MeshModeRequest {
+    mode: String,
+}
+
+/// `POST /v1/mesh/mode` — 运行时进出只读（Admin）。`normal`/`read_only`；
+/// `standalone` 是自动判定，不允许手工设置。
+async fn mesh_mode_post(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    JsonAny(req): JsonAny<MeshModeRequest>,
+) -> Response {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized().into_response();
+    };
+    if !role.allows("/v1/mesh/mode") || role != Role::Admin {
+        return forbidden().into_response();
+    }
+    let read_only = match req.mode.as_str() {
+        "normal" => false,
+        "read_only" => true,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("unsupported mode `{other}`（normal | read_only；standalone 自动判定）"),
+                })),
+            )
+                .into_response()
+        }
+    };
+    let from = state.router.mesh_mode();
+    let prev_read_only = state.router.set_read_only(read_only);
+    let now = state.router.mesh_mode();
+    state.router.audit_event(
+        "mode.set",
+        role.as_str(),
+        json!({
+            "from": from.as_str(),
+            "to": now.as_str(),
+            "read_only": read_only,
+            "prev_read_only": prev_read_only,
+        }),
+    );
+    Json(json!({
+        "ok": true,
+        "mode": now.as_str(),
+        "read_only": state.router.is_read_only(),
+        "standalone_after_seconds": state.router.standalone_after_secs(),
+    }))
+    .into_response()
 }
 
 /// `GET /v1/mesh/slo` — v0.7 §7.2 SLO 告警 + 历史基线视图（只读）。
@@ -937,6 +1029,8 @@ async fn status(State(state): State<SharedState>, headers: HeaderMap) -> impl In
             "durable": state.router.durable(),
             "local_pending": state.router.local_pending_count(),
             "active_transfers": state.files.active(),
+            "mode": state.router.mesh_mode().as_str(),
+            "read_only": state.router.is_read_only(),
         })),
     )
 }
@@ -1322,6 +1416,9 @@ async fn agents_post(
     if !role.allows("/v1/agents") {
         return forbidden();
     }
+    if let Some(r) = read_only_guard(&state) {
+        return r;
+    }
     let id = req.agent_id.trim();
     let valid = !id.is_empty()
         && id.len() <= 64
@@ -1352,6 +1449,9 @@ async fn agents_delete(
     };
     if !role.allows("/v1/agents") {
         return forbidden();
+    }
+    if let Some(r) = read_only_guard(&state) {
+        return r;
     }
     let removed = state.router.unregister_agent(req.agent_id.trim());
     (
@@ -1659,6 +1759,9 @@ async fn tasks_post(
         Some(m) => m.clone(),
         None => return mesh_required(),
     };
+    if let Some(r) = read_only_guard(&state) {
+        return r;
+    }
     // 协议 §2 必填门：task_id / type 为非空字符串。其余字段（requires、
     // deadline、payload、budget、priority、correlation…）原样透传——
     // 引擎表存原文，不做 schema 白名单（前向兼容，对齐 taskstore 透传口径）。
@@ -1777,6 +1880,9 @@ async fn tasks_cancel_post(
     if !role.allows("/v1/tasks/:task_id/cancel") {
         return forbidden();
     }
+    if let Some(r) = read_only_guard(&state) {
+        return r;
+    }
     let Some(mesh) = state.mesh.as_ref().cloned() else {
         return mesh_required();
     };
@@ -1855,6 +1961,9 @@ async fn tasks_delete(
     };
     if !role.allows("/v1/tasks/:task_id") {
         return forbidden();
+    }
+    if let Some(r) = read_only_guard(&state) {
+        return r;
     }
     let Some(mesh) = state.mesh.as_ref().cloned() else {
         return mesh_required();
@@ -2542,6 +2651,9 @@ async fn config_put(
     };
     if !role.allows("/v1/config") {
         return forbidden();
+    }
+    if let Some(r) = read_only_guard(&state) {
+        return r;
     }
     // 审计只记「改了哪些键」，不记任何值（cluster_token 等密钥绝不入链）。
     let mut changed: Vec<&str> = Vec::new();

@@ -205,6 +205,8 @@ pub struct Engine {
     slo_cfg: crate::slo::SloConfig,
     /// SLO 评估节流（1s 一评，避免 200ms tick 空转排序）。
     slo_next: std::sync::Mutex<std::time::Instant>,
+    /// v0.7 §6.3 上次对外报告的降级模式（变化时审计 + webhook）。
+    mode_last: std::sync::Mutex<crate::router::MeshMode>,
 }
 
 impl Engine {
@@ -228,6 +230,7 @@ impl Engine {
         let circuit_cfg = state.config.mesh.engine.circuit.clone();
         let warmpool_cfg = state.config.mesh.engine.warmpool.clone();
         let slo_cfg = state.config.mesh.engine.slo.clone();
+        let mode_last = std::sync::Mutex::new(router.mesh_mode());
         let warm_next = std::sync::Mutex::new(
             std::time::Instant::now()
                 + std::time::Duration::from_secs(warmpool_cfg.interval_secs.clamp(5, 3600_u64)),
@@ -247,6 +250,7 @@ impl Engine {
             reclaim_since: std::sync::Mutex::new(HashMap::new()),
             slo_cfg,
             slo_next: std::sync::Mutex::new(std::time::Instant::now()),
+            mode_last,
         };
         tokio::spawn(async move {
             if let Err(e) = engine.run(shutdown_rx).await {
@@ -518,6 +522,9 @@ impl Engine {
         // ---- 5. SLO 评估（1s 节流；enabled=false 直接返回）----
         self.slo_tick(now_epoch);
 
+        // ---- 6. 降级模式转换（read_only 由 API 触发；standalone 自动）----
+        self.mode_tick();
+
         Ok(())
     }
 
@@ -643,6 +650,50 @@ impl Engine {
             return;
         }
         slo.record(now_wall(), ms, ok);
+    }
+
+    /// v0.7 §6.3：降级模式变化 → 审计 `mode.change` + webhook `node_degraded`/
+    /// `node_recovered`。只做事实记录，不改变调度/投递语义（standalone 下本地
+    /// 队列天然继续收敛；read_only 的写面拒绝在 API 层完成）。
+    fn mode_tick(&self) {
+        let now = self.router.mesh_mode();
+        let mut last = self.mode_last.lock().unwrap();
+        if *last == now {
+            return;
+        }
+        let from = *last;
+        *last = now;
+        drop(last);
+        let peers = self.router.peers_online();
+        tracing::warn!(
+            from = from.as_str(),
+            to = now.as_str(),
+            peers_online = peers,
+            "engine: 降级模式切换"
+        );
+        self.router.audit_event(
+            "mode.change",
+            "engine",
+            json!({
+                "from": from.as_str(),
+                "to": now.as_str(),
+                "peers_online": peers,
+            }),
+        );
+        let ev = if now == crate::router::MeshMode::Normal {
+            "node_recovered"
+        } else {
+            "node_degraded"
+        };
+        self.router.notify(
+            ev,
+            json!({
+                "mode": now.as_str(),
+                "from": from.as_str(),
+                "peers_online": peers,
+                "engine": self.node_id,
+            }),
+        );
     }
 
     /// 每秒评估一次 SLO 阈值/漂移；新告警写日志 + webhook（event=`slo_alert`）。
@@ -1268,6 +1319,7 @@ mod tests {
             mesh: MeshConfig {
                 enabled: true,
                 license_file: None,
+                degraded: Default::default(),
                 engine: EngineConfig {
                     max_retries: 2,
                     backoff_secs: 30,
@@ -1336,6 +1388,7 @@ mod tests {
             reclaim_since: std::sync::Mutex::new(HashMap::new()),
             slo_cfg: cfg.mesh.engine.slo.clone(),
             slo_next: std::sync::Mutex::new(std::time::Instant::now()),
+            mode_last: std::sync::Mutex::new(crate::router::MeshMode::Normal),
         };
         (state, mesh, engine)
     }

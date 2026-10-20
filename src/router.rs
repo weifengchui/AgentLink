@@ -903,6 +903,27 @@ pub fn tasks_projection(entries: &[HistoryEntry], f: &TaskFilter) -> Vec<TaskVie
     tasks
 }
 
+/// v0.7 §6.3 节点降级模式。
+/// - `normal`：常规；
+/// - `read_only`：维护只读（写面 503，读面/在途收敛照常）；
+/// - `standalone`：连续无直连对端超过阈值，本地队列自治（仅状态标记）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshMode {
+    Normal,
+    ReadOnly,
+    Standalone,
+}
+
+impl MeshMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MeshMode::Normal => "normal",
+            MeshMode::ReadOnly => "read_only",
+            MeshMode::Standalone => "standalone",
+        }
+    }
+}
+
 pub struct Router {
     cfg: Config,
     registry: PeerRegistry,
@@ -968,6 +989,12 @@ pub struct Router {
     offline_nodes: Mutex<HashMap<String, std::time::Instant>>,
     /// v0.7 §4.4 不可变审计日志（hash 链 append-only；关闭时 no-op）。
     audit: crate::audit::AuditLog,
+    /// v0.7 §6.3 运行时只读开关（配置值只是启动初值）。
+    read_only: AtomicBool,
+    /// 自动 standalone 阈值（秒；0=关闭）。
+    standalone_after_secs: u64,
+    /// 最近一次有直连对端（连接/断开）的时刻；standalone 计时起点。
+    last_peer_seen: Mutex<Instant>,
 }
 
 /// 一条中继学到的节点目录记录。
@@ -1117,6 +1144,9 @@ impl Router {
                 cfg.security.audit.enabled,
                 &cfg.node_id,
             ),
+            read_only: AtomicBool::new(cfg.mesh.degraded.read_only),
+            standalone_after_secs: cfg.mesh.degraded.standalone_after_seconds,
+            last_peer_seen: Mutex::new(Instant::now()),
         }
     }
 
@@ -1329,6 +1359,7 @@ impl Router {
 
     pub fn register_peer(&self, sink: PeerSink) {
         self.registry.insert(sink.clone());
+        *self.last_peer_seen.lock().unwrap() = Instant::now();
         self.offline_nodes.lock().unwrap().remove(&sink.node_id);
         tracing::info!(peer = %sink.name, node_id = %sink.node_id, addr = %sink.addr, "router: peer registered");
         // v0.5 §7.1 structured twin (debug level: default text output of the
@@ -1398,6 +1429,8 @@ impl Router {
         let removed = self.registry.remove(node_id).is_some();
         if removed {
             self.mark_node_offline(node_id);
+            // standalone 计时从最后一个直连对端断开起算。
+            *self.last_peer_seen.lock().unwrap() = Instant::now();
         }
         // A node that left takes its agent list with it: drop the cached
         // fleet view for it so ghosts never linger on /web.
@@ -2266,6 +2299,41 @@ impl Router {
 
     pub fn peers_online(&self) -> usize {
         self.registry.len()
+    }
+
+    /// v0.7 §6.3：当前降级模式（纯计算，不改状态）。
+    /// 只读优先级最高；standalone 仅在「阈值 >0 且无直连对端且静默超时」时成立。
+    pub fn mesh_mode(&self) -> MeshMode {
+        if self.read_only.load(Ordering::Relaxed) {
+            return MeshMode::ReadOnly;
+        }
+        if self.standalone_after_secs == 0 || self.peers_online() > 0 {
+            return MeshMode::Normal;
+        }
+        let last = *self.last_peer_seen.lock().unwrap();
+        if last.elapsed().as_secs() >= self.standalone_after_secs {
+            MeshMode::Standalone
+        } else {
+            MeshMode::Normal
+        }
+    }
+
+    /// 运行时切换只读（返回切换前状态）。standalone 不可手工设置。
+    pub fn set_read_only(&self, on: bool) -> bool {
+        self.read_only.swap(on, Ordering::Relaxed)
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::Relaxed)
+    }
+
+    pub fn standalone_after_secs(&self) -> u64 {
+        self.standalone_after_secs
+    }
+
+    /// 最近一次直连对端活动距今秒数（无则从进程启动算）。
+    pub fn last_peer_seen_secs(&self) -> u64 {
+        self.last_peer_seen.lock().unwrap().elapsed().as_secs()
     }
 
     /// Advertised address of a live peer, used to open file connections.
@@ -3273,5 +3341,48 @@ mod relay_tests {
         assert!(r.on_node_dir(&expired, None));
         assert!(!r.dir_online("leaf3"), "过期条目不得被视为在线");
         assert!(!r.dir_snapshot().iter().any(|v| v.node_id == "leaf3"));
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::{MeshMode, Router};
+    use crate::config::Config;
+    use std::time::{Duration, Instant};
+
+    fn router_with(standalone_after: u64, read_only: bool) -> Router {
+        let mut cfg = Config::generate(
+            Some("mode-test".to_string()),
+            Some("tok".to_string()),
+            Some("open".to_string()),
+        );
+        cfg.mesh.degraded.read_only = read_only;
+        cfg.mesh.degraded.standalone_after_seconds = standalone_after;
+        Router::new(&cfg)
+    }
+
+    #[test]
+    fn threshold_zero_keeps_normal_and_read_only_wins() {
+        let r = router_with(0, false);
+        assert_eq!(r.mesh_mode(), MeshMode::Normal);
+        r.set_read_only(true);
+        assert_eq!(r.mesh_mode(), MeshMode::ReadOnly);
+        r.set_read_only(false);
+        assert_eq!(r.mesh_mode(), MeshMode::Normal);
+    }
+
+    #[test]
+    fn standalone_after_peer_silence() {
+        let r = router_with(30, false);
+        assert_eq!(r.mesh_mode(), MeshMode::Normal);
+        // 模拟「最后一个对端已断开 31s」（单调钟，无 sleep）。
+        *r.last_peer_seen.lock().unwrap() =
+            Instant::now().checked_sub(Duration::from_secs(31)).unwrap();
+        assert_eq!(r.mesh_mode(), MeshMode::Standalone);
+        // 只读优先级更高，退出只读后回到 standalone。
+        r.set_read_only(true);
+        assert_eq!(r.mesh_mode(), MeshMode::ReadOnly);
+        r.set_read_only(false);
+        assert_eq!(r.mesh_mode(), MeshMode::Standalone);
     }
 }

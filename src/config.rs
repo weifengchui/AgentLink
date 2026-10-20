@@ -155,6 +155,25 @@ pub struct MeshConfig {
     /// reconcile 引擎的调参项（拍板记录第 4 条：显式声明才有的语义全在这）。
     #[serde(default)]
     pub engine: EngineConfig,
+    /// 降级模式（v0.7 §6.3）。缺省全关：只读关闭、standalone 不自动判定。
+    #[serde(default)]
+    pub degraded: DegradedConfig,
+}
+
+/// 降级模式配置（§6.3）。
+///
+/// - `read_only`：只读维护窗口。拒绝**新工作/治理写面**（任务声明/撤销/删除、
+///   agent 注册/注销、配置保存），读面与在途任务收敛照常；`POST /v1/mesh/mode`
+///   可在运行时进出（该端点本身不被只读拦截）。
+/// - `standalone_after_seconds`：连续无直连对端达到该秒数 → 模式标记为
+///   `standalone`（工作节点本地队列继续自治）；对端恢复即回 `normal`。
+///   `0` = 不自动判定（缺省，行为零变化）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DegradedConfig {
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub standalone_after_seconds: u64,
 }
 
 /// 任务引擎内核循环参数。
@@ -502,6 +521,7 @@ impl Role {
                     | "/v1/fleet/agents"
                     | "/v1/metrics"
                     | "/v1/mesh/slo"
+                    | "/v1/mesh/mode"
             ),
             Role::Executor => matches!(
                 endpoint,

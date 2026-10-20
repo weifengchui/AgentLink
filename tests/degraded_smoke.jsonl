@@ -1,0 +1,6 @@
+{"scenario": "S0 有对端时 mode=normal", "pass": true, "detail": {"mode": "normal", "peers_online": 1}}
+{"scenario": "S1 只读：写面 503、读面/状态照常、standalone 手工设置 400", "pass": true, "detail": {"set": "read_only", "task_status": 503, "task_error": "read_only", "status_mode": "read_only", "bad_mode_status": 400}}
+{"scenario": "S2 退出只读后任务可提交并成功", "pass": true, "detail": {"submit": 202, "state": "succeeded"}}
+{"scenario": "S3 停对端后自动 standalone，本地队列仍完成任务并审计", "pass": true, "detail": {"mode": "standalone", "peer_silence": 2, "task_state": "succeeded", "mode_events": ["standalone"]}}
+{"scenario": "S4 对端恢复后回到 normal，审计出现 mode.change → normal", "pass": true, "detail": {"mode": "normal", "peers_online": 1, "mode_events": ["standalone", "normal"]}}
+{"scenario": "S5 两进程存活、日志无 panic", "pass": true, "detail": {"alive": 2, "panics": []}}
