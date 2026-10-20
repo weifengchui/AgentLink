@@ -116,6 +116,21 @@ enum Command {
     },
     /// Print this node's cluster token (for pairing other machines).
     Token,
+    /// 查看 / 修复本机身份（node_id）。
+    ///
+    /// 如果重启后 node_id 意外变了，用 `--set <旧ID>` 改回，或 `--recover`
+    /// 从 backups/、upgrade-ledger、历史记录里自动找回。改完需重启节点。
+    Identity {
+        /// 只查看当前身份、身份锚点与 data_dir（默认行为）。
+        #[arg(long)]
+        show: bool,
+        /// 把本机身份改回指定 node_id（同时修配置与身份锚点）。
+        #[arg(long, value_name = "NODE_ID", conflicts_with = "recover")]
+        set: Option<String>,
+        /// 从本地备份/升级台账/历史里自动找回上一个身份并恢复。
+        #[arg(long, conflicts_with = "set")]
+        recover: bool,
+    },
     /// Run the node (default command).
     Run {
         /// Create `agentlink.json` with defaults if it does not exist yet.
@@ -246,9 +261,13 @@ fn open_web_browser(url: &str) {
 fn load_config(path: &Path, create_if_missing: bool) -> Result<Config> {
     if !path.exists() {
         if create_if_missing {
-            let cfg = Config::generate(None, None, None);
+            // 即便是“新建配置”，也先看机器身份锚点：同一台机器绝不能因为
+            // 配置文件丢了就换一个 node_id。
+            let cfg = generate_preserving_identity(path, None, None, None);
             cfg.save(path)
                 .with_context(|| format!("failed to write config to {}", path.display()))?;
+            cfg.ensure_identity_anchor()
+                .context("failed to write machine identity anchor")?;
             println!("created new config: {}", path.display());
             return Ok(cfg);
         }
@@ -278,6 +297,10 @@ fn ensure_dirs(cfg: &Config) -> Result<()> {
 /// pointing at a different folder, whole nodes "became different machines"
 /// (incident 2026-10-13, node .7). Identity is what the mesh addresses by;
 /// regenerating it is almost never what the user means by re-init.
+///
+/// 第二道保险（2026-10-20）：即使配置文件本身不在了（换发行目录、被删、
+/// 半截写入），只要 `data_dir/node-identity.json` 还在，就沿用其中的
+/// node_id。这样“重启”永远不会把本机变成网格里的陌生节点。
 fn generate_preserving_identity(
     path: &std::path::Path,
     name: Option<String>,
@@ -296,7 +319,264 @@ fn generate_preserving_identity(
             cfg.security.cluster_token = old.security.cluster_token;
         }
     }
+    // 身份锚点优先于 random new id（覆盖旧配置读不到的情况）。
+    if let Some(pinned) = cfg.pinned_node_id() {
+        cfg.node_id = pinned;
+    }
     cfg
+}
+
+/// 启动时对账机器身份：身份锚点存在就以锚点为准，配置里漂移的 node_id
+/// 会被就地修回并重新落盘；锚点不存在则用当前配置补写。
+///
+/// 这是“重启不变身份”的最后一道保险：无论配置来自旧目录、新目录还是
+/// `init --force` 重建，节点对外呈现的 node_id 始终是这台机器首次生成的
+/// 那一个。修复动作会打印到 stderr（此时日志系统可能尚未初始化）。
+fn reconcile_identity(cfg: &mut Config, config_file: &Path) -> Result<()> {
+    match cfg.pinned_node_id() {
+        Some(pinned) if pinned != cfg.node_id => {
+            eprintln!(
+                "[identity] node_id drift detected: config={} pinned={} — restoring pinned identity",
+                cfg.node_id, pinned
+            );
+            cfg.node_id = pinned;
+            cfg.save(config_file)
+                .with_context(|| format!("failed to repair config {}", config_file.display()))?;
+        }
+        Some(_) => {}
+        None => cfg
+            .pin_identity()
+            .context("failed to write machine identity anchor")?,
+    }
+    Ok(())
+}
+
+/// `agentlink identity`：查看或显式修复本机身份。
+///
+/// 这是给“已经发生了漂移”的补救入口：`--set` 直接指定旧 node_id，
+/// `--recover` 从本地备份/升级台账/出站历史里自动找。两者都会同时改写
+/// 配置文件和身份锚点（锚点必须一起改，否则下次启动又被搬回去），
+/// 运行中的进程需要重启才会用新身份对外通信。
+fn identity_cmd(config_path: &Path, show: bool, set: Option<String>, recover: bool) -> Result<()> {
+    let _ = show; // 无参数/--show 都走查看分支
+    let mut cfg = load_config(config_path, false)?;
+
+    if let Some(raw) = set {
+        let id = normalize_node_id(&raw)?;
+        return restore_identity(&mut cfg, config_path, &id, "命令行 --set");
+    }
+
+    if recover {
+        let candidates = identity_candidates(config_path, &cfg);
+        if candidates.is_empty() {
+            println!(
+                "没有找到与当前身份（{}）不同的旧身份线索（当前可能已经正确）。",
+                cfg.node_id
+            );
+            println!(
+                "如确需指定: agentlink --config {} identity --set <旧 node_id>",
+                config_path.display()
+            );
+            return Ok(());
+        }
+        if candidates.len() > 1 {
+            println!(
+                "找到 {} 个候选身份（按可靠度/新旧排序）：",
+                candidates.len()
+            );
+            for (i, (id, source)) in candidates.iter().enumerate() {
+                println!(
+                    "  {}. {id}  ({source}){}",
+                    i + 1,
+                    if i == 0 { "  ← 采用" } else { "" }
+                );
+            }
+            println!();
+        }
+        let (id, source) = candidates[0].clone();
+        return restore_identity(&mut cfg, config_path, &id, &source);
+    }
+
+    println!("config:   {}", config_path.display());
+    println!("node_id:  {}", cfg.node_id);
+    println!("anchor:   {}", cfg.identity_path().display());
+    println!("data_dir: {}", cfg.data_dir.display());
+    match cfg.pinned_node_id() {
+        Some(pinned) if pinned != cfg.node_id => {
+            println!("status:   DRIFT（锚点={pinned}，下次启动会自动修回）");
+        }
+        Some(_) => println!("status:   pinned"),
+        None => println!("status:   unpinned（下次启动会写入锚点）"),
+    }
+    println!(
+        "\n修复到旧身份: agentlink --config {} identity --set <旧 node_id>",
+        config_path.display()
+    );
+    println!(
+        "自动找回旧身份: agentlink --config {} identity --recover",
+        config_path.display()
+    );
+    Ok(())
+}
+
+/// 校验命令行传入的 node_id。标准形态是 12 位十六进制；历史配置里若有
+/// 非标准但合法的 id，也允许原样写回（仅提示，不阻塞补救）。
+fn normalize_node_id(raw: &str) -> Result<String> {
+    let id = raw.trim();
+    if id.is_empty() {
+        bail!("node_id 不能为空");
+    }
+    if id.chars().any(char::is_whitespace) {
+        bail!("node_id 不能包含空白字符");
+    }
+    if !(id.len() == 12 && id.chars().all(|c| c.is_ascii_hexdigit())) {
+        eprintln!("warning: {id:?} 不是标准 12 位十六进制 node_id，将按原样写入");
+    }
+    Ok(id.to_string())
+}
+
+/// 同时修复配置与身份锚点。锚点覆盖是**有意为之**：这正是补救入口，
+/// 必须把错误锚点一起改掉，否则下一次启动会被旧锚点搬回去。
+fn restore_identity(cfg: &mut Config, config_path: &Path, id: &str, source: &str) -> Result<()> {
+    let old = cfg.node_id.clone();
+    if old == id {
+        cfg.pin_identity()
+            .context("failed to refresh machine identity anchor")?;
+        println!("身份已经是 {id}（来源: {source}），已刷新身份锚点");
+    } else {
+        cfg.node_id = id.to_string();
+        cfg.save(config_path)?;
+        cfg.pin_identity()
+            .context("failed to write machine identity anchor")?;
+        println!("身份已恢复: {old} -> {id}");
+        println!("  来源: {source}");
+        println!("  配置: {}", config_path.display());
+        println!("  锚点: {}", cfg.identity_path().display());
+    }
+    println!("\n重启节点后生效（运行中的进程仍持有旧身份）。");
+    Ok(())
+}
+
+/// 收集旧身份候选：身份锚点 → 最新备份 → 升级台账 → 出站历史 → agents.json。
+/// 返回 (node_id, 来源说明)，已去重并排除当前 node_id。
+fn identity_candidates(config_path: &Path, cfg: &Config) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let current = cfg.node_id.trim().to_string();
+    let mut push = |raw: &str, source: String| {
+        let id = raw.trim();
+        if id.is_empty() || id == current {
+            return;
+        }
+        if out.iter().any(|(known, _)| known == id) {
+            return;
+        }
+        out.push((id.to_string(), source));
+    };
+
+    // 1) 身份锚点（若它与当前配置不一致，通常就是真身份）
+    if let Some(pinned) = cfg.pinned_node_id() {
+        push(
+            &pinned,
+            format!("身份锚点 {}", cfg.identity_path().display()),
+        );
+    }
+
+    let base = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // 2) backups/<version>/agentlink.json，按修改时间从新到旧
+    let mut backups: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(base.join("backups")) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            backups.push((path, mtime));
+        }
+    }
+    backups.sort_by(|a, b| b.1.cmp(&a.1));
+    for (dir, _) in backups {
+        let backup_cfg = dir.join("agentlink.json");
+        if let Some(id) = json_node_id(&backup_cfg) {
+            push(&id, format!("备份 {}", backup_cfg.display()));
+        }
+    }
+
+    // 3) 升级台账（节点目录 + data_dir），取每个文件里最近一条
+    for ledger in [
+        base.join("upgrade-ledger.jsonl"),
+        cfg.data_dir.join("upgrade-ledger.jsonl"),
+    ] {
+        let Ok(raw) = std::fs::read_to_string(&ledger) else {
+            continue;
+        };
+        for line in raw.lines().rev() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if let Some(id) = v.get("node").and_then(|x| x.as_str()) {
+                push(id, format!("升级台账 {}", ledger.display()));
+                break;
+            }
+        }
+    }
+
+    // 4) 历史里最近一条“出站且 node == from”的记录就是本机旧身份
+    let history = cfg.data_dir.join("history.jsonl");
+    if let Ok(raw) = std::fs::read_to_string(&history) {
+        for line in raw.lines().rev().take(2000) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let direction = v.get("direction").and_then(|x| x.as_str()).unwrap_or("");
+            let node = v.get("node").and_then(|x| x.as_str()).unwrap_or("");
+            let from = v.get("from").and_then(|x| x.as_str()).unwrap_or("");
+            if direction == "out" && !node.is_empty() && node == from {
+                push(node, format!("出站历史 {}", history.display()));
+                break;
+            }
+        }
+    }
+
+    // 5) 本机 agent 注册快照（最后手段）
+    let agents = cfg.data_dir.join("agents.json");
+    if let Some(id) = latest_agent_node_id(&agents) {
+        push(&id, format!("agent 注册表 {}", agents.display()));
+    }
+
+    out
+}
+
+fn json_node_id(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let id = v.get("node_id")?.as_str()?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+fn latest_agent_node_id(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let agents: Vec<serde_json::Value> = serde_json::from_str(&raw).ok()?;
+    agents
+        .into_iter()
+        .filter_map(|a| {
+            let id = a.get("node_id")?.as_str()?.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let seen = a.get("last_seen").and_then(|x| x.as_i64()).unwrap_or(0);
+            Some((seen, id))
+        })
+        .max_by_key(|(seen, _)| *seen)
+        .map(|(_, id)| id)
 }
 
 #[tokio::main]
@@ -319,6 +599,8 @@ async fn main() -> Result<()> {
             let mode = open.then(|| "open".to_string());
             let cfg = generate_preserving_identity(&cli.config, name, cluster_token, mode);
             cfg.save(&cli.config)?;
+            cfg.ensure_identity_anchor()
+                .context("failed to write machine identity anchor")?;
             println!("created config: {}", cli.config.display());
             println!("  node_id: {}", cfg.node_id);
             println!("  name:    {}", cfg.name);
@@ -352,6 +634,8 @@ async fn main() -> Result<()> {
             let mode = open.then(|| "open".to_string());
             let mut cfg = generate_preserving_identity(&cli.config, name, Some(token), mode);
             cfg.save(&cli.config)?;
+            cfg.ensure_identity_anchor()
+                .context("failed to write machine identity anchor")?;
             if let Some(boot) = admission {
                 if boot.trim().is_empty() {
                     bail!("--admission 准入令牌不能为空");
@@ -375,6 +659,10 @@ async fn main() -> Result<()> {
             let cfg = load_config(&cli.config, false)?;
             println!("{}", cfg.security.cluster_token);
             Ok(())
+        }
+
+        Some(Command::Identity { show, set, recover }) => {
+            identity_cmd(&cli.config, show, set, recover)
         }
 
         Some(Command::Peers) => {
@@ -508,6 +796,8 @@ async fn setup_flow(config_path: &Path, log_format: Option<String>, yes: bool) -
         cfg.listen_port = port;
     }
     cfg.save(config_path)?;
+    cfg.ensure_identity_anchor()
+        .context("failed to write machine identity anchor")?;
     println!("已写入配置: {}", config_path.display());
     println!("  node_id: {}", cfg.node_id);
     println!("  name:    {}", cfg.name);
@@ -787,7 +1077,9 @@ fn print_admission_status(cfg: &Config) {
     }
 }
 
-async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
+async fn run(mut cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
+    // 机器身份铁律：以 data_dir 的身份锚点为准，配置漂移就地修回。
+    reconcile_identity(&mut cfg, &config_file)?;
     let bind = format!("{}:{}", cfg.local_api.host, cfg.listen_port);
 
     // v0.6 P1 mTLS：开启时装配运行态。权威节点（create_ca=true）就地建/载 CA；
@@ -1189,4 +1481,108 @@ fn autostart(config_path: &std::path::Path, remove: bool, force: bool) -> Result
         vbs.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn temp_case(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agentlink-identity-{tag}-{}",
+            config::new_short_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn drift_in_config_is_repaired_from_anchor() {
+        let dir = temp_case("drift");
+        let cfg_path = dir.join("agentlink.json");
+        let mut cfg = Config::generate(Some("t".into()), Some("tok".into()), Some("open".into()));
+        cfg.node_id = "aaaaaaaaaaaa".into();
+        cfg.data_dir = dir.join("data");
+        cfg.save(&cfg_path).unwrap();
+        cfg.pin_identity().unwrap();
+
+        // 模拟「配置被重建/覆盖」：node_id 变成新的随机值。
+        cfg.node_id = "bbbbbbbbbbbb".into();
+        cfg.save(&cfg_path).unwrap();
+
+        reconcile_identity(&mut cfg, &cfg_path).unwrap();
+        assert_eq!(cfg.node_id, "aaaaaaaaaaaa");
+        let on_disk = Config::load(&cfg_path).unwrap();
+        assert_eq!(
+            on_disk.node_id, "aaaaaaaaaaaa",
+            "修复必须落盘，重启后仍是同一身份"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn first_run_pins_the_identity() {
+        let dir = temp_case("pin");
+        let cfg_path = dir.join("agentlink.json");
+        let mut cfg = Config::generate(Some("t".into()), Some("tok".into()), Some("open".into()));
+        cfg.node_id = "cccccccccccc".into();
+        cfg.data_dir = dir.join("data");
+        cfg.save(&cfg_path).unwrap();
+
+        reconcile_identity(&mut cfg, &cfg_path).unwrap();
+        assert_eq!(cfg.pinned_node_id().as_deref(), Some("cccccccccccc"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_node_id_recovers_from_anchor() {
+        let dir = temp_case("recover");
+        let cfg_path = dir.join("agentlink.json");
+        let cfg = {
+            let mut c = Config::generate(Some("t".into()), Some("tok".into()), Some("open".into()));
+            c.node_id = "dddddddddddd".into();
+            c.data_dir = dir.join("data");
+            c
+        };
+        // 先落一份正常配置并写锚点，再把配置里的身份抹掉（模拟半截写入）。
+        let mut broken = cfg.clone();
+        broken.save(&cfg_path).unwrap();
+        broken.pin_identity().unwrap();
+        broken.node_id = String::new();
+        broken.save(&cfg_path).unwrap();
+
+        let loaded = Config::load(&cfg_path).unwrap();
+        assert_eq!(loaded.node_id, "dddddddddddd", "空 node_id 必须从锚点恢复");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recover_candidates_pick_previous_identity_from_backup() {
+        let dir = temp_case("candidates");
+        let backup = dir.join("backups").join("v0.5.9");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(
+            backup.join("agentlink.json"),
+            r#"{"v":1,"node_id":"eeeeeeeeeeee","name":"old"}"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::generate(Some("t".into()), Some("tok".into()), Some("open".into()));
+        cfg.node_id = "ffffffffffff".into(); // 漂移后的当前身份
+        cfg.data_dir = dir.join("data");
+        let candidates = identity_candidates(&dir.join("agentlink.json"), &cfg);
+        assert_eq!(candidates[0].0, "eeeeeeeeeeee");
+        assert!(candidates[0].1.contains("备份"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explicit_identity_must_be_a_clean_token() {
+        assert_eq!(
+            normalize_node_id("  ABCDEFabcdef ").unwrap(),
+            "ABCDEFabcdef"
+        );
+        assert!(normalize_node_id("   ").is_err());
+        assert!(normalize_node_id("aa bb").is_err());
+    }
 }

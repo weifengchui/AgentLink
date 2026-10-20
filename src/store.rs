@@ -265,12 +265,18 @@ impl Journal {
 }
 
 /// Write `value` as pretty JSON atomically (temp file + rename + fsync).
+///
+/// Temp 名带进程号+序号：配置/快照可能被并发保存（如改名与 /v1/config
+/// 同时落盘），固定 `.tmp` 会让两个写者互相截断。
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    use std::sync::atomic::AtomicU64;
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "state.json".to_string());
-    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("{file_name}.tmp.{}.{seq}", std::process::id()));
     let raw = serde_json::to_string_pretty(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let mut f = File::create(&tmp)?;

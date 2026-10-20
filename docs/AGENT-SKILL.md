@@ -155,6 +155,11 @@ ws://127.0.0.1:8765/v1/ws?token=<local_api.token>&client=<你的agent_id>
 - **`init/join --force` 不再抹身份**：覆盖配置时自动保留旧 `node_id`/`local_api.token`/`data_dir`，
   彻底堵住「重启后节点变成陌生机器」事故（.7 号机 node_id 漂移根因）。身份是网格的寻址锚点，
   重新配对（join 新 cluster_token）照旧生效，唯独身份不动。
+- **（2026-10-20 补强）身份锚点**：node_id 另存 `<data_dir>/node-identity.json`。
+  配置被删/重建/换发行目录/半截写入时，启动会以锚点为准把 node_id 修回来，
+  `init --force` 也会沿用锚点。**同一台机器重启后 node_id 永远不变。**
+  已经漂移的补救：`agentlink --config agentlink.json identity --set <旧ID>`，
+  或 `identity --recover` 从 backups/升级台账/出站历史自动找回（改完需重启）。
 - **fleet agents 在线判定联动节点**：节点掉线后其 agent 不再显示 online=true（幽灵在线）。
 - **web 节点列表**：本机行有「本机」标记；离线节点有「遗忘」按钮——移除并忽略自动发现，
   持久化在 `data_dir/forgotten_peers.json`，该节点下次真实握手会自动回来。

@@ -4,9 +4,16 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::store;
+
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_LISTEN_PORT: u16 = 8765;
 pub const DEFAULT_BROADCAST_PORT: u16 = 8766;
+
+/// 机器身份锚点文件名（位于 `data_dir`）。node_id 一旦生成就写入这里，
+/// 之后无论配置文件被重建、换发行目录还是被 `init --force` 覆盖，都以
+/// 锚点为准——重启绝不能把同一台机器变成网格里的“新节点”。
+pub const IDENTITY_FILE_NAME: &str = "node-identity.json";
 
 /// Top-level node configuration. Mirrors `docs/设计方案.md` §12.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +21,9 @@ pub struct Config {
     #[serde(default = "default_version")]
     pub v: u32,
     /// Stable unique identifier used for addressing. Never changes once created.
+    /// `default` 让旧/损坏配置缺字段时还能从 `data_dir` 的身份锚点恢复，
+    /// 而不是直接解析失败后被迫生成新身份。
+    #[serde(default)]
     pub node_id: String,
     /// Human friendly display name. Not used for addressing.
     pub name: String,
@@ -1048,6 +1058,14 @@ impl Default for EngineConfig {
 
 // ---- impl -------------------------------------------------------------------
 
+/// 持久化在 `data_dir/node-identity.json` 的机器身份锚点。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineIdentity {
+    #[serde(default = "default_version")]
+    pub v: u32,
+    pub node_id: String,
+}
+
 impl Config {
     /// Build a brand new configuration with a fresh identity and tokens.
     pub fn generate(
@@ -1122,8 +1140,53 @@ impl Config {
         let raw = std::fs::read_to_string(path)?;
         let mut cfg: Config = serde_json::from_str(&raw)?;
         cfg.normalize(path);
+        // 配置里的 node_id 丢了（旧版本/手工编辑/半截写入）时，先尝试从
+        // data_dir 的身份锚点恢复；恢复不了才让 validate 报错，绝不悄悄
+        // 换成随机新身份。
+        if cfg.node_id.trim().is_empty() {
+            if let Some(pinned) = cfg.pinned_node_id() {
+                cfg.node_id = pinned;
+            }
+        }
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// 机器身份锚点路径：`<data_dir>/node-identity.json`。
+    pub fn identity_path(&self) -> PathBuf {
+        self.data_dir.join(IDENTITY_FILE_NAME)
+    }
+
+    /// 读取身份锚点里的 node_id；文件不存在或内容损坏时返回 None。
+    pub fn pinned_node_id(&self) -> Option<String> {
+        let raw = std::fs::read_to_string(self.identity_path()).ok()?;
+        let doc: MachineIdentity = serde_json::from_str(&raw).ok()?;
+        let id = doc.node_id.trim().to_string();
+        (!id.is_empty()).then_some(id)
+    }
+
+    /// 把当前 node_id 写入身份锚点（原子替换）。
+    pub fn pin_identity(&self) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.data_dir)?;
+        let doc = MachineIdentity {
+            v: CURRENT_CONFIG_VERSION,
+            node_id: self.node_id.clone(),
+        };
+        store::write_json_atomic(&self.identity_path(), &doc).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to write identity anchor {}: {e}",
+                self.identity_path().display()
+            )
+        })?;
+        Ok(())
+    }
+
+    /// 锚点不存在时补写；已存在则保持原值（绝不覆盖既有身份）。
+    pub fn ensure_identity_anchor(&self) -> anyhow::Result<()> {
+        if self.pinned_node_id().is_none() {
+            self.pin_identity()?;
+        }
+        Ok(())
     }
 
     /// Resolve data paths so they never depend on the current working
@@ -1160,15 +1223,16 @@ impl Config {
             .unwrap_or_else(|| self.listen_port.saturating_add(1))
     }
 
-    /// Persist configuration as pretty JSON.
+    /// Persist configuration as pretty JSON (atomic: temp file + rename), so a
+    /// crash/kill during save can never leave a half-written config behind.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let raw = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, format!("{raw}\n"))?;
+        store::write_json_atomic(path, self)
+            .map_err(|e| anyhow::anyhow!("failed to write config {}: {e}", path.display()))?;
         Ok(())
     }
 

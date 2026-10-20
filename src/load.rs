@@ -5,6 +5,7 @@
 //! 仅在 `lease.enabled=true` 时被调用）。任何失败返回 `None`，
 //! 上报层自动退化为「无负载字段的裸 lease 心跳」，链路活性不受影响。
 
+#[cfg(any(target_os = "linux", test))]
 use std::time::Duration;
 
 /// 采样本机 CPU 利用率（0..=100 的整数四舍五入）。失败/平台不支持 → `None`。
@@ -30,6 +31,7 @@ pub fn cpu_percent() -> Option<u32> {
 // ---- Linux：/proc/stat 两读取差分 ------------------------------------------
 
 /// 读一次 `/proc/stat` 首行 `cpu ...`，返回 `(total, idle)`（jiffies）。
+#[cfg(any(target_os = "linux", test))]
 fn proc_stat_sample() -> Option<(u64, u64)> {
     let text = std::fs::read_to_string("/proc/stat").ok()?;
     parse_proc_stat_line(text.lines().next()?)
@@ -37,6 +39,7 @@ fn proc_stat_sample() -> Option<(u64, u64)> {
 
 /// 解析 `/proc/stat` 首行：`cpu user nice system idle iowait irq softirq steal …`。
 /// 返回 `(total, idle)`，其中 idle = idle + iowait（Linux 惯例）。
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_stat_line(line: &str) -> Option<(u64, u64)> {
     let rest = line.strip_prefix("cpu ")?;
     let vals: Vec<u64> = rest
@@ -52,6 +55,7 @@ fn parse_proc_stat_line(line: &str) -> Option<(u64, u64)> {
 }
 
 /// 两次读取差分得出利用率。`wait` 是两次读取的间隔（约 200ms）。
+#[cfg(target_os = "linux")]
 fn proc_snapshot_percent(wait: Duration) -> Option<u32> {
     let (t0, i0) = proc_stat_sample()?;
     std::thread::sleep(wait);
@@ -60,6 +64,7 @@ fn proc_snapshot_percent(wait: Duration) -> Option<u32> {
 }
 
 /// 差分计算（纯函数，供单测）：`(1 - Δidle/Δtotal) × 100`，四舍五入。
+#[cfg(any(target_os = "linux", test))]
 fn percent_from_delta(t0: u64, i0: u64, t1: u64, i1: u64) -> u32 {
     let d_total = t1.saturating_sub(t0) as f64;
     let d_idle = i1.saturating_sub(i0) as f64;
@@ -75,7 +80,7 @@ fn percent_from_delta(t0: u64, i0: u64, t1: u64, i1: u64) -> u32 {
 #[cfg(target_os = "windows")]
 fn windows_probe_percent() -> Option<u32> {
     // wmic 已被逐步弃置但仍广泛可用；失败再退 PowerShell（慢但稳）。
-    if let Ok(pct) = probe_shell(&["wmic", "cpu", "get", "loadpercentage"], filter_int) {
+    if let Some(pct) = probe_shell(&["wmic", "cpu", "get", "loadpercentage"], filter_int) {
         return Some(pct);
     }
     probe_shell(
