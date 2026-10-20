@@ -24,6 +24,7 @@ mod mdns;
 mod mtls;
 mod peer;
 mod proto;
+mod quota;
 mod reconcile;
 mod redact;
 mod router;

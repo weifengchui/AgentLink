@@ -207,6 +207,8 @@ pub struct Engine {
     slo_next: std::sync::Mutex<std::time::Instant>,
     /// v0.7 §6.3 上次对外报告的降级模式（变化时审计 + webhook）。
     mode_last: std::sync::Mutex<crate::router::MeshMode>,
+    /// v0.7 §5.4 per-namespace 配额快照（enabled=false 时派发零限制）。
+    quota_cfg: crate::quota::QuotaConfig,
 }
 
 impl Engine {
@@ -252,6 +254,7 @@ impl Engine {
             slo_cfg,
             slo_next: std::sync::Mutex::new(std::time::Instant::now()),
             mode_last,
+            quota_cfg: state.config.mesh.quota.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = engine.run(shutdown_rx).await {
@@ -787,6 +790,8 @@ impl Engine {
         // Pending 任务也占额度——否则 executor 慢确认时会被重复派发、
         // 压过 max_concurrent_per_node）。
         let mut loads: HashMap<String, usize> = HashMap::new();
+        // v0.7 §5.4：per-namespace in-flight 账（running + 已分配未确认）。
+        let mut ns_inflight: HashMap<String, usize> = HashMap::new();
         {
             let table = self.mesh.table.lock().unwrap();
             for rec in table.values() {
@@ -795,6 +800,8 @@ impl Engine {
                 if !in_flight {
                     continue;
                 }
+                let ns = crate::router::task_namespace(rec.spec.as_ref()).to_string();
+                *ns_inflight.entry(ns).or_insert(0) += 1;
                 if let Some(ref agent_id) = rec.to_agent {
                     if let Some(node_id) = self.router.find_agent_node(agent_id) {
                         *loads.entry(node_id).or_insert(0) += 1;
@@ -845,9 +852,15 @@ impl Engine {
         // 已调度的 in-flight 数（running 任务总数）
         let inflight: usize = loads.values().sum();
 
-        let assigned = self
-            .scheduler
-            .schedule_batch(&pending, &agents, &node_tags, &mut loads, inflight);
+        let assigned = self.scheduler.schedule_batch_with_quota(
+            &pending,
+            &agents,
+            &node_tags,
+            &mut loads,
+            inflight,
+            &self.quota_cfg,
+            &ns_inflight,
+        );
 
         // 批次护栏（M3 P3-3）+ 派发
         for (task_id, node_id, to_agent) in &assigned {
@@ -1336,6 +1349,7 @@ mod tests {
                 enabled: true,
                 license_file: None,
                 degraded: Default::default(),
+                quota: Default::default(),
                 engine: EngineConfig {
                     max_retries: 2,
                     backoff_secs: 30,
@@ -1381,6 +1395,7 @@ mod tests {
             scheduled_nodes: std::sync::Mutex::new(std::collections::HashSet::new()),
             circuit: std::sync::Mutex::new(crate::circuit::Circuit::new()),
             slo: std::sync::Mutex::new(crate::slo::SloState::new(None, false)),
+            quota_rate: std::sync::Mutex::new(crate::quota::RateLimiter::default()),
         });
         state_inner.mesh = Some(mesh.clone());
         let state = Arc::new(state_inner);
@@ -1405,6 +1420,7 @@ mod tests {
             slo_cfg: cfg.mesh.engine.slo.clone(),
             slo_next: std::sync::Mutex::new(std::time::Instant::now()),
             mode_last: std::sync::Mutex::new(crate::router::MeshMode::Normal),
+            quota_cfg: cfg.mesh.quota.clone(),
         };
         (state, mesh, engine)
     }

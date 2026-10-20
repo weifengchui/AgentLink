@@ -183,6 +183,8 @@ pub struct MeshRuntime {
     pub circuit: Mutex<crate::circuit::Circuit>,
     /// v0.7 §7.2 SLO 观测：窗口样本 + 历史基线 + 告警历史。缺省关闭态零采集。
     pub slo: Mutex<crate::slo::SloState>,
+    /// v0.7 §5.4 per-namespace 提交限流窗口（进程内，重启清零）。
+    pub quota_rate: Mutex<crate::quota::RateLimiter>,
 }
 
 impl MeshRuntime {
@@ -294,6 +296,7 @@ pub fn build_mesh(cfg: &Config, config_file: &Path) -> Option<Arc<MeshRuntime>> 
             },
             cfg.mesh.engine.slo.enabled,
         )),
+        quota_rate: Mutex::new(crate::quota::RateLimiter::default()),
     }))
 }
 
@@ -365,6 +368,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/open-folder", post(open_folder))
         .route("/v1/config", get(config_get).put(config_put))
         .route("/v1/mesh/status", get(mesh_status_get))
+        .route("/v1/mesh/quota", get(mesh_quota_get))
         .route("/v1/mesh/slo", get(mesh_slo_get))
         .route("/v1/mesh/mode", get(mesh_mode_get).post(mesh_mode_post))
         .route("/v1/audit/verify", get(audit_verify_get))
@@ -420,6 +424,75 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
 
 /// M3 P3-4：AgentMesh 运维面——显示 license 配额/用量、引擎状态。
 /// Requires a valid local API token.
+/// `GET /v1/mesh/quota`（Admin）：per-namespace 配额配置与实时用量。
+/// 观察面只含计数，不含任务 payload。
+async fn mesh_quota_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized();
+    };
+    if !role.allows("/v1/mesh/quota") {
+        return forbidden();
+    }
+    let Some(mesh) = state.mesh.as_ref() else {
+        return mesh_required();
+    };
+    let cfg = &state.config.mesh.quota;
+    let usage: std::collections::HashMap<String, (usize, usize)> = {
+        let table = mesh.table.lock().unwrap();
+        let mut usage: std::collections::HashMap<String, (usize, usize)> =
+            std::collections::HashMap::new();
+        for rec in table.values() {
+            let ns = crate::router::task_namespace(rec.spec.as_ref()).to_string();
+            let e = usage.entry(ns).or_insert((0, 0));
+            if matches!(
+                rec.state,
+                crate::taskengine::TaskState::Pending
+                    | crate::taskengine::TaskState::Running
+                    | crate::taskengine::TaskState::Cancelling
+            ) {
+                e.0 += 1;
+            }
+            if rec.state == crate::taskengine::TaskState::Running
+                || (rec.state == crate::taskengine::TaskState::Pending && rec.to_agent.is_some())
+            {
+                e.1 += 1;
+            }
+        }
+        usage
+    };
+    let now = std::time::Instant::now();
+    let mut rl = mesh.quota_rate.lock().unwrap();
+    let rows: Vec<serde_json::Value> = cfg
+        .known_namespaces(usage.keys().cloned())
+        .into_iter()
+        .map(|ns| {
+            let (open, inflight) = usage.get(&ns).copied().unwrap_or((0, 0));
+            json!({
+                "namespace": ns,
+                "max_open": cfg.max_open(&ns),
+                "max_inflight": cfg.max_inflight(&ns),
+                "max_submit_per_minute": cfg.max_submit_per_minute(&ns),
+                "open": open,
+                "inflight": inflight,
+                "submit_last_minute": rl.recent(&ns, now),
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "enabled": cfg.enabled,
+            "defaults": {
+                "max_open": cfg.default_max_open,
+                "max_inflight": cfg.default_max_inflight,
+                "max_submit_per_minute": cfg.default_max_submit_per_minute,
+            },
+            "namespaces": rows,
+        })),
+    )
+}
+
 async fn mesh_status_get(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -2022,6 +2095,123 @@ async fn tasks_post(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    // v0.7 §5.4：per-namespace 准入（提交速率 + 活跃任务上限）。
+    // 缺省 enabled=false / 全 0：不改变任何提交行为。
+    let required_ok = body.as_object().is_some_and(|o| {
+        ["task_id", "type"].iter().all(|k| {
+            o.get(*k)
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| !v.trim().is_empty())
+        })
+    });
+    if required_ok && state.config.mesh.quota.enabled {
+        let quota = &state.config.mesh.quota;
+        let namespace = crate::router::task_namespace(Some(&body)).to_string();
+        let now = std::time::Instant::now();
+        let rate_limit = quota.max_submit_per_minute(&namespace);
+        let mut rl = mesh.quota_rate.lock().unwrap();
+        let rate_ok = rl.allow(&namespace, rate_limit, now);
+        let recent = rl.recent(&namespace, now);
+        drop(rl);
+        if !rate_ok {
+            state.router.audit_event(
+                "quota.reject",
+                role.as_str(),
+                json!({
+                    "namespace": namespace,
+                    "reason": "rate_limited",
+                    "limit": rate_limit,
+                    "recent": recent,
+                    "task_id": task_id,
+                }),
+            );
+            state.router.notify(
+                "quota_alert",
+                json!({
+                    "namespace": namespace,
+                    "reason": "rate_limited",
+                    "limit": rate_limit,
+                    "recent": recent,
+                }),
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "ok": false,
+                    "error": "namespace quota exceeded",
+                    "reason": "rate_limited",
+                    "namespace": namespace,
+                    "limit": rate_limit,
+                    "current": recent,
+                    "retry_after_seconds": 60,
+                })),
+            );
+        }
+        let max_open = quota.max_open(&namespace);
+        if max_open > 0 {
+            let (open, inflight) = {
+                let table = mesh.table.lock().unwrap();
+                let mut open = 0usize;
+                let mut inflight = 0usize;
+                for rec in table.values() {
+                    if crate::router::task_namespace(rec.spec.as_ref()) != namespace {
+                        continue;
+                    }
+                    if matches!(
+                        rec.state,
+                        crate::taskengine::TaskState::Pending
+                            | crate::taskengine::TaskState::Running
+                            | crate::taskengine::TaskState::Cancelling
+                    ) {
+                        open += 1;
+                    }
+                    if rec.state == crate::taskengine::TaskState::Running
+                        || (rec.state == crate::taskengine::TaskState::Pending
+                            && rec.to_agent.is_some())
+                    {
+                        inflight += 1;
+                    }
+                }
+                (open, inflight)
+            };
+            if open >= max_open {
+                state.router.audit_event(
+                    "quota.reject",
+                    role.as_str(),
+                    json!({
+                        "namespace": namespace,
+                        "reason": "open_quota",
+                        "limit": max_open,
+                        "current": open,
+                        "inflight": inflight,
+                        "task_id": task_id,
+                    }),
+                );
+                state.router.notify(
+                    "quota_alert",
+                    json!({
+                        "namespace": namespace,
+                        "reason": "open_quota",
+                        "limit": max_open,
+                        "current": open,
+                        "inflight": inflight,
+                    }),
+                );
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "ok": false,
+                        "error": "namespace quota exceeded",
+                        "reason": "open_quota",
+                        "namespace": namespace,
+                        "limit": max_open,
+                        "current": open,
+                        "inflight": inflight,
+                    })),
+                );
+            }
+        }
+    }
     match reconcile::apply_task_spec(&mesh, &body) {
         Ok(state_str) => {
             // v0.7 §4.4：声明式提交进不可变审计链（不含 payload 原文）。

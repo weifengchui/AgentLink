@@ -158,6 +158,9 @@ pub struct MeshConfig {
     /// 降级模式（v0.7 §6.3）。缺省全关：只读关闭、standalone 不自动判定。
     #[serde(default)]
     pub degraded: DegradedConfig,
+    /// per-namespace 配额（v0.7 §5.4）。缺省关闭且全 0：准入/派发零变化。
+    #[serde(default)]
+    pub quota: crate::quota::QuotaConfig,
 }
 
 /// 降级模式配置（§6.3）。
@@ -508,6 +511,7 @@ impl Role {
                 endpoint,
                 "/v1/config"
                     | "/v1/mesh/status"
+                    | "/v1/mesh/quota"
                     | "/v1/metrics"
                     | "/v1/lockdown"
                     | "/v1/admission"
@@ -1183,6 +1187,7 @@ impl Config {
         }
         crate::abac::validate(&self.security.abac)?;
         crate::guardrails::validate(&self.security.guardrails)?;
+        crate::quota::validate(&self.mesh.quota)?;
         // v0.7 §4.2 多租户：绑定 token 不能是 Admin（Admin 是集群级角色），
         // 也不能是 local_api.token（WS/全局管理入口必须保持全局）。
         for (token, ns) in &self.auth.token_namespaces {

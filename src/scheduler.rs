@@ -159,6 +159,7 @@ impl Scheduler {
     ///
     /// 返回 (task_id, node_id, to_agent) 列表，按优先级顺序。
     /// `loads` 会被原地更新（被选中的节点负载 +1）。
+    #[allow(dead_code)] // 兼容入口（测试与旧调用方）；引擎走带配额版本。
     pub fn schedule_batch(
         &self,
         tasks: &[(String, Value)],
@@ -166,6 +167,31 @@ impl Scheduler {
         node_tags: &HashMap<String, Vec<String>>,
         loads: &mut HashMap<String, usize>,
         already_inflight: usize,
+    ) -> Vec<(String, String, String)> {
+        self.schedule_batch_with_quota(
+            tasks,
+            agents,
+            node_tags,
+            loads,
+            already_inflight,
+            &crate::quota::QuotaConfig::default(),
+            &HashMap::new(),
+        )
+    }
+
+    /// 带 per-namespace in-flight 配额的批次调度（v0.7 §5.4）。
+    /// `namespace_inflight` 是派发前各 namespace 已占用的额度（running +
+    /// 已分配未确认）；本批次新分配也计入，保证单批不会突破上限。
+    #[allow(clippy::too_many_arguments)]
+    pub fn schedule_batch_with_quota(
+        &self,
+        tasks: &[(String, Value)],
+        agents: &[AgentRecord],
+        node_tags: &HashMap<String, Vec<String>>,
+        loads: &mut HashMap<String, usize>,
+        already_inflight: usize,
+        quota: &crate::quota::QuotaConfig,
+        namespace_inflight: &HashMap<String, usize>,
     ) -> Vec<(String, String, String)> {
         let mut out = Vec::new();
 
@@ -192,9 +218,27 @@ impl Scheduler {
         });
 
         let mut dispatched = 0usize;
+        let mut ns_assigned: HashMap<String, usize> = HashMap::new();
         for (task_id, spec) in ordered.into_iter() {
             if dispatched >= remaining_global {
                 break;
+            }
+
+            // v0.7 §5.4：namespace in-flight 上限（0=不限制）。
+            let namespace = crate::router::task_namespace(Some(&spec)).to_string();
+            let ns_limit = quota.max_inflight(&namespace);
+            if ns_limit > 0 {
+                let used = namespace_inflight.get(&namespace).copied().unwrap_or(0)
+                    + ns_assigned.get(&namespace).copied().unwrap_or(0);
+                if used >= ns_limit {
+                    tracing::debug!(
+                        namespace = %namespace,
+                        used,
+                        limit = ns_limit,
+                        "scheduler: namespace in-flight 配额已满，任务保持 pending"
+                    );
+                    continue;
+                }
             }
 
             let explicit = spec
@@ -215,6 +259,7 @@ impl Scheduler {
                     explicit
                 };
                 out.push((task_id, chosen.node_id.clone(), to_agent));
+                *ns_assigned.entry(namespace).or_insert(0) += 1;
                 dispatched += 1;
             }
             // 无可用 candidate：任务保持 pending，下一拍重试
@@ -526,5 +571,75 @@ mod tests {
             Some("n1".to_string()),
             "同分时按 node_id 字典序，n1 < n2"
         );
+    }
+    #[test]
+    fn namespace_inflight_quota_caps_dispatch() {
+        let sched = Scheduler::new(10, 0);
+        let mut a1 = agent("n1", "a1", &["cap:file"], true);
+        a1.namespace = Some("team-a".to_string());
+        let mut a2 = agent("n2", "a2", &["cap:file"], true);
+        a2.namespace = Some("team-b".to_string());
+        let agents = vec![a1, a2];
+        let node_tags: HashMap<String, Vec<String>> = HashMap::new();
+        let mut loads: HashMap<String, usize> = HashMap::new();
+
+        let mut ta1 = spec(&["cap:file"], 100, "2026-01-01T00:00:00Z");
+        ta1["namespace"] = json!("team-a");
+        let mut ta2 = spec(&["cap:file"], 50, "2026-01-01T00:00:01Z");
+        ta2["namespace"] = json!("team-a");
+        let mut tb = spec(&["cap:file"], 100, "2026-01-01T00:00:02Z");
+        tb["namespace"] = json!("team-b");
+
+        let mut namespaces = std::collections::BTreeMap::new();
+        namespaces.insert(
+            "team-a".to_string(),
+            crate::quota::NamespaceQuota {
+                max_inflight: Some(1),
+                ..Default::default()
+            },
+        );
+        let quota = crate::quota::QuotaConfig {
+            enabled: true,
+            namespaces,
+            ..Default::default()
+        };
+        let tasks = vec![
+            ("ta1".to_string(), ta1),
+            ("ta2".to_string(), ta2),
+            ("tb".to_string(), tb),
+        ];
+        let out = sched.schedule_batch_with_quota(
+            &tasks,
+            &agents,
+            &node_tags,
+            &mut loads,
+            0,
+            &quota,
+            &HashMap::new(),
+        );
+        assert_eq!(out.len(), 2, "team-a 只放 1 个，team-b 不受限");
+        // ta2 优先级更高（50 < 100），配额内应先选 ta2。
+        assert!(out.iter().any(|(id, _, _)| id == "ta2"));
+        assert!(!out.iter().any(|(id, _, _)| id == "ta1"));
+        assert!(out.iter().any(|(id, _, _)| id == "tb"));
+
+        // 已占用 1 个 in-flight 时 team-a 全部截流。
+        let mut used: HashMap<String, usize> = HashMap::new();
+        used.insert("team-a".to_string(), 1);
+        loads.clear();
+        let out = sched.schedule_batch_with_quota(
+            &[("ta2".to_string(), {
+                let mut s = spec(&["cap:file"], 50, "2026-01-01T00:00:01Z");
+                s["namespace"] = json!("team-a");
+                s
+            })],
+            &agents,
+            &node_tags,
+            &mut loads,
+            0,
+            &quota,
+            &used,
+        );
+        assert!(out.is_empty());
     }
 }
