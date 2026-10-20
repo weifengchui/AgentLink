@@ -956,9 +956,35 @@ pub struct Router {
     /// `audit_alert` / `agent_message` 等消息面事件由此送出；`cfg.webhook`
     /// 与引擎共用同一配置，任务面事件仍由 reconcile::Engine 发出）。
     webhook: Option<Arc<crate::api::WebhookClient>>,
-    /// v0.7 spine/relay 中继参数（enabled / spine / max_hops 快照）。
+    /// v0.7 spine/relay 中继参数（enabled / spine / upstream / max_hops 快照）。
     relay: crate::config::RelayConfig,
+    /// v0.7 第二波：经中继学到的**节点目录**（非直连；TTL 见
+    /// `DIR_TTL_SECONDS`，由中继节点每 `DIR_SYNC_INTERVAL_SECS` 刷新）。
+    /// 只用于 `/v1/peers` 展示与 fleet 的 node_online 判定，不参与拨号。
+    dir: Mutex<HashMap<String, DirEntry>>,
 }
+
+/// 一条中继学到的节点目录记录。
+#[derive(Clone)]
+struct DirEntry {
+    node_id: String,
+    name: String,
+    addr: String,
+    /// 来源中继（保留最初 spine，多级时指向叶子侧的 spine）。
+    via: String,
+    hops: u8,
+    /// 本节点最近一次收到/刷新该条目的时刻（展示 last_seen 用）。
+    updated: std::time::Instant,
+    /// **绝对过期时间**（unix 秒，由最初的中继按 TTL 设定并原样转发）。
+    /// 多级级联时若各跳各自按本地接收时间续期，离线的叶子会被环路互相
+    /// 刷新、永不掉线——所以过期时间必须随目录帧原样传播、只由源头续期。
+    expires_wall: i64,
+}
+
+/// 目录条目存活时间：中继每 5s 刷新，30s 未见即视为离开。
+const DIR_TTL_SECONDS: u64 = 30;
+/// 中继目录推送周期（秒；与 maintenance 的 1s tick 对齐）。
+const DIR_SYNC_INTERVAL_SECS: u64 = 5;
 
 /// 路由层 Prometheus 指标。
 #[derive(Debug, Clone, Default)]
@@ -1076,6 +1102,7 @@ impl Router {
             started: Instant::now(),
             webhook: crate::api::WebhookClient::new(&cfg.webhook).map(Arc::new),
             relay: cfg.relay.clone(),
+            dir: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1511,36 +1538,43 @@ impl Router {
                 }
             }
             None => {
-                // v0.7 spine/relay：目标非直连且配置了上游 spine → 交其转发
-                // （下一跳=spine，pending 也按 spine 记账：逐跳 ACK，端到端
-                // 由每跳各自重试+接收端 dedup 兜底）。
-                let via_spine = !self.relay.spine.is_empty()
-                    && self.relay.spine != env.to
-                    && self
-                        .registry
-                        .get(&self.relay.spine)
-                        .map(|s| (s.node_id.clone(), s))
-                        .is_some();
-                if via_spine {
-                    let spine_id = self.relay.spine.clone();
-                    if let Some(sink) = self.registry.get(&spine_id) {
-                        if self.send_raw(&sink, &env).await {
-                            crate::trace::log_event(
-                                tracing::Level::DEBUG,
-                                "message.relay",
-                                &self.cfg.node_id,
-                                &trace_id,
-                                Some(&env),
-                            );
-                            self.register_pending_at(&env, &spine_id, 0);
-                            return Ok(env.msg_id);
-                        }
+                // v0.7 spine/relay：目标非直连 → 依次尝试上游中继（叶子用
+                // `relay.spine`；spine 用 `relay.upstream` 级联）。下一跳=中继，
+                // pending 也按中继记账：逐跳 ACK，端到端由每跳重试+接收端
+                // dedup 兜底。
+                for next_hop in self.upstream_candidates(&env.to) {
+                    let Some(sink) = self.registry.get(&next_hop) else {
+                        continue;
+                    };
+                    if self.send_raw(&sink, &env).await {
+                        crate::trace::log_event(
+                            tracing::Level::DEBUG,
+                            "message.relay",
+                            &self.cfg.node_id,
+                            &trace_id,
+                            Some(&env),
+                        );
+                        self.register_pending_at(&env, &next_hop, 0);
+                        return Ok(env.msg_id);
                     }
                 }
                 self.enqueue_offline(&env).await
             }
         }
         Ok(env.msg_id)
+    }
+
+    /// 候选上游中继（去重、排除最终目标）：叶子优先 `spine`，spine 可再
+    /// 用 `upstream` 级联；返回顺序即尝试顺序。
+    fn upstream_candidates(&self, target: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for cand in [&self.relay.spine, &self.relay.upstream] {
+            if cand.is_empty() || cand == target || out.contains(cand) {
+                continue;
+            }
+            out.push(cand.clone());
+        }
+        out
     }
 
     /// v0.7 spine/relay：中继转发。仅由 `conn` 在「目标为第三方」或
@@ -1619,9 +1653,32 @@ impl Router {
                 }
             }
             None => {
+                // v0.7 第二波：多级级联——spine 找不到目标直连时向
+                // `relay.upstream` 兜底转发（不回弹给入站连接，防两跳乒乓）。
+                let up = self.relay.upstream.clone();
+                let can_up = !up.is_empty()
+                    && up != env.to
+                    && ingress != Some(up.as_str())
+                    && self.registry.get(&up).is_some();
+                if can_up {
+                    if let Some(sink) = self.registry.get(&up) {
+                        if self.send_raw(&sink, env).await {
+                            crate::trace::log_event(
+                                tracing::Level::DEBUG,
+                                "message.relay",
+                                &self.cfg.node_id,
+                                &trace_id,
+                                Some(env),
+                            );
+                            self.register_pending_at(env, &up, 0);
+                            return true;
+                        }
+                    }
+                }
                 tracing::warn!(
                     msg_id = %env.msg_id,
                     to = %env.to,
+                    upstream = %up,
                     "router: transit target not a direct peer, dropped（未知路由不与离线队列混用）"
                 );
                 return false;
@@ -1983,6 +2040,13 @@ impl Router {
                 this.evict_local_pending();
                 if this.agent_ttl > 0 && counter.is_multiple_of(5) {
                     this.evict_stale_agents();
+                }
+                // v0.7 第二波：目录过期清理 + 中继周期推送（仅 spine 推送）。
+                if counter.is_multiple_of(DIR_SYNC_INTERVAL_SECS) {
+                    this.dir_prune();
+                    if this.relay.enabled {
+                        this.sync_push_dir();
+                    }
                 }
                 if this.compact_due.swap(false, Ordering::Relaxed) {
                     this.compact_journal().await;
@@ -2357,13 +2421,259 @@ impl Router {
             return None;
         }
         let payload = serde_json::json!({ "agents": agents });
-        Some(Envelope::agents_update(
+        let mut env = Envelope::agents_update(&self.cfg.node_id, to, payload, None, None);
+        self.sign_control(&mut env);
+        Some(env)
+    }
+
+    /// 控制面帧签名（v0.7 第二波）：strict 模式下所有新发出的控制面帧都带
+    /// `sig`（HMAC 覆盖 from|msg_id|ts，与业务帧同一把 cluster_token）。
+    /// 未开启 strict 时不签（保持 open 模式零开销）。
+    fn sign_control(&self, env: &mut Envelope) {
+        if self.cfg.security.mode != "strict" {
+            return;
+        }
+        env.sig = Some(envelope_sign(
+            &self.cfg.security.cluster_token,
+            &env.from,
+            &env.msg_id,
+            &env.ts,
+        ));
+    }
+
+    /// 控制面帧校验（v0.7 第二波）：
+    /// - open 模式：放行；
+    /// - strict + 帧带 `sig`：**总是**验签（篡改即拒）；
+    /// - strict + 无 `sig`：`security.control_auth=false`（缺省）放行以兼容
+    ///   未升级节点；开启后一律拒绝。
+    pub fn verify_control(&self, env: &Envelope) -> bool {
+        if self.cfg.security.mode != "strict" {
+            return true;
+        }
+        match &env.sig {
+            Some(_) => self.verify_incoming(env),
+            None => !self.cfg.security.control_auth,
+        }
+    }
+
+    // ---- node directory (v0.7 第二波) ---------------------------------------
+
+    /// 合并对端中继来的节点目录。直连 peer / 本机 / 空 id 一律忽略
+    /// （直连信息以 PeerTable 为准，避免目录覆盖真实在线态）。
+    pub fn dir_merge(&self, nodes: &[serde_json::Value], via: &str) {
+        let mut d = self.dir.lock().unwrap();
+        for n in nodes {
+            let id = n.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
+            if id.is_empty() || id == self.cfg.node_id || self.registry.get(id).is_some() {
+                continue;
+            }
+            let name = n
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(id)
+                .to_string();
+            let addr = n
+                .get("addr")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let origin = n
+                .get("via")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(via)
+                .to_string();
+            let hops = n
+                .get("hops")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(u8::MAX as u64) as u8;
+            // 绝对过期时间：源头设定（now+TTL），中继原样转发；缺失则本地兜底。
+            let now = store::now_wall();
+            let expires_wall = n
+                .get("expires")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(now + DIR_TTL_SECONDS as i64)
+                .min(now + DIR_TTL_SECONDS as i64);
+            tracing::debug!(
+                node_id = %id,
+                provided = ?n.get("expires"),
+                effective = expires_wall,
+                via = %origin,
+                hops,
+                "router: dir_merge"
+            );
+            d.insert(
+                id.to_string(),
+                DirEntry {
+                    node_id: id.to_string(),
+                    name,
+                    addr,
+                    via: origin,
+                    hops,
+                    updated: std::time::Instant::now(),
+                    expires_wall,
+                },
+            );
+        }
+    }
+
+    /// 条目是否仍在有效期内（绝对过期时间，见 `DirEntry::expires_wall`）。
+    fn dir_entry_live(e: &DirEntry) -> bool {
+        store::now_wall() <= e.expires_wall
+    }
+
+    /// 清理过期目录条目（中继每 5s 刷新，30s 未见即离开）。
+    pub fn dir_prune(&self) {
+        let mut d = self.dir.lock().unwrap();
+        d.retain(|_, e| Self::dir_entry_live(e));
+    }
+
+    /// 目录里的节点是否「新鲜」（用于 fleet 的 node_online 判定）。
+    pub fn dir_online(&self, node_id: &str) -> bool {
+        self.dir
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .map(Self::dir_entry_live)
+            .unwrap_or(false)
+    }
+
+    /// `/v1/peers` 的加性视图：经中继学到的节点（`relayed=true`、`via`）。
+    pub fn dir_snapshot(&self) -> Vec<crate::peer::PeerView> {
+        let d = self.dir.lock().unwrap();
+        let mut out: Vec<crate::peer::PeerView> = d
+            .values()
+            .filter(|e| Self::dir_entry_live(e))
+            .map(|e| crate::peer::PeerView {
+                node_id: e.node_id.clone(),
+                name: e.name.clone(),
+                addr: e.addr.clone(),
+                mtls_addr: None,
+                tags: Vec::new(),
+                online: true,
+                last_seen_seconds_ago: e.updated.elapsed().as_secs(),
+                direction: "relay".to_string(),
+                load: None,
+                relayed: Some(true),
+                via: Some(e.via.clone()),
+            })
+            .collect();
+        out.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        out
+    }
+
+    /// 构造目录帧：本机直连 peer + 已学到的目录（带 hops，供下游中继判断）。
+    pub fn node_dir_envelope(&self) -> Option<Envelope> {
+        let mut nodes = Vec::new();
+        let now = store::now_wall();
+        for s in self.registry.all() {
+            nodes.push(serde_json::json!({
+                "node_id": s.node_id,
+                "name": s.name,
+                "addr": s.addr,
+                "via": self.cfg.node_id,
+                "hops": 0,
+                "expires": now + DIR_TTL_SECONDS as i64,
+            }));
+        }
+        {
+            let d = self.dir.lock().unwrap();
+            for e in d.values() {
+                if !Self::dir_entry_live(e) || e.hops.saturating_add(1) > self.relay.max_hops.max(1)
+                {
+                    continue;
+                }
+                nodes.push(serde_json::json!({
+                    "node_id": e.node_id,
+                    "name": e.name,
+                    "addr": e.addr,
+                    "via": e.via,
+                    "hops": e.hops.saturating_add(1),
+                    // 绝对过期时间原样转发（只由源头续期）。
+                    "expires": e.expires_wall,
+                }));
+            }
+        }
+        if nodes.is_empty() {
+            return None;
+        }
+        tracing::debug!(
+            nodes = %serde_json::to_string(&nodes).unwrap_or_default(),
+            "router: node_dir outbound"
+        );
+        let mut env = Envelope::business(
             &self.cfg.node_id,
-            to,
-            payload,
+            "*",
+            "ctrl",
+            "node_dir",
+            serde_json::json!({ "nodes": nodes }),
             None,
             None,
-        ))
+            None,
+            None,
+            None,
+        );
+        self.sign_control(&mut env);
+        Some(env)
+    }
+
+    /// 中继目录：把本节点已知目录推给所有直连 peer（maintenance 周期调用）。
+    pub fn sync_push_dir(&self) {
+        let Some(env) = self.node_dir_envelope() else {
+            return;
+        };
+        self.broadcast_envelope(&env);
+    }
+
+    /// 新 peer 注册后立刻推一份目录（不必等下一个 5s 周期）。
+    pub fn push_dir_to(&self, node_id: &str) {
+        let Some(env) = self.node_dir_envelope() else {
+            return;
+        };
+        self.broadcast_env_to(node_id, &env);
+    }
+
+    /// 收目录帧：验签 → 合并。返回是否接受。
+    pub fn on_node_dir(&self, env: &Envelope, _ingress: Option<&str>) -> bool {
+        if !self.verify_control(env) {
+            tracing::warn!(
+                from = %env.from,
+                msg_id = %env.msg_id,
+                "router: node_dir rejected (control frame signature)"
+            );
+            self.notify(
+                "audit_alert",
+                serde_json::json!({
+                    "kind": "control_frame_rejected",
+                    "action": "node_dir",
+                    "from": env.from,
+                    "msg_id": env.msg_id,
+                }),
+            );
+            return false;
+        }
+        let nodes = env
+            .payload
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        self.dir_merge(&nodes, &env.from);
+        true
+    }
+
+    /// 向单个 peer 发一个已构造好的信封（fire-and-forget，断线不影响调用方）。
+    fn broadcast_env_to(&self, node_id: &str, env: &Envelope) {
+        let Some(sink) = self.registry.get(node_id) else {
+            return;
+        };
+        let Ok(text) = serde_json::to_string(env) else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = sink.tx.send(Frame::Text(text)).await;
+        });
     }
 
     /// Push our latest agent table to every connected peer.
@@ -2588,6 +2898,15 @@ mod relay_tests {
     use std::sync::Arc;
 
     fn router_with(relay_enabled: bool, spine: &str, max_hops: u8) -> (Config, Arc<Router>) {
+        router_custom(relay_enabled, spine, "", max_hops)
+    }
+
+    fn router_custom(
+        relay_enabled: bool,
+        spine: &str,
+        upstream: &str,
+        max_hops: u8,
+    ) -> (Config, Arc<Router>) {
         let mut cfg = Config::generate(
             Some("relay-test".to_string()),
             Some("tok".to_string()),
@@ -2599,6 +2918,7 @@ mod relay_tests {
         cfg.delivery.persist = false;
         cfg.relay.enabled = relay_enabled;
         cfg.relay.spine = spine.to_string();
+        cfg.relay.upstream = upstream.to_string();
         cfg.relay.max_hops = max_hops;
         let r = Arc::new(Router::new(&cfg));
         (cfg, r)
@@ -2690,5 +3010,165 @@ mod relay_tests {
         let pending = r.pending.lock().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending.values().next().unwrap().peer_id, "spine1");
+    }
+
+    // ---- v0.7 第二波：级联 / 目录 / 控制面验签 ------------------------------
+
+    #[tokio::test]
+    async fn send_uses_upstream_when_spine_empty() {
+        let (_cfg, r2) = router_custom(false, "", "up1", 3);
+        let mut rx = attach(&r2, "up1");
+        r2.send(frame_env("far-node", None)).await.unwrap();
+        let text = match rx.recv().await.expect("应经 upstream 级联") {
+            Frame::Text(t) => t,
+            other => panic!("非文本帧: {other:?}"),
+        };
+        let fwd: Envelope = serde_json::from_str(&text).unwrap();
+        assert_eq!(fwd.to, "far-node");
+        assert_eq!(
+            r2.pending.lock().unwrap().values().next().unwrap().peer_id,
+            "up1",
+            "pending 按 upstream 记账"
+        );
+    }
+
+    #[tokio::test]
+    async fn transit_unknown_target_falls_back_to_upstream() {
+        let (_cfg, r2) = router_custom(true, "", "up1", 3);
+        let mut rx = attach(&r2, "up1");
+        let mut env = frame_env("ghost-node", None);
+        assert!(r2.handle_transit(&mut env, Some("ingress1")).await);
+        let text = match rx.recv().await.expect("未知目标应兜底到 upstream") {
+            Frame::Text(t) => t,
+            other => panic!("非文本帧: {other:?}"),
+        };
+        let fwd: Envelope = serde_json::from_str(&text).unwrap();
+        assert_eq!(fwd.hops, Some(1), "级联转发同样逐跳累加");
+        assert_eq!(fwd.to, "ghost-node");
+    }
+
+    #[tokio::test]
+    async fn transit_does_not_bounce_back_to_ingress_upstream() {
+        let (_cfg, r2) = router_custom(true, "", "up1", 3);
+        let _rx = attach(&r2, "up1");
+        let mut env = frame_env("ghost-node", None);
+        // 入站连接就是 upstream → 不得再弹回（两跳乒乓）。
+        assert!(!r2.handle_transit(&mut env, Some("up1")).await);
+    }
+
+    fn router_strict(control_auth: bool) -> (Config, Arc<Router>) {
+        let mut cfg = Config::generate(
+            Some("ctrl-auth-test".to_string()),
+            Some("tok-ctrl".to_string()),
+            Some("strict".to_string()),
+        );
+        cfg.data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("relay-test");
+        cfg.delivery.persist = false;
+        cfg.security.control_auth = control_auth;
+        let r = Arc::new(Router::new(&cfg));
+        (cfg, r)
+    }
+
+    #[tokio::test]
+    async fn control_auth_default_tolerates_unsigned_but_verifies_signed() {
+        let (cfg, r) = router_strict(false);
+        assert!(
+            r.verify_control(&frame_env("nodeB", None)),
+            "缺省容忍未签名"
+        );
+        // 带签名且正确 → 通过。
+        let mut signed = frame_env("nodeB", None);
+        signed.sig = Some(crate::proto::envelope_sign(
+            &cfg.security.cluster_token,
+            &signed.from,
+            &signed.msg_id,
+            &signed.ts,
+        ));
+        assert!(r.verify_control(&signed));
+        // 带签名但被篡改 → 拒绝。
+        let mut tampered = signed.clone();
+        tampered.msg_id = "deadbeef".to_string();
+        assert!(!r.verify_control(&tampered), "签名不覆盖篡改后的 msg_id");
+    }
+
+    #[tokio::test]
+    async fn control_auth_strict_rejects_unsigned() {
+        let (_cfg, r) = router_strict(true);
+        assert!(
+            !r.verify_control(&frame_env("nodeB", None)),
+            "control_auth 开启必须签名"
+        );
+        let mut signed = Envelope::business(
+            "nodeA",
+            "*",
+            "ctrl",
+            "node_dir",
+            json!({"nodes": []}),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        signed.sig = Some(crate::proto::envelope_sign(
+            &_cfg.security.cluster_token,
+            &signed.from,
+            &signed.msg_id,
+            &signed.ts,
+        ));
+        assert!(r.verify_control(&signed));
+    }
+
+    #[tokio::test]
+    async fn node_dir_merges_skips_self_and_direct_peers() {
+        let (_cfg, r) = router_with(true, "", 2);
+        let _rx = attach(&r, "direct1");
+        let self_id = r.node_id().to_string();
+        let env = Envelope::business(
+            "spine1",
+            "*",
+            "ctrl",
+            "node_dir",
+            json!({"nodes": [
+                {"node_id": self_id, "name": "self", "addr": "x", "via": "spine1", "hops": 0},
+                {"node_id": "direct1", "name": "direct", "addr": "x", "via": "spine1", "hops": 0},
+                {"node_id": "leaf2", "name": "leaf2", "addr": "10.0.0.9:8765", "via": "spine1", "hops": 1}
+            ]}),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(r.on_node_dir(&env, None));
+        let snap = r.dir_snapshot();
+        assert_eq!(snap.len(), 1, "本机与直连 peer 不进目录");
+        assert_eq!(snap[0].node_id, "leaf2");
+        assert_eq!(snap[0].relayed, Some(true));
+        assert_eq!(snap[0].via.as_deref(), Some("spine1"));
+        assert!(r.dir_online("leaf2"));
+        assert!(!r.dir_online("nobody"));
+        // 绝对过期时间：中继转发时原样携带，过期条目即使被反复转发也不再新鲜
+        // （多级级联下防止环路互相续期）。
+        let expired = Envelope::business(
+            "spine1",
+            "*",
+            "ctrl",
+            "node_dir",
+            serde_json::json!({"nodes": [
+                {"node_id": "leaf3", "name": "leaf3", "addr": "x", "via": "spine1",
+                 "hops": 1, "expires": crate::store::now_wall() - 5}
+            ]}),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(r.on_node_dir(&expired, None));
+        assert!(!r.dir_online("leaf3"), "过期条目不得被视为在线");
+        assert!(!r.dir_snapshot().iter().any(|v| v.node_id == "leaf3"));
     }
 }

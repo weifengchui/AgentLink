@@ -51,6 +51,13 @@ pub struct PeerView {
     /// 0.5.9 逐字节一致（零行为变化门）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load: Option<PeerLoad>,
+    /// v0.7 第二波：该条目是**经中继学到的节点目录**（非直连）。缺省
+    /// `None` 且跳过序列化——直连条目字节不变。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relayed: Option<bool>,
+    /// 该中继条目的来源（spine node_id，多级时是最近一跳的中继）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 /// A peer learned from discovery, forwarded to the connection manager.
@@ -242,6 +249,8 @@ impl PeerTable {
                 last_seen_seconds_ago: p.last_seen.elapsed().as_secs(),
                 direction: p.direction.clone(),
                 load: p.load.clone(),
+                relayed: None,
+                via: None,
             })
             .collect();
         views.sort_by(|a, b| a.node_id.cmp(&b.node_id));

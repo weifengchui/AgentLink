@@ -460,6 +460,9 @@ async fn handle_text(
             if let Some(env) = state.router.agents_update_envelope(&hello.node_id) {
                 let _ = send_text(send, &env).await;
             }
+            // v0.7 第二波：新 peer 注册后立刻推一份节点目录（spine 的目录
+            // 含其它叶子；叶子收到即可在 /v1/peers 看到非直连节点）。
+            state.router.push_dir_to(&hello.node_id);
             // v0.6 P1 Lease：新对端注册后补推一次当前负载快照——lease 任务的
             // 每 ticker 首拍常发生在对端注册之前（阈值内静默期不再重发），
             // 若不补推，新入网节点要等下一次阈值跨越才可见负载。
@@ -583,10 +586,28 @@ async fn handle_text(
         }
 
         "agents_update" => {
-            let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("");
-            let agents: Option<Vec<crate::router::AgentRecord>> = value
-                .get("payload")
-                .and_then(|p| p.get("agents"))
+            // v0.7 第二波：控制面帧验签（带 sig 必验；control_auth=true 时
+            // 无 sig 直接拒）。拒绝只影响 agent 表同步，不影响业务消息。
+            let Ok(env) = serde_json::from_value::<Envelope>(value.clone()) else {
+                return true;
+            };
+            if !state.router.verify_control(&env) {
+                tracing::warn!(from = %env.from, "conn: agents_update rejected (control signature)");
+                state.router.notify(
+                    "audit_alert",
+                    serde_json::json!({
+                        "kind": "control_frame_rejected",
+                        "action": "agents_update",
+                        "from": env.from,
+                        "msg_id": env.msg_id,
+                    }),
+                );
+                return true;
+            }
+            let from = env.from.as_str();
+            let agents: Option<Vec<crate::router::AgentRecord>> = env
+                .payload
+                .get("agents")
                 .and_then(|a| serde_json::from_value(a.clone()).ok());
             if let (Some(agents), false) = (agents, from.is_empty()) {
                 state.router.on_agents_update(from, agents);
@@ -595,9 +616,18 @@ async fn handle_text(
             // （保留原 from）——叶子据此看到非直连节点的 agent，引擎才能跨
             // 叶子调度。hops 上限防环。
             if cfg.relay.enabled {
-                if let Ok(env) = serde_json::from_value::<Envelope>(value.clone()) {
-                    state.router.relay_control(&env, peer_id.as_deref()).await;
-                }
+                state.router.relay_control(&env, peer_id.as_deref()).await;
+            }
+            true
+        }
+
+        // v0.7 第二波：节点目录中继（spine 周期推送 / 新 peer 注册即推）。
+        "node_dir" => {
+            let Ok(env) = serde_json::from_value::<Envelope>(value.clone()) else {
+                return true;
+            };
+            if state.router.on_node_dir(&env, peer_id.as_deref()) && cfg.relay.enabled {
+                state.router.relay_control(&env, peer_id.as_deref()).await;
             }
             true
         }

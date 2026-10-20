@@ -293,6 +293,11 @@ pub struct RelayConfig {
     /// spine 并由其转发（spine 再按目标直连投递）；空 = 维持既有全网格语义。
     #[serde(default)]
     pub spine: String,
+    /// spine 的**上游中继** node_id（多级级联用，v0.7 第二波）：
+    /// 本节点作为 spine 找不到目标直连时，向 upstream 兜底转发。
+    /// 叶子通常不配（叶子用 `spine`）；空 = 不级联（第一波语义）。
+    #[serde(default)]
+    pub upstream: String,
     /// 中继跳数上限（缺省 2：leaf → spine → leaf；跨 spine 级联需 ≥3）。
     #[serde(default = "default_relay_max_hops")]
     pub max_hops: u8,
@@ -307,6 +312,7 @@ impl Default for RelayConfig {
         Self {
             enabled: false,
             spine: String::new(),
+            upstream: String::new(),
             max_hops: default_relay_max_hops(),
         }
     }
@@ -343,6 +349,16 @@ pub struct SecurityConfig {
     /// 行为与从前完全一致（cluster_token 单因素）。
     #[serde(default)]
     pub admission: AdmissionConfig,
+    /// 控制面帧强制验签（v0.7 第二波）。缺省 false：
+    /// - 帧带 `sig` → strict 模式下**总是**校验（篡改即拒，零破坏）；
+    /// - 帧不带 `sig` → 放行（兼容未升级节点 / 旧控制帧）。
+    ///
+    /// 开启后：`agents_update` / `node_dir` 等控制帧不带签名一律拒绝。
+    ///
+    /// **滚动升级**：须先把 `control_auth=true` 推到接收方，再让发送方开启/升级，
+    /// 否则未签名控制帧会被丢弃（agent 表/目录不更新，不影响业务消息）。
+    #[serde(default)]
+    pub control_auth: bool,
 }
 
 /// 新节点准入配置（v0.6 P1）：bootstrap 令牌 + 硬件指纹**双验证**。
@@ -827,6 +843,7 @@ impl Default for SecurityConfig {
             mode: default_security_mode(),
             cluster_token: default_placeholder_token(),
             admission: AdmissionConfig::default(),
+            control_auth: false,
         }
     }
 }
@@ -946,6 +963,7 @@ impl Config {
                 mode: mode.unwrap_or_else(default_security_mode),
                 cluster_token: cluster_token.unwrap_or_else(new_secret),
                 admission: AdmissionConfig::default(),
+                control_auth: false,
             },
             local_api: LocalApiConfig {
                 host: default_local_host(),

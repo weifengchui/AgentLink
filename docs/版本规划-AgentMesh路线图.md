@@ -46,7 +46,7 @@
 
 目标：团队付费意愿的功能与合规。
 
-- spine/relay 中继拓扑 + 静态种子清单（破全网格连接数与广播风暴）——第一波已交付（2026-10-19，`docs/spine-relay-验证-2026-10-19.md`：`relay{enabled,spine,max_hops=2}` 加性缺省关；叶子经 `discovery.static_peers` 连 spine、非直连目标改投 spine；spine 验签+去重+`hops` 加性字段（超限丢弃）+透明转发（保 `from`）+逐跳 ACK/逐跳重试 + 广播扩散 + `agents_update` 中继；未知目标丢弃不与离线队列混用；单测 5 + 冒烟 7/7（三节点 A-R-B）零回归；第二波：多级 spine 级联、节点目录同步、控制面帧验签）
+- spine/relay 中继拓扑 + 静态种子清单（破全网格连接数与广播风暴）——第一波已交付（2026-10-19，`docs/spine-relay-验证-2026-10-19.md`：`relay{enabled,spine,max_hops=2}` 加性缺省关；叶子经 `discovery.static_peers` 连 spine、非直连目标改投 spine；spine 验签+去重+`hops` 加性字段（超限丢弃）+透明转发（保 `from`）+逐跳 ACK/逐跳重试 + 广播扩散 + `agents_update` 中继；未知目标丢弃不与离线队列混用；单测 5 + 冒烟 7/7（三节点 A-R-B）零回归）；第二波已交付（2026-10-20，`docs/spine-relay-第二波-验证-2026-10-20.md`：`relay.upstream` 多级级联（链式相邻 spine 互为上游、未知目标兜底且不回弹）+ `ctrl/node_dir` 节点目录同步（`/v1/peers` 带 `relayed/via`、绝对 `expires` 防环路续期、fleet `node_online` 目录兜底）+ 控制面帧验签（`security.control_auth`，`agents_update`/`node_dir` 带签名必验、无签名可强制拒绝并审计；单测 11 + 四节点冒烟 10/10 含 kill-node TTL 收敛，零回归）
 - journal group commit：`delivery.journal_sync_ms`（缺省 0=逐条 fsync 掉电零丢；>0=批量窗口，掉电最多丢一窗，突发派发 P99 从 ~2s 回到 395ms）——已交付（2026-10-19，`docs/journal-groupcommit-验证-2026-10-19.md`：批量线程 + Drop 收尾强刷；单测 +3=126；验收仿真 persist=true+50ms 5/5，P99 395ms）
 - ABAC 策略引擎（label × node 属性 allow/deny，如 finance-data 禁入低安全级节点）+ namespace 多租户【§4.2】
 - 不可变审计日志（hash 链 append-only）+ 导出 ELK/文件【§4.4】

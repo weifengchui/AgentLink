@@ -1,0 +1,10 @@
+{"scenario": "C0 两级级联组网（每节点只见直连邻居）", "pass": true, "detail": {"r1": ["a00000000001", "b00000000002"], "r2": ["b00000000001", "c00000000001"], "a": ["b00000000001"], "b": ["b00000000002"]}}
+{"scenario": "C1 A→B 两级转发（hops=2、from 保持）", "pass": true, "detail": {"hops": 2, "from": "a00000000001"}}
+{"scenario": "C2 B→A 回向两级转发", "pass": true, "detail": {"hops": 2}}
+{"scenario": "C3 节点目录（A 看到 B/R2：relayed=true + via）", "pass": true, "detail": {"b": {"addr": "127.0.0.1:59909", "direction": "relay", "last_seen_seconds_ago": 0, "mtls_addr": null, "name": "cascade-b", "node_id": "c00000000001", "online": true, "relayed": true, "tags": [], "via": "b00000000002"}, "r2": {"addr": "127.0.0.1:18926", "direction": "relay", "last_seen_seconds_ago": 0, "mtls_addr": null, "name": "cascade-r2", "node_id": "b00000000002", "online": true, "relayed": true, "tags": [], "via": "b00000000001"}}}
+{"scenario": "C4 跨级 fleet（A 看到 B 的 agent online + node_name）", "pass": true, "detail": {"agent": {"agent_id": "casc-worker", "capabilities": ["cap:shell:safe"], "last_seen": 1792459936, "name": "casc-worker", "node_addr": "127.0.0.1:59909", "node_id": "c00000000001", "node_name": "cascade-b", "online": true}}}
+{"scenario": "C5 未签名 node_dir 被拒（不落目录 + 审计日志）", "pass": true, "detail": {"absent": true, "logged": true}}
+{"scenario": "C6 正确签名的 node_dir 被接受", "pass": true, "detail": {"relayed": true, "via": "d00000000002"}}
+{"scenario": "C7 篡改签名被拒", "pass": true, "detail": {}}
+{"scenario": "C8 目录 TTL 过期（kill B → A 端目录消失、agent 转 offline）", "pass": true, "detail": {"gone": true, "agent_online": false, "a_b": null, "r2_direct": ["b00000000001"], "r1_direct": ["a00000000001", "b00000000002"]}}
+{"scenario": "C9 剩余节点无崩溃", "pass": true, "detail": {}}

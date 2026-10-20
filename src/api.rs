@@ -848,8 +848,24 @@ async fn peers(State(state): State<SharedState>, headers: HeaderMap) -> impl Int
     }
     (
         StatusCode::OK,
-        Json(json!({ "ok": true, "peers": state.peers.snapshot() })),
+        Json(json!({ "ok": true, "peers": merged_peer_views(&state) })),
     )
+}
+
+/// 直连 peer（PeerTable）+ v0.7 第二波「经中继学到的目录」合并视图。
+/// 直连条目优先（同 node_id 时不追加）；目录条目带 `relayed=true`/`via`。
+fn merged_peer_views(state: &AppState) -> Vec<crate::peer::PeerView> {
+    let mut peers = state.peers.snapshot();
+    let known: std::collections::HashSet<String> =
+        peers.iter().map(|p| p.node_id.clone()).collect();
+    let self_id = &state.config.node_id;
+    for d in state.router.dir_snapshot() {
+        if d.node_id != *self_id && !known.contains(&d.node_id) {
+            peers.push(d);
+        }
+    }
+    peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    peers
 }
 
 /// Persist the current suppress list under the node's data dir.
@@ -1279,7 +1295,7 @@ async fn fleet_agents(
     }
     let mut names: HashMap<String, String> = HashMap::new();
     let mut addrs: HashMap<String, String> = HashMap::new();
-    for p in state.peers.snapshot() {
+    for p in merged_peer_views(&state) {
         names.insert(p.node_id.clone(), p.name.clone());
         addrs.insert(p.node_id.clone(), p.addr.clone());
     }
@@ -1291,7 +1307,10 @@ async fn fleet_agents(
     // Ghost guard: an agent can only be online if its NODE is online. Remote
     // agent caches used to keep `online:true` forever after the owner node
     // went away (new identity/reboot), confusing the fleet view.
-    let node_online = |nid: &str| nid == state.config.node_id || state.peers.is_online(nid);
+    // v0.7 第二波：非直连节点以中继目录的新鲜度判定（30s 未见即离线）。
+    let node_online = |nid: &str| {
+        nid == state.config.node_id || state.peers.is_online(nid) || state.router.dir_online(nid)
+    };
     // v0.5 kernel list §3: optional capability query (open-source = query only,
     // no scheduling). `?requires=cap:node:reboot,cap:edit:py` keeps only ONLINE
     // agents whose capabilities satisfy every requirement (hierarchical,
