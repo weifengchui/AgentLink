@@ -125,7 +125,12 @@ pub fn apply_task_spec(mesh: &MeshRuntime, body: &serde_json::Value) -> Result<S
         .get(&task_id)
         .map(|r| r.state.as_str().to_string())
         .unwrap_or_else(|| "pending".to_string());
+    let warmpool = table.get(&task_id).and_then(|r| r.correlation.as_deref()) == Some("warmpool");
     drop(table);
+    // v0.7 §7.2：本机声明式提交的 SLO 起点（入表时刻；预热池不计入）。
+    if !warmpool {
+        mesh.slo.lock().unwrap().touch(&task_id);
+    }
     mesh.maybe_snapshot();
     Ok(final_state)
 }
@@ -196,6 +201,10 @@ pub struct Engine {
     /// v0.7 chaos：Running 任务「所在节点首次观测到离线」的单调时刻，
     /// 用于宽限期判定；任务离开 Running 或节点恢复即清除。
     reclaim_since: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// v0.7 §7.2 SLO 参数快照（enabled=false 时零采集）。
+    slo_cfg: crate::slo::SloConfig,
+    /// SLO 评估节流（1s 一评，避免 200ms tick 空转排序）。
+    slo_next: std::sync::Mutex<std::time::Instant>,
 }
 
 impl Engine {
@@ -218,6 +227,7 @@ impl Engine {
         let node_id = state.config.node_id.clone();
         let circuit_cfg = state.config.mesh.engine.circuit.clone();
         let warmpool_cfg = state.config.mesh.engine.warmpool.clone();
+        let slo_cfg = state.config.mesh.engine.slo.clone();
         let warm_next = std::sync::Mutex::new(
             std::time::Instant::now()
                 + std::time::Duration::from_secs(warmpool_cfg.interval_secs.clamp(5, 3600_u64)),
@@ -235,6 +245,8 @@ impl Engine {
             warmpool_cfg,
             warm_next,
             reclaim_since: std::sync::Mutex::new(HashMap::new()),
+            slo_cfg,
+            slo_next: std::sync::Mutex::new(std::time::Instant::now()),
         };
         tokio::spawn(async move {
             if let Err(e) = engine.run(shutdown_rx).await {
@@ -342,6 +354,8 @@ impl Engine {
                 };
                 let rec_json = serde_json::to_value(table.get(&task_id).unwrap())
                     .map_err(|e| anyhow!("task record serialize: {e}"))?;
+                let warmpool =
+                    table.get(&task_id).and_then(|r| r.correlation.as_deref()) == Some("warmpool");
                 let rev = self.mesh.next_rev();
                 drop(table); // 释放表锁再落 store（锁顺序：table → store）
                 if let Err(e) = self
@@ -366,6 +380,14 @@ impl Engine {
                 if let Some(st) = new_state {
                     if st.is_terminal() {
                         self.on_task_terminal(&task_id, st);
+                        // v0.7 §7.2：终态样本（cancelled 视为成功侧，仅错误率
+                        // 统计 failed/declined/expired；此处 ok 只用于区分）。
+                        self.finish_slo(&task_id, st == TaskState::Succeeded, warmpool);
+                    } else {
+                        // 非终态：记录 SLO 起点（幂等；预热池跳过）。
+                        if !warmpool {
+                            self.mesh.slo.lock().unwrap().touch(&task_id);
+                        }
                     }
                 }
                 // v0.6 P1 熔断归账：只在**首次转入 Failed**（Transitioned）时
@@ -416,6 +438,8 @@ impl Engine {
             // P3-3：expired 终态更新批次护栏（锁外调用，on_task_terminal 内部自加锁）。
             for (tid, st) in &expired_recs {
                 self.on_task_terminal(tid, *st);
+                // v0.7 §7.2：deadline 超期计入失败样本。
+                self.finish_slo(tid, false, false);
             }
             ids
         };
@@ -491,6 +515,9 @@ impl Engine {
         // ---- 4. pending → 调度派发（M3 P3-2 bin-packing）----
         self.dispatch_pending(now_epoch).await?;
 
+        // ---- 5. SLO 评估（1s 节流；enabled=false 直接返回）----
+        self.slo_tick(now_epoch);
+
         Ok(())
     }
 
@@ -505,7 +532,7 @@ impl Engine {
         }
         let grace = Duration::from_secs(self.params.reclaim_grace_secs.max(1));
         let now = std::time::Instant::now();
-        let mut reclaimed: Vec<(String, String, u64)> = Vec::new();
+        let mut reclaimed: Vec<(String, String, u64, bool, bool)> = Vec::new();
         {
             let mut table = self.mesh.table.lock().unwrap();
             let mut since = self.reclaim_since.lock().unwrap();
@@ -561,13 +588,14 @@ impl Engine {
                     rec.assignee_node = None;
                     rec.next_retry_at = None;
                     let attempts = rec.attempts;
+                    let warmpool = rec.correlation.as_deref() == Some("warmpool");
                     let rec_json = serde_json::to_value(rec)?;
                     let rev = self.mesh.next_rev();
                     self.mesh
                         .store
                         .append(&TaskEvent::up(&tid, rev, rec_json))?;
                     since.remove(&tid);
-                    reclaimed.push((tid, node, attempts));
+                    reclaimed.push((tid, node, attempts, retryable, warmpool));
                 }
             }
         }
@@ -575,8 +603,7 @@ impl Engine {
             return Ok(());
         }
         self.mesh.maybe_snapshot();
-        for (tid, node, attempts) in reclaimed {
-            let retryable = attempts <= self.params.reclaim_max_attempts as u64;
+        for (tid, node, attempts, retryable, warmpool) in reclaimed {
             tracing::warn!(
                 task_id = %tid,
                 node = %node,
@@ -584,6 +611,10 @@ impl Engine {
                 retryable,
                 "engine: 节点失联，回收任务（chaos reclaim）"
             );
+            if !retryable {
+                // 独立预算耗尽 → failed 终态，计入 SLO 失败样本。
+                self.finish_slo(&tid, false, warmpool);
+            }
             self.router.notify(
                 "task_reclaimed",
                 serde_json::json!({
@@ -596,6 +627,74 @@ impl Engine {
             );
         }
         Ok(())
+    }
+
+    /// v0.7 §7.2：终态 SLO 样本。起点取出即删除，保证每个任务只记一条；
+    /// 预热池任务不计入（调用方传入 warmpool 标记，样本丢弃）。
+    fn finish_slo(&self, task_id: &str, ok: bool, warmpool: bool) {
+        if !self.slo_cfg.enabled {
+            return;
+        }
+        let mut slo = self.mesh.slo.lock().unwrap();
+        let Some(ms) = slo.finish(task_id) else {
+            return;
+        };
+        if warmpool {
+            return;
+        }
+        slo.record(now_wall(), ms, ok);
+    }
+
+    /// 每秒评估一次 SLO 阈值/漂移；新告警写日志 + webhook（event=`slo_alert`）。
+    fn slo_tick(&self, now_epoch: i64) {
+        if !self.slo_cfg.enabled {
+            return;
+        }
+        {
+            let mut next = self.slo_next.lock().unwrap();
+            let now = std::time::Instant::now();
+            if now < *next {
+                return;
+            }
+            *next = now + Duration::from_secs(1);
+        }
+        let (pending, running) = {
+            let table = self.mesh.table.lock().unwrap();
+            (
+                table
+                    .values()
+                    .filter(|r| r.state == TaskState::Pending)
+                    .count(),
+                table
+                    .values()
+                    .filter(|r| r.state == TaskState::Running)
+                    .count(),
+            )
+        };
+        let fired = {
+            let mut slo = self.mesh.slo.lock().unwrap();
+            slo.evaluate(&self.slo_cfg, now_epoch, std::time::Instant::now(), pending)
+        };
+        for a in fired {
+            tracing::warn!(
+                kind = %a.kind,
+                value = a.value,
+                threshold = a.threshold,
+                "slo: 告警触发"
+            );
+            self.router.notify(
+                "slo_alert",
+                serde_json::json!({
+                    "kind": a.kind,
+                    "value": a.value,
+                    "threshold": a.threshold,
+                    "at": a.at,
+                    "queue_depth": pending,
+                    "running": running,
+                    "engine": self.node_id,
+                }),
+            );
+        }
     }
 
     /// P3-2：把表中 pending 且未分配的任务通过调度器派发到 candidate 节点。
@@ -1105,12 +1204,17 @@ impl Engine {
         };
         rec.to_agent = Some(to_agent.to_string());
         rec.assignee_node = Some(node_id.to_string());
+        let warmpool = rec.correlation.as_deref() == Some("warmpool");
         let rec_json = serde_json::to_value(rec)?;
         let rev = self.mesh.next_rev();
         drop(table);
         self.mesh
             .store
             .append(&TaskEvent::up(task_id, rev, rec_json))?;
+        if !warmpool {
+            // 派发即起点（幂等；apply_task_spec 已记过的任务不会重置）。
+            self.mesh.slo.lock().unwrap().touch(task_id);
+        }
         self.mesh.maybe_snapshot();
         Ok(())
     }
@@ -1173,6 +1277,7 @@ mod tests {
                     circuit: Default::default(),
                     warmpool: Default::default(),
                     reclaim: Default::default(),
+                    slo: Default::default(),
                 },
             },
             auth: AuthConfig::default(),
@@ -1207,6 +1312,7 @@ mod tests {
             },
             scheduled_nodes: std::sync::Mutex::new(std::collections::HashSet::new()),
             circuit: std::sync::Mutex::new(crate::circuit::Circuit::new()),
+            slo: std::sync::Mutex::new(crate::slo::SloState::new(None, false)),
         });
         state_inner.mesh = Some(mesh.clone());
         let state = Arc::new(state_inner);
@@ -1228,6 +1334,8 @@ mod tests {
                     ),
             ),
             reclaim_since: std::sync::Mutex::new(HashMap::new()),
+            slo_cfg: cfg.mesh.engine.slo.clone(),
+            slo_next: std::sync::Mutex::new(std::time::Instant::now()),
         };
         (state, mesh, engine)
     }
@@ -1552,6 +1660,51 @@ mod tests {
         assert_eq!(c.backoff_secs, 30); // 拍板：固定 30s
         assert!(c.drift_alert_only); // 拍板：drift 只告警
         assert_eq!(c.tick_ms, 200); // P99 <500ms 推论
+    }
+
+    #[tokio::test]
+    async fn slo_records_terminal_samples_and_skips_warmpool() {
+        let (_state, mesh, mut engine) = test_mesh();
+        mesh.slo.lock().unwrap().set_enabled(true);
+        engine.slo_cfg = crate::slo::SloConfig {
+            enabled: true,
+            min_samples: 1,
+            ..Default::default()
+        };
+        crate::reconcile::apply_task_spec(&mesh, &json!({"task_id": "slo-ok", "type": "text"}))
+            .unwrap();
+        crate::reconcile::apply_task_spec(
+            &mesh,
+            &json!({"task_id": "slo-warm", "type": "text", "correlation": "warmpool"}),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        for tid in ["slo-ok", "slo-warm"] {
+            let env = Envelope::business(
+                "orch",
+                "n1",
+                "text",
+                "task",
+                json!({"topic": "task_succeeded", "task_id": tid, "seq": 10}),
+                None,
+                None,
+                None,
+                Some("orch".into()),
+                Some("worker".into()),
+            );
+            engine.consume_event(&env).unwrap();
+        }
+        let snap =
+            mesh.slo
+                .lock()
+                .unwrap()
+                .snapshot(&engine.slo_cfg, crate::store::now_wall(), 0, 0);
+        assert_eq!(snap["samples"], 1, "预热池任务不得计入: {snap}");
+        assert!(
+            snap["p50_ms"].as_f64().unwrap() >= 30.0,
+            "耗时口径应含等待: {snap}"
+        );
+        assert_eq!(snap["errors"], 0);
     }
 
     #[tokio::test]

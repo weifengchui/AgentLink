@@ -181,6 +181,8 @@ pub struct MeshRuntime {
     /// 缺省关闭态为空 map、零记录——观察面（/v1/mesh/status 的 circuit_taints）
     /// 也保持空数组。std Mutex：临界区内同步操作、不跨 .await（与 table 同规）。
     pub circuit: Mutex<crate::circuit::Circuit>,
+    /// v0.7 §7.2 SLO 观测：窗口样本 + 历史基线 + 告警历史。缺省关闭态零采集。
+    pub slo: Mutex<crate::slo::SloState>,
 }
 
 impl MeshRuntime {
@@ -284,6 +286,14 @@ pub fn build_mesh(cfg: &Config, config_file: &Path) -> Option<Arc<MeshRuntime>> 
         license,
         scheduled_nodes: Mutex::new(HashSet::new()),
         circuit: std::sync::Mutex::new(crate::circuit::Circuit::new()),
+        slo: std::sync::Mutex::new(crate::slo::SloState::new(
+            if cfg.mesh.engine.slo.enabled {
+                Some(cfg.data_dir.join("slo_baseline.json"))
+            } else {
+                None
+            },
+            cfg.mesh.engine.slo.enabled,
+        )),
     }))
 }
 
@@ -355,6 +365,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/open-folder", post(open_folder))
         .route("/v1/config", get(config_get).put(config_put))
         .route("/v1/mesh/status", get(mesh_status_get))
+        .route("/v1/mesh/slo", get(mesh_slo_get))
         .route("/v1/metrics", get(metrics_get))
         .route("/v1/admission", get(admission_get))
         .route("/web", get(web_page))
@@ -512,6 +523,57 @@ async fn mesh_status_get(
             "engine": engine_stats,
         })),
     )
+}
+
+/// `GET /v1/mesh/slo` — v0.7 §7.2 SLO 告警 + 历史基线视图（只读）。
+/// mesh 关闭时也返回一致形状（enabled=false），便于探针无条件抓取。
+async fn mesh_slo_get(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized().into_response();
+    };
+    if !role.allows("/v1/mesh/slo") {
+        return forbidden().into_response();
+    }
+    let cfg = &state.config.mesh.engine.slo;
+    match &state.mesh {
+        Some(mesh) => {
+            let (pending, running) = {
+                let table = mesh.table.lock().unwrap();
+                (
+                    table
+                        .values()
+                        .filter(|r| r.state == TaskState::Pending)
+                        .count(),
+                    table
+                        .values()
+                        .filter(|r| r.state == TaskState::Running)
+                        .count(),
+                )
+            };
+            let mut slo = mesh.slo.lock().unwrap();
+            Json(slo.snapshot(cfg, crate::store::now_wall(), pending, running)).into_response()
+        }
+        None => Json(json!({
+            "enabled": false,
+            "window_seconds": cfg.window_seconds,
+            "samples": 0,
+            "errors": 0,
+            "error_rate": 0.0,
+            "p50_ms": 0.0,
+            "p95_ms": 0.0,
+            "p99_ms": 0.0,
+            "avg_ms": 0.0,
+            "baseline_ms": 0.0,
+            "baseline_samples": 0,
+            "drift_ratio": 0.0,
+            "anomaly": false,
+            "queue_depth": 0,
+            "running": 0,
+            "active": [],
+            "alerts": [],
+        }))
+        .into_response(),
+    }
 }
 
 /// M3 P3-4 / P0：Prometheus 指标端点（文本格式，供 Prometheus 抓取）。

@@ -25,6 +25,7 @@ mod reconcile;
 mod redact;
 mod router;
 mod scheduler;
+mod slo;
 mod store;
 mod taskengine;
 mod taskstore;

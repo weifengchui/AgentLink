@@ -1,0 +1,7 @@
+{"scenario": "S0 SLO 视图可读（enabled=true, 初始 samples=0）", "pass": true, "detail": {"enabled": true, "samples": 0}}
+{"scenario": "S1 样本/错误率正确（5 样本、1 失败、P99 含执行等待）", "pass": true, "detail": {"samples": 5, "errors": 1, "error_rate": 0.2, "p99_ms": 630.6}}
+{"scenario": "S2 四类阈值/漂移全部命中（p99/error_rate/drift/queue）", "pass": true, "detail": {"active": ["baseline_drift", "error_rate", "p99", "queue_depth"], "drift_ratio": 18.4, "baseline_ms": 24.1}}
+{"scenario": "S3 webhook 收到 4 类 slo_alert", "pass": true, "detail": {"kinds": ["baseline_drift", "error_rate", "p99", "queue_depth"], "deliveries": 4}}
+{"scenario": "S4 同类告警冷却（3s 内告警数不增）", "pass": true, "detail": {"alerts_before": 4, "alerts_after": 4}}
+{"scenario": "S5 未启用 SLO 的节点返回 enabled=false / samples=0", "pass": true, "detail": {"enabled": false, "samples": 0}}
+{"scenario": "S6 进程存活、日志无 panic", "pass": true, "detail": {"alive": 2, "panics": []}}

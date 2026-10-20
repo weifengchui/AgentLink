@@ -186,6 +186,9 @@ pub struct EngineConfig {
     /// 节点失联任务回收（v0.7 chaos 第一波）。缺省关闭——调度行为零变化。
     #[serde(default)]
     pub reclaim: ReclaimConfig,
+    /// SLO 告警 + 历史基线异常检测（v0.7 §7.2）。缺省关闭——零采集/零告警。
+    #[serde(default)]
+    pub slo: crate::slo::SloConfig,
 }
 
 /// 节点失联任务回收参数（v0.7 chaos / kill-node）。
@@ -472,6 +475,7 @@ impl Role {
                     | "/v1/agents"
                     | "/v1/fleet/agents"
                     | "/v1/metrics"
+                    | "/v1/mesh/slo"
             ),
             Role::Executor => matches!(
                 endpoint,
@@ -966,6 +970,7 @@ impl Default for EngineConfig {
             circuit: CircuitConfig::default(),
             warmpool: WarmpoolConfig::default(),
             reclaim: ReclaimConfig::default(),
+            slo: crate::slo::SloConfig::default(),
         }
     }
 }
