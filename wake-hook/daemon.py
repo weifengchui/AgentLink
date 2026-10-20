@@ -31,10 +31,27 @@ except Exception:
     wake_hook = None
 
 def resolve_config():
+    """找本机节点配置。
+
+    优先顺序（与 agentlink 二进制一致）：
+      1. AGENTLINK_CONFIG 环境变量；
+      2. 稳定位置（升级不覆盖）：Windows %LOCALAPPDATA%\\AgentLink\\agentlink.json
+         （WSL 侧映射到 /mnt/c/Users/*/AppData/Local/AgentLink/），或
+         Linux ~/.config/agentlink/agentlink.json；
+      3. 发行目录里的旧配置（已被二进制自动迁移到稳定位置，这里兜底读旧的）。
+    """
     import glob
     env = os.environ.get("AGENTLINK_CONFIG")
     if env and os.path.exists(env):
         return env
+    # 2) 稳定位置：Windows LOCALAPPDATA（WSL 可达）
+    for pat in ("/mnt/c/Users/*/AppData/Local/AgentLink/agentlink.json",
+                os.path.expanduser("~/.config/agentlink/agentlink.json"),
+                os.path.expanduser("~/.agentlink/agentlink.json")):
+        for p in sorted(glob.glob(pat)):
+            if os.path.isfile(p):
+                return p
+    # 3) 发行目录里的旧配置（按版本号取最新）
     cands = sorted(glob.glob("/mnt/e/Tools/AgentLink-v*/agentlink.json"),
                    key=lambda p: [int(x) for x in __import__("re").findall(r"\d+", p)])
     if cands:

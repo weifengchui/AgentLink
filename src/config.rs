@@ -15,6 +15,42 @@ pub const DEFAULT_BROADCAST_PORT: u16 = 8766;
 /// 锚点为准——重启绝不能把同一台机器变成网格里的“新节点”。
 pub const IDENTITY_FILE_NAME: &str = "node-identity.json";
 
+/// 稳定配置文件名。配置属于「机器数据」，和接收的文件一样不该跟着发行
+/// 目录被升级覆盖——所以它住在用户配置目录里，不在 exe 旁边。
+pub const STABLE_CONFIG_FILE_NAME: &str = "agentlink.json";
+
+/// 稳定配置文件的完整路径（用户级配置目录，升级永不覆盖）。
+///
+/// Windows: `%LOCALAPPDATA%\AgentLink\agentlink.json`
+/// Linux:   `$XDG_CONFIG_HOME/agentlink/agentlink.json`（或 `~/.config/agentlink/agentlink.json`）
+///
+/// 选用户配置目录而不是数据目录：配置是「怎么跑」的设定，data 是「跑了
+/// 什么」的产物，两者生命周期不同但都要脱离发行目录。Linux 侧这个路径
+/// 正是 wake-hook/al_watch.py 早就在找的 `~/.config/agentlink/agentlink.json`。
+pub fn stable_config_path() -> PathBuf {
+    #[cfg(windows)]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        return PathBuf::from(local)
+            .join("AgentLink")
+            .join(STABLE_CONFIG_FILE_NAME);
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            return PathBuf::from(xdg)
+                .join("agentlink")
+                .join(STABLE_CONFIG_FILE_NAME);
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join(".config")
+                .join("agentlink")
+                .join(STABLE_CONFIG_FILE_NAME);
+        }
+    }
+    PathBuf::from("./agentlink.json") // last-resort fallback
+}
+
 /// Top-level node configuration. Mirrors `docs/设计方案.md` §12.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {

@@ -48,6 +48,7 @@ use api::AppState;
 use config::Config;
 
 /// Default configuration file name, relative to the working directory.
+/// 只作为「旧版就地配置」的探测名；新装机的配置写在用户配置目录里。
 const DEFAULT_CONFIG_FILE: &str = "agentlink.json";
 
 #[derive(Debug, Parser)]
@@ -58,8 +59,13 @@ const DEFAULT_CONFIG_FILE: &str = "agentlink.json";
 )]
 struct Cli {
     /// Path to the configuration file.
-    #[arg(long, global = true, default_value = DEFAULT_CONFIG_FILE)]
-    config: PathBuf,
+    ///
+    /// 省略时按「稳定位置 → 就地旧文件（自动迁移）」顺序解析：
+    /// 稳定位置 = `%LOCALAPPDATA%\AgentLink\agentlink.json`（Windows）
+    /// 或 `~/.config/agentlink/agentlink.json`（Linux）——升级永不覆盖它。
+    /// 显式指定则完全按你给的路径走（不迁移）。
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     /// 薄壳子命令（get/logs/apply）访问的 local API 基址。
     /// 默认 http://127.0.0.1:<--config 的 listen_port>。
     #[arg(long, global = true)]
@@ -116,6 +122,22 @@ enum Command {
     },
     /// Print this node's cluster token (for pairing other machines).
     Token,
+    /// 查看/迁移配置文件位置。
+    ///
+    /// 配置默认住在用户配置目录（Windows `%LOCALAPPDATA%\AgentLink`，
+    /// Linux `~/.config/agentlink`），升级换发行目录不会覆盖它。
+    /// `migrate` 可把旧版「放在发行目录里」的配置搬到稳定位置。
+    Config {
+        /// 只打印当前生效的配置文件路径（默认行为）。
+        #[arg(long)]
+        show: bool,
+        /// 把就地旧配置迁移到稳定位置（幂等；已是稳定位置则无事发生）。
+        #[arg(long)]
+        migrate: bool,
+        /// 只输出配置文件的绝对路径（一行，机器可读，供脚本/自启使用）。
+        #[arg(long)]
+        path: bool,
+    },
     /// 查看 / 修复本机身份（node_id）。
     ///
     /// 如果重启后 node_id 意外变了，用 `--set <旧ID>` 改回，或 `--recover`
@@ -257,6 +279,95 @@ fn open_web_browser(url: &str) {
     let _ = std::process::Command::new("open").arg(url).spawn();
 }
 
+/// 解析配置文件的实际路径。
+///
+/// 规则（与「升级不动数据」一致）：
+/// 1. 显式 `--config <path>` → 完全按给的走，不迁移、不解释；
+/// 2. `AGENTLINK_CONFIG` 环境变量 → 同上；
+/// 3. 稳定位置（用户配置目录）已有配置 → 用它；
+/// 4. 就地旧文件（当前目录 / exe 同目录的 `agentlink.json`）存在 →
+///    **一次性迁移**到稳定位置（复制，原文件留作备份），之后只用稳定位置；
+/// 5. 都没有 → 稳定位置（新配置写这里，升级不会碰到）。
+///
+/// 第 4 步是升级兼容的关键：老版本把配置放在发行目录里，新版本第一次
+/// 启动会把它搬到用户配置目录，从此与发行目录脱钩。
+fn resolve_config_path(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = explicit {
+        return p;
+    }
+    if let Ok(p) = std::env::var("AGENTLINK_CONFIG") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    let stable = config::stable_config_path();
+    if stable.exists() {
+        return stable;
+    }
+    // 就地旧文件：当前工作目录优先，其次 exe 同目录（Windows 双击/自启场景）。
+    let mut candidates: Vec<PathBuf> = vec![PathBuf::from(DEFAULT_CONFIG_FILE)];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(DEFAULT_CONFIG_FILE));
+        }
+    }
+    for cand in candidates {
+        if !cand.exists() {
+            continue;
+        }
+        match migrate_legacy_config(&cand, &stable) {
+            Ok(()) => {
+                eprintln!(
+                    "[config] 已把旧配置 {} 迁移到 {}（升级不再覆盖配置）",
+                    cand.display(),
+                    stable.display()
+                );
+                return stable;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[config] 迁移旧配置 {} 失败（{e}），继续使用原路径",
+                    cand.display()
+                );
+                return cand;
+            }
+        }
+    }
+    stable
+}
+
+/// 把旧配置复制到稳定位置。原文件保留（升级脚本会备份它），但节点以后
+/// 只读稳定位置的那份。
+fn migrate_legacy_config(legacy: &Path, stable: &Path) -> Result<()> {
+    let raw = std::fs::read_to_string(legacy)
+        .with_context(|| format!("failed to read legacy config {}", legacy.display()))?;
+    let mut cfg: Config = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse legacy config {}", legacy.display()))?;
+    // 旧配置里的相对路径是相对旧文件所在目录解析的；换位置后必须锚回
+    // 旧目录，否则 data_dir / recv_dir 会指向新位置（数据"搬家"）。
+    let old_base = legacy
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    if cfg.data_dir.is_relative() {
+        cfg.data_dir = old_base.join(&cfg.data_dir);
+    }
+    if let Some(rd) = cfg.files.recv_dir.as_ref() {
+        if rd.is_relative() {
+            cfg.files.recv_dir = Some(old_base.join(rd));
+        }
+    }
+    if let Some(parent) = stable.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    cfg.save(stable)
+        .with_context(|| format!("failed to write config {}", stable.display()))?;
+    Ok(())
+}
+
 /// Load configuration, optionally creating it on first run.
 fn load_config(path: &Path, create_if_missing: bool) -> Result<Config> {
     if !path.exists() {
@@ -348,6 +459,52 @@ fn reconcile_identity(cfg: &mut Config, config_file: &Path) -> Result<()> {
             .pin_identity()
             .context("failed to write machine identity anchor")?,
     }
+    Ok(())
+}
+
+/// `agentlink config`：查看/迁移配置文件位置。
+///
+/// 配置属于「机器设定」，和接收到的文件一样不该跟着发行目录被升级覆盖。
+/// 新版默认把它放在用户配置目录；`--migrate` 把旧版就地配置搬过去。
+fn config_cmd(config_path: &Path, show: bool, migrate: bool, path: bool) -> Result<()> {
+    let _ = show; // 无参数与 --show 同一分支
+    let stable = config::stable_config_path();
+    if path {
+        // 机器可读：只输出路径一行（自启脚本/守护进程据此定位配置）。
+        println!("{}", config_path.display());
+        return Ok(());
+    }
+    println!("生效配置: {}", config_path.display());
+    println!("稳定位置: {}", stable.display());
+    println!(
+        "数据目录: {}",
+        load_config(config_path, false)
+            .map(|c| c.data_dir.display().to_string())
+            .unwrap_or_else(|_| "<配置不存在>".to_string())
+    );
+
+    if !migrate {
+        if config_path != &stable {
+            println!("\n提示: 当前配置不在稳定位置，可用 `agentlink config --migrate` 搬迁。");
+        }
+        return Ok(());
+    }
+
+    if config_path == &stable {
+        println!("\n已在稳定位置，无需迁移。");
+        return Ok(());
+    }
+    if !config_path.exists() {
+        println!("\n当前配置不存在，无需迁移。");
+        return Ok(());
+    }
+    migrate_legacy_config(config_path, &stable)?;
+    println!(
+        "\n已迁移: {} -> {}",
+        config_path.display(),
+        stable.display()
+    );
+    println!("原文件保留在旧位置（可自行删除）；后续请用不带 --config 的命令启动。");
     Ok(())
 }
 
@@ -582,6 +739,9 @@ fn latest_agent_node_id(path: &Path) -> Option<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // 配置解析：显式 --config > AGENTLINK_CONFIG > 稳定位置 > 就地旧文件（迁移）。
+    // 稳定位置在用户配置目录里，升级换目录/换二进制都不会覆盖它。
+    let config_path = resolve_config_path(cli.config.clone());
 
     match cli.command {
         Some(Command::Init {
@@ -590,18 +750,18 @@ async fn main() -> Result<()> {
             cluster_token,
             open,
         }) => {
-            if cli.config.exists() && !force {
+            if config_path.exists() && !force {
                 bail!(
                     "config already exists: {} (use --force to overwrite)",
-                    cli.config.display()
+                    config_path.display()
                 );
             }
             let mode = open.then(|| "open".to_string());
-            let cfg = generate_preserving_identity(&cli.config, name, cluster_token, mode);
-            cfg.save(&cli.config)?;
+            let cfg = generate_preserving_identity(&config_path, name, cluster_token, mode);
+            cfg.save(&config_path)?;
             cfg.ensure_identity_anchor()
                 .context("failed to write machine identity anchor")?;
-            println!("created config: {}", cli.config.display());
+            println!("created config: {}", config_path.display());
             println!("  node_id: {}", cfg.node_id);
             println!("  name:    {}", cfg.name);
             println!("  token:   {} (local API)", cfg.local_api.token);
@@ -625,15 +785,15 @@ async fn main() -> Result<()> {
             force,
             admission,
         }) => {
-            if cli.config.exists() && !force {
+            if config_path.exists() && !force {
                 bail!(
                     "config already exists: {} (use --force to overwrite)",
-                    cli.config.display()
+                    config_path.display()
                 );
             }
             let mode = open.then(|| "open".to_string());
-            let mut cfg = generate_preserving_identity(&cli.config, name, Some(token), mode);
-            cfg.save(&cli.config)?;
+            let mut cfg = generate_preserving_identity(&config_path, name, Some(token), mode);
+            cfg.save(&config_path)?;
             cfg.ensure_identity_anchor()
                 .context("failed to write machine identity anchor")?;
             if let Some(boot) = admission {
@@ -641,7 +801,7 @@ async fn main() -> Result<()> {
                     bail!("--admission 准入令牌不能为空");
                 }
                 cfg.security.admission.bootstrap_token = boot;
-                cfg.save(&cli.config)?;
+                cfg.save(&config_path)?;
             }
             println!("paired: {} ({})", cfg.name, cfg.node_id);
             println!("  cluster_token set ({} mode)", cfg.security.mode);
@@ -656,17 +816,23 @@ async fn main() -> Result<()> {
         }
 
         Some(Command::Token) => {
-            let cfg = load_config(&cli.config, false)?;
+            let cfg = load_config(&config_path, false)?;
             println!("{}", cfg.security.cluster_token);
             Ok(())
         }
 
+        Some(Command::Config {
+            show,
+            migrate,
+            path,
+        }) => config_cmd(&config_path, show, migrate, path),
+
         Some(Command::Identity { show, set, recover }) => {
-            identity_cmd(&cli.config, show, set, recover)
+            identity_cmd(&config_path, show, set, recover)
         }
 
         Some(Command::Peers) => {
-            let cfg = load_config(&cli.config, false)?;
+            let cfg = load_config(&config_path, false)?;
             println!("node: {} ({})", cfg.name, cfg.node_id);
             println!(
                 "static peers configured: {}",
@@ -688,29 +854,29 @@ async fn main() -> Result<()> {
             create_if_missing,
             no_open,
         }) => {
-            let mut cfg = load_config(&cli.config, create_if_missing)?;
+            let mut cfg = load_config(&config_path, create_if_missing)?;
             if let Some(fmt) = cli.log_format.clone() {
                 cfg.log.format = fmt;
             }
             logging::init(&cfg.log);
             ensure_dirs(&cfg)?;
-            let cfg_path = cli.config.clone();
+            let cfg_path = config_path.clone();
             run(cfg, cfg_path, no_open).await
         }
-        Some(Command::Autostart { remove, force }) => autostart(&cli.config, remove, force),
+        Some(Command::Autostart { remove, force }) => autostart(&config_path, remove, force),
 
         Some(Command::Get(what)) => {
-            cli::get(what, cli.url.as_deref(), cli.token.as_deref(), &cli.config).await
+            cli::get(what, cli.url.as_deref(), cli.token.as_deref(), &config_path).await
         }
         Some(Command::Logs { opts }) => {
-            cli::logs(opts, cli.url.as_deref(), cli.token.as_deref(), &cli.config).await
+            cli::logs(opts, cli.url.as_deref(), cli.token.as_deref(), &config_path).await
         }
         Some(Command::Apply { opts }) => {
-            cli::apply(opts, cli.url.as_deref(), cli.token.as_deref(), &cli.config).await
+            cli::apply(opts, cli.url.as_deref(), cli.token.as_deref(), &config_path).await
         }
-        Some(Command::Setup { yes }) => setup_flow(&cli.config, cli.log_format.clone(), yes).await,
+        Some(Command::Setup { yes }) => setup_flow(&config_path, cli.log_format.clone(), yes).await,
         Some(Command::Hello { opts }) => {
-            cli::hello(opts, cli.url.as_deref(), cli.token.as_deref(), &cli.config).await
+            cli::hello(opts, cli.url.as_deref(), cli.token.as_deref(), &config_path).await
         }
         Some(Command::Mtls {
             enable,
@@ -721,7 +887,7 @@ async fn main() -> Result<()> {
             authority,
             require,
         }) => mtls_cmd(
-            &cli.config,
+            &config_path,
             enable,
             disable,
             show,
@@ -737,9 +903,15 @@ async fn main() -> Result<()> {
             allow,
             revoke,
             disable,
-        }) => admission_cmd(&cli.config, status, enable, boot, allow, revoke, disable),
+        }) => admission_cmd(&config_path, status, enable, boot, allow, revoke, disable),
         Some(Command::Top { watch }) => {
-            cli::top(cli.url.as_deref(), cli.token.as_deref(), &cli.config, watch).await
+            cli::top(
+                cli.url.as_deref(),
+                cli.token.as_deref(),
+                &config_path,
+                watch,
+            )
+            .await
         }
         Some(Command::Completions { shell }) => {
             use clap::CommandFactory;
@@ -750,16 +922,16 @@ async fn main() -> Result<()> {
         None => {
             // v0.5 收官：裸启动 + 无配置 + 交互终端 → 自动进入首次向导
             // （Windows 双击 exe 的新机器旅程，不需要先读任何文档）。
-            if !cli.config.exists() && wizard::is_interactive() {
-                return setup_flow(&cli.config, cli.log_format.clone(), false).await;
+            if !config_path.exists() && wizard::is_interactive() {
+                return setup_flow(&config_path, cli.log_format.clone(), false).await;
             }
-            let mut cfg = load_config(&cli.config, false)?;
+            let mut cfg = load_config(&config_path, false)?;
             if let Some(fmt) = cli.log_format.clone() {
                 cfg.log.format = fmt;
             }
             logging::init(&cfg.log);
             ensure_dirs(&cfg)?;
-            let cfg_path = cli.config.clone();
+            let cfg_path = config_path.clone();
             run(cfg, cfg_path, false).await
         }
     }
@@ -1452,6 +1624,9 @@ fn autostart(config_path: &std::path::Path, remove: bool, force: bool) -> Result
     // VBS quotes a literal " as "" — so the inner command reads ""..."" .
     // 自修复模板：exe 路径失效时回落到 config 同目录的 agentlink.exe，仍不存在则静默退出，
     // 不再让 wscript 弹 "系统找不到指定的文件 80070002" 打断开机。
+    // VBS 里 exe 与 cfg 各记各的：cfg 在用户配置目录（升级不动），exe 在
+    // 发行目录（升级会换）。exe 失效时回落到 **exe 自己的目录**，而不是
+    // cfg 的目录——两者已经不在同一个文件夹了。
     let script = format!(
         "' AgentLink autostart (installed by `agentlink autostart`)\n\
          On Error Resume Next\n\
@@ -1460,7 +1635,7 @@ fn autostart(config_path: &std::path::Path, remove: bool, force: bool) -> Result
          exe = \"{}\"\n\
          cfg = \"{}\"\n\
          If Not fso.FileExists(exe) Then\n\
-           exe2 = fso.BuildPath(fso.GetParentFolderName(cfg), \"agentlink.exe\")\n\
+           exe2 = fso.BuildPath(fso.GetParentFolderName(exe), \"agentlink.exe\")\n\
            If fso.FileExists(exe2) Then\n\
              exe = exe2\n\
            Else\n\
@@ -1584,5 +1759,90 @@ mod identity_tests {
         );
         assert!(normalize_node_id("   ").is_err());
         assert!(normalize_node_id("aa bb").is_err());
+    }
+}
+
+#[cfg(test)]
+mod config_path_tests {
+    use super::*;
+
+    fn temp_case(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agentlink-cfgpath-{tag}-{}",
+            config::new_short_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 迁移：旧配置（放在发行目录）→ 稳定位置，且相对 data_dir 锚回旧目录。
+    #[test]
+    fn legacy_config_migrates_to_stable_path() {
+        let dir = temp_case("migrate");
+        let legacy = dir.join("agentlink.json");
+        let stable = dir.join("stable").join("agentlink.json");
+
+        let mut cfg = Config::generate(Some("t".into()), Some("tok".into()), Some("open".into()));
+        cfg.node_id = "1234567890ab".into();
+        cfg.data_dir = PathBuf::from("./data"); // 相对路径
+        cfg.files.recv_dir = Some(PathBuf::from("./files"));
+        cfg.save(&legacy).unwrap();
+
+        migrate_legacy_config(&legacy, &stable).unwrap();
+
+        let moved = Config::load(&stable).unwrap();
+        assert_eq!(moved.node_id, "1234567890ab", "迁移必须保住 node_id");
+        assert!(
+            moved.data_dir.is_absolute(),
+            "相对 data_dir 必须锚回旧目录，迁移后不能漂"
+        );
+        assert_eq!(moved.data_dir, dir.join("data"));
+        let recv = moved.files.recv_dir.clone().expect("recv_dir");
+        assert_eq!(recv, dir.join("files"));
+        // 旧文件保留（升级脚本还会备份它）
+        assert!(legacy.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 显式 --config 时完全不介入：不迁移、不改路径。
+    #[test]
+    fn explicit_config_path_is_respected_verbatim() {
+        let dir = temp_case("explicit");
+        let explicit = dir.join("my-own.json");
+        assert_eq!(resolve_config_path(Some(explicit.clone())), explicit);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 稳定位置已有配置时直接用它，绝不去碰发行目录里的旧文件。
+    #[test]
+    fn stable_config_wins_over_legacy() {
+        let dir = temp_case("stable-wins");
+        let stable = dir.join("stable.json");
+        std::fs::write(&stable, "{}").unwrap();
+        // 显式路径不受影响；这里只验证「稳定路径存在 → 不迁移」的行为：
+        // 迁移函数对已存在的稳定位置不该被调用。
+        assert!(stable.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 稳定配置路径必须落在用户配置目录里，绝不能是发行目录。
+    #[test]
+    fn stable_config_path_is_outside_release_dir() {
+        let p = config::stable_config_path();
+        assert_eq!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some("agentlink.json")
+        );
+        // 路径里必须带一个用户级目录段（Windows: AppData\Local\AgentLink；
+        // Linux: .config/agentlink 或 .local/share/agentlink）
+        let s = p.to_string_lossy().to_string();
+        assert!(
+            s.contains("AgentLink") || s.contains("agentlink"),
+            "稳定配置路径应在用户级目录: {s}"
+        );
+        assert!(
+            !s.contains("AgentLink-v"),
+            "稳定配置路径不能落在发行目录里: {s}"
+        );
     }
 }

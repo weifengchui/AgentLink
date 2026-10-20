@@ -14,10 +14,15 @@ if not errorlevel 1 (
     exit /b
 )
 
+rem 配置住在用户配置目录（升级换目录也不覆盖），问二进制要生效路径
+set "CFG="
+for /f "usebackq delims=" %%p in (`"%~dp0agentlink.exe" config --path`) do set "CFG=%%p"
+if not defined CFG set "CFG=%LOCALAPPDATA%\AgentLink\agentlink.json"
+
 if defined ARG goto :witharg
 
 rem 没有参数：确保有配置，自动免密初始化并启动
-if not exist agentlink.json (
+if not exist "%CFG%" (
     "%~dp0agentlink.exe" init --open --force
     if errorlevel 1 (
         echo [错误] 初始化失败。请确认本目录下有 agentlink.exe。
@@ -25,6 +30,7 @@ if not exist agentlink.json (
         exit /b
     )
     echo 已自动创建配置（免密互信模式 --open）。
+    echo 配置文件位置: %CFG%
     echo 局域网内所有机器双击本脚本即可互通。
 )
 goto :run
@@ -44,13 +50,14 @@ if errorlevel 1 (
 echo 配对成功（strict 模式）.
 
 :run
-rem -- ensure per-user autostart (Startup folder, silent) --
-"%~dp0agentlink.exe" autostart --force >nul 2>&1
+rem -- ensure per-user autostart (Startup folder, silent) --
+"%~dp0agentlink.exe" autostart --force >nul 2>&1
 echo 启动 AgentLink... （关闭本窗口即停止）
 "%~dp0agentlink.exe" run
+
 echo.
 echo [已退出] 常见原因：
-echo   - 端口 8765 被占用（改 agentlink.json 的 listen_port）
+echo   - 端口 8765 被占用（改 %CFG% 的 listen_port）
 echo   - Windows 防火墙未放行 8765/8766
 echo   - 运行异常（可看上方日志）
 echo.

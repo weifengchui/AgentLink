@@ -168,13 +168,24 @@ def main():
             pass
 
         # 3) 备份
+        #    配置可能住在用户配置目录（v0.6.1 起：%LOCALAPPDATA%\AgentLink\
+        #    或 ~/.config/agentlink/），不在发行目录里——备份真实的 --config
+        #    路径，别只盯 node_dir 下的旧位置。
         ts = time.strftime("%Y%m%d-%H%M%S")
         bak = os.path.join(node_dir, "backups", f"v{old_version}_{ts}")
         os.makedirs(bak, exist_ok=True)
-        for f in (exe_name, "agentlink.json", "启动.bat"):
+        for f in (exe_name, "启动.bat"):
             src = os.path.join(node_dir, f)
             if os.path.exists(src):
                 shutil.copy2(src, bak)
+        # 真实生效的配置（--config 指向的那份）单独备份，名字固定 config.json
+        cfg_real = os.path.abspath(args.config)
+        if os.path.exists(cfg_real):
+            shutil.copy2(cfg_real, os.path.join(bak, "config.json"))
+        # 兼容旧布局：发行目录里若还留着 agentlink.json，也一并备份
+        legacy_cfg = os.path.join(node_dir, "agentlink.json")
+        if os.path.exists(legacy_cfg):
+            shutil.copy2(legacy_cfg, os.path.join(bak, "agentlink.json"))
         result["backup"] = os.path.relpath(bak, node_dir)
         print(f"[upgrade] backup -> {bak}")
 
@@ -190,7 +201,11 @@ def main():
             restored = False
             try:
                 shutil.copy2(os.path.join(bak, exe_name), exe_path)
-                if os.path.exists(os.path.join(bak, "agentlink.json")):
+                # 还原真实生效的配置（v0.6.1 起它可能不在发行目录里）
+                bak_cfg = os.path.join(bak, "config.json")
+                if os.path.exists(bak_cfg):
+                    shutil.copy2(bak_cfg, cfg_real)
+                elif os.path.exists(os.path.join(bak, "agentlink.json")):
                     shutil.copy2(os.path.join(bak, "agentlink.json"),
                                  os.path.join(node_dir, "agentlink.json"))
                 restored = True
@@ -218,7 +233,10 @@ def main():
             print(f"[upgrade] health 未达标（{h}），开始回滚…")
             kill_node(base)
             shutil.copy2(os.path.join(bak, exe_name), exe_path)
-            if os.path.exists(os.path.join(bak, "agentlink.json")):
+            bak_cfg = os.path.join(bak, "config.json")
+            if os.path.exists(bak_cfg):
+                shutil.copy2(bak_cfg, cfg_real)
+            elif os.path.exists(os.path.join(bak, "agentlink.json")):
                 shutil.copy2(os.path.join(bak, "agentlink.json"), os.path.join(node_dir, "agentlink.json"))
             start_node(node_dir)
             ok2, h2, ms2 = wait_health(base, old_version, args.health_timeout)

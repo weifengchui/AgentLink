@@ -21,13 +21,23 @@ CTL_HOST, CTL_PORT = "127.0.0.1", int(os.environ.get("BRIDGE_PORT", "8767"))
 NODE_API   = "http://127.0.0.1:8765"
 
 def resolve_config():
+    """找本机节点配置：AGENTLINK_CONFIG > 稳定位置 > 发行目录旧配置。
+
+    稳定位置与 agentlink 二进制一致（Windows %LOCALAPPDATA%\\AgentLink\\，
+    Linux ~/.config/agentlink/）——升级换发行目录不会动它。
+    """
     if os.environ.get("AGENTLINK_CONFIG"):
         return os.environ["AGENTLINK_CONFIG"]
-    cands = glob.glob("/mnt/e/Tools/AgentLink-v*/agentlink.json")
     real_home = os.path.expanduser("~")
-    for extra in (os.path.join(real_home, ".config", "agentlink", "agentlink.json"),
-                  os.path.join(real_home, ".agentlink", "agentlink.json"),
-                  os.path.join(real_home, "agentlink.json")):
+    # 稳定位置优先（升级不覆盖）
+    for pat in ("/mnt/c/Users/*/AppData/Local/AgentLink/agentlink.json",
+                os.path.join(real_home, ".config", "agentlink", "agentlink.json"),
+                os.path.join(real_home, ".agentlink", "agentlink.json")):
+        for p in sorted(glob.glob(pat)):
+            if os.path.isfile(p):
+                return p
+    cands = glob.glob("/mnt/e/Tools/AgentLink-v*/agentlink.json")
+    for extra in (os.path.join(real_home, "agentlink.json"),):
         if os.path.isfile(extra):
             cands.append(extra)
     if not cands:

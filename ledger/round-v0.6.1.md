@@ -2,30 +2,64 @@
 
 ## 事由
 
-用户报：**重启 AgentLink 后 node_id 变了**——同一台机器在 Mesh 里被当成新节点。
-排查定位到两类根因：
+用户连续报两件事：
 
-1. 从新发行目录 / 新 `agentlink.json` 启动 → 配置不存在 → 重新 `init` 生成随机 node_id；
-2. 配置被 `init --force` 覆盖、被删、或半截写入（旧 `Config::save()` 非原子写）→
-   旧身份随配置一起丢失（同 2026-10-13 `.7` 号机事故同源）。
+1. **重启 AgentLink 后 node_id 变了** —— 同一台机器在 Mesh 里被当成新节点；
+2. **`agentlink.json` 放在应用目录里**，升级换目录/换二进制会被覆盖 ——
+   「接收到的文件升级不动，配置也不应该动」。
 
-## 修复（身份铁律：node_id 一旦生成，永不变）
+## 修复一：身份铁律（node_id 永不变）
 
 新增**机器身份锚点** `<data_dir>/node-identity.json`（原子写）：
 
 - 启动时 `reconcile_identity()`：锚点存在即以锚点为准，配置里 node_id 漂移就地修回并落盘；
-- `generate_preserving_identity()`：配置文件完全不存在时（换目录 / 重建）也沿用锚点；
+- `generate_preserving_identity()`：配置文件完全不存在时也沿用锚点（换目录不换身份）；
 - `Config::load()`：node_id 缺失/为空 → 先从锚点恢复再校验；
-- `Config::save()`：改为 temp + fsync + rename（原子写），进程被杀不留半截 JSON。
+- `Config::save()`：改 temp+fsync+rename 原子写，进程被杀不留半截 JSON。
 
-**补救入口** `agentlink identity`（新增子命令）：
+**补救入口** `agentlink identity`：
 
 - `identity` —— 查看当前 node_id / 锚点路径 / DRIFT 状态；
 - `identity --set <旧ID>` —— 显式改回旧身份（同时覆盖配置 + 锚点，改完需重启）；
 - `identity --recover` —— 从 backups/、upgrade-ledger.jsonl、出站历史、agents.json
   自动找回上一个身份（列候选，采用第一个）。
 
-## 附带修复：Windows 目标编译失败
+## 修复二：配置位置隔离（升级不覆盖配置）
+
+配置搬到**用户配置目录**，不再跟着发行目录走：
+
+| 平台 | 稳定位置 |
+|------|----------|
+| Windows | `%LOCALAPPDATA%\AgentLink\agentlink.json` |
+| Linux | `$XDG_CONFIG_HOME/agentlink/agentlink.json`（或 `~/.config/agentlink/agentlink.json`） |
+
+`resolve_config_path()` 解析顺序：
+
+1. 显式 `--config <path>` → 完全按给的走，**不迁移、不解释**；
+2. `AGENTLINK_CONFIG` 环境变量 → 同上；
+3. 稳定位置已有配置 → 用它；
+4. 就地旧文件（当前目录 / exe 同目录的 `agentlink.json`）存在 →
+   **自动复制**到稳定位置，之后只用稳定位置那份；
+5. 都没有 → 稳定位置（新配置写这里）。
+
+迁移细节（`migrate_legacy_config`）：node_id / local_api.token / cluster_token /
+端口 / 模式全部原样保留；**相对 `data_dir` / `files.recv_dir` 锚回旧目录**
+（否则配置换位置会让数据"搬家"）；旧文件保留在原地。
+
+**新命令** `agentlink config`：`config`（看路径）/ `config --migrate`（手动迁移，幂等）/
+`config --path`（只输出一行路径，机器可读）。
+
+**配套改动**：
+- `启动.bat`：改问二进制要配置路径（`for /f` 读 `config --path`），不再依赖本目录的
+  agentlink.json；`run` 不带 `--config`，走内置解析。
+- 自启 VBS：exe 失效时的回落逻辑修正 —— 原来从 **cfg 目录**找 exe（现在 exe 与 cfg
+  已不同目录），改为从 **exe 自己的目录**找。
+- systemd 单元：仍用 `/etc/agentlink/agentlink.json`（发行目录外的固定位置，符合同一原则）。
+- wake-hook `daemon.py` / `hermes_bridge.py` / `bridge.sh`：配置发现改为优先稳定位置。
+- `dist/upgrade_runner.py`：备份/回滚改用真实的 `--config` 路径（`config.json`），
+  旧布局的 `agentlink.json` 仍兼容。
+
+## 修复三：Windows 目标编译失败（附带）
 
 `src/load.rs` 的 wmic/PowerShell 探测把 `probe_shell()` 的 `Option<u32>` 当 `Result` 用
 （`if let Ok(pct) = ...`），导致 v0.6 起 **Windows 交叉编译直接失败**——
@@ -34,28 +68,36 @@
 
 ## 验证
 
-- `cargo test --bin agentlink`：195/195 PASS
+- `cargo test --bin agentlink`：199/199 PASS
 - `cargo fmt --check`：OK
-- `tests/node_identity_smoke.py`：12/12 PASS（配置漂移自修 / `--set` 改回 / `--recover` 从备份找回 /
-  换目录重新 init 不换身份）
-- **生产节点（192.168.1.50 / `4f793d7cd6fc`）实跑演练**（Windows，v0.6.1 新二进制）：
-  1. `identity` → `status: unpinned`（首次）→ `--set` 写锚点 → `status: pinned`；
-  2. 配置改成 `deadbeef1234` → `identity` 正确报 `status: DRIFT`；
-  3. `identity --recover` → 自动找回 `4f793d7cd6fc`（来源：身份锚点），配置与锚点同步修回；
-  4. 模拟「配置被重建」重启 → health 仍报 `4f793d7cd6fc`，配置文件被自动修回；
-  5. 模拟「配置被删除」`run --create-if-missing` → 重建的配置 node_id 仍是 `4f793d7cd6fc`；
-  6. 恢复原配置重启 → `name=B / tags=[main] / node_id=4f793d7cd6fc / version=0.6.1` 正常。
+- `tests/node_identity_smoke.py`：12/12 PASS
+- `tests/config_location_smoke.py`：10/10 PASS
+- **生产节点实跑演练**（Windows，v0.6.1，192.168.1.50 / `4f793d7cd6fc`）：
+
+| 场景 | 结果 |
+|------|------|
+| 首次运行 | 自动把 `E:\Tools\AgentLink-v0.4.4\agentlink.json` 迁到 `C:\Users\yxf\AppData\Local\AgentLink\agentlink.json`，node_id/name/tags/data_dir 全保留 |
+| 配置漂移成 `deadbeef1234` | `identity` 正确报 `status: DRIFT`；`--recover` 自动找回 `4f793d7cd6fc` |
+| 配置被重建 | 重启后 health 仍 `4f793d7cd6fc`，配置自动修回 |
+| 配置被删除 | `run --create-if-missing` 重建的配置 node_id 仍 `4f793d7cd6fc` |
+| **发行目录配置被覆盖成 `999999999999`/NEW-RELEASE** | **重启后仍 `node_id=4f793d7cd6fc` name=B**（用稳定位置那份） |
+| **发行目录配置文件整个移走** | **重启后仍 `4f793d7cd6fc` / name=B / tags=[main]** |
+| 新的 `启动.bat` | 正常启动；自启 VBS 的 `cfg` 已指向 `%LOCALAPPDATA%\AgentLink\agentlink.json` |
 
 ## 产物
 
 - `dist/AgentLink-v0.6.1.zip`（9 文件，win/linux 双二进制）
-  sha256 = `4c68d2981e0db89e7343f1fb9742e0cb7b8712ada402d1130654be950af18d5a`（6,512,647 B）
+  sha256 = `733d5bbe0427fa8bf350c4f74c535d480cd373bd277f2c03995824582db122db`（6,520,000 B）
 - `dist/pkg0621/`（平铺九件套）、`dist/agentlink.exe`、`dist/agentlink-linux`
 - 版本号 0.6.0 → 0.6.1
 
 ## 现场状态
 
-生产节点已就地升级为 v0.6.1 并在役：`node_id=4f793d7cd6fc`、name=B、tags=[main]、
-锚点 `C:\Users\yxf\AppData\Local\AgentLink\data\node-identity.json` 已写。
-旧二进制备份 `agentlink.exe.bak-20261020`。
+生产节点就地升级为 v0.6.1 并在役：
+`node_id=4f793d7cd6fc` / name=B / tags=[main] / version=0.6.1；
+配置已迁到 `C:\Users\yxf\AppData\Local\AgentLink\agentlink.json`；
+身份锚点 `...\data\node-identity.json` 已写；
+自启 VBS 指向稳定配置路径。旧二进制备份 `agentlink.exe.bak-20261020`。
+发行目录里的 `agentlink.json` 保留作备份，但**不再被使用**（可自行删除）。
+
 对端 .7/.10/.60 本轮 8765 端口均不可达（节点未运行），peers 为空属正常，非本次改动所致。

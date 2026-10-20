@@ -1,6 +1,6 @@
-## v0.6.1 发布物说明（2026-10-20，机器身份铁律 + Windows 目标修复）
+## v0.6.1 发布物说明（2026-10-20，机器身份铁律 + 配置位置隔离 + Windows 目标修复）
 
-**核心：node_id 一旦生成就永不变——重启、换发行目录、配置被删/重建/`init --force` 都不会换身份。**
+**核心 1：node_id 一旦生成就永不变——重启、换发行目录、配置被删/重建/`init --force` 都不会换身份。**
 
 - **身份锚点**：node_id 另存 `<data_dir>/node-identity.json`（原子写）。启动时以锚点为准，
   配置里的 node_id 若漂移会被就地修回并重新落盘；配置缺失/半截写入时从锚点恢复。
@@ -10,13 +10,33 @@
   - `... identity --set <旧node_id>` —— 显式改回旧身份（同时改配置 + 锚点，改完需重启）；
   - `... identity --recover` —— 从 backups/、upgrade-ledger.jsonl、出站历史、agents.json
     自动找回上一个身份并恢复（列出全部候选）。
-- **配置原子写**：`Config::save()` 改为临时文件 + fsync + rename，进程被杀不再留半截 JSON。
-- **Windows 目标修复**：`src/load.rs` 的 wmic/PowerShell 探测把 `Option` 当 `Result` 用，
-  导致 v0.6 起 Windows 交叉编译失败（此前 Windows 节点停留在 v0.5.10）。本版起可正常编译 Windows 版。
+
+**核心 2：配置和接收到的文件一样，是"机器数据"，升级不覆盖。**
+
+- **配置搬到用户配置目录**，不再跟着发行目录走：
+  - Windows: `%LOCALAPPDATA%\AgentLink\agentlink.json`
+  - Linux:   `~/.config/agentlink/agentlink.json`
+- **一次性自动迁移**：旧版放在发行目录里的 `agentlink.json`，新版第一次启动会自动
+  复制到稳定位置（node_id/token/data_dir 全部保留；相对 `data_dir` 锚回旧目录，
+  数据不搬家），旧文件留作备份。之后升级换目录、换二进制都不会再动配置。
+- **配置查找顺序**：显式 `--config` > `AGENTLINK_CONFIG` 环境变量 > 稳定位置 >
+  就地旧文件（自动迁移）。显式指定时完全不介入，不迁移、不改路径。
+- **新命令 `agentlink config`**：
+  - `agentlink config` —— 打印生效路径 / 稳定位置 / 数据目录；
+  - `agentlink config --migrate` —— 手动触发迁移（幂等）；
+  - `agentlink config --path` —— 只输出一行路径（机器可读，自启脚本用）。
+- **配套改动**：`启动.bat` 改问二进制要配置路径（不再依赖本目录的 agentlink.json）；
+  自启 VBS 的 exe 回落逻辑修正（原来从 cfg 目录找 exe，现在从 exe 自己的目录找）；
+  systemd 单元仍用 `/etc/agentlink/agentlink.json`（同样是发行目录外的固定位置）；
+  wake-hook 的 daemon.py / hermes_bridge.py / bridge.sh 配置发现改为优先稳定位置。
+
+**附带修复**：`src/load.rs` 的 wmic/PowerShell 探测把 `Option` 当 `Result` 用，
+导致 v0.6 起 Windows 交叉编译失败（此前 Windows 节点停留在 v0.5.10）。本版起可正常编译 Windows 版。
+
 - 协议与消息格式不变，0.5.x/0.6.0 混布兼容；配置文件向后兼容（无 node-identity.json 的旧节点首次启动自动补写）。
 
-发布包：`AgentLink-v0.6.1.zip`（9 文件，win/linux 双二进制）
-sha256 = `4c68d2981e0db89e7343f1fb9742e0cb7b8712ada402d1130654be950af18d5a`（6,512,647 B）
+发布包：`AgentLink-v0.6.1.zip`（9 文件，win/linux 双二进制）。
+sha256 见仓库 `ledger/round-v0.6.1.md`（README 不写自身 sha，避免自引用）。
 
 ## v0.5.6 发布物说明（2026-10-17，Web 控制台第十三/十四轮，协议兼容 0.5.x）
 

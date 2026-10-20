@@ -9,6 +9,9 @@ Type=simple
 User=agentlink
 Group=agentlink
 WorkingDirectory=/var/lib/agentlink
+# 配置默认落在 ~/.config/agentlink/agentlink.json（用户级，升级不覆盖）；
+# 下面显式指定 /etc/agentlink/agentlink.json 是给「系统级部署」用的固定位置，
+# 同样不在发行目录里，升级换二进制不会动它。
 ExecStart=/usr/local/bin/agentlink --config /etc/agentlink/agentlink.json run
 Restart=always
 RestartSec=2

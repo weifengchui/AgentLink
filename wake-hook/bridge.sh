@@ -32,7 +32,7 @@ case "${1:-start}" in
     ensure_node
     if is_up; then echo "already running (pid $(cat "$PIDF"))"; exit 0; fi
     cd "$D"
-    HOME=/home/yxf AGENTLINK_CONFIG="${AGENTLINK_CONFIG:-/mnt/e/Tools/AgentLink-v0.4.4/agentlink.json}" setsid nohup "$D/venv/bin/python" "$D/daemon.py" >> "$LOGF" 2>&1 &
+    HOME=/home/yxf AGENTLINK_CONFIG="${AGENTLINK_CONFIG:-/mnt/c/Users/yxf/AppData/Local/AgentLink/agentlink.json}" setsid nohup "$D/venv/bin/python" "$D/daemon.py" >> "$LOGF" 2>&1 &
     echo $! > "$PIDF"
     sleep 2
     if is_up; then echo "started pid $(cat "$PIDF")"; else echo "FAILED, see $LOGF"; tail -5 "$LOGF"; exit 1; fi

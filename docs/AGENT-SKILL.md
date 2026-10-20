@@ -160,6 +160,11 @@ ws://127.0.0.1:8765/v1/ws?token=<local_api.token>&client=<你的agent_id>
   `init --force` 也会沿用锚点。**同一台机器重启后 node_id 永远不变。**
   已经漂移的补救：`agentlink --config agentlink.json identity --set <旧ID>`，
   或 `identity --recover` 从 backups/升级台账/出站历史自动找回（改完需重启）。
+- **（2026-10-20 补强）配置位置隔离**：配置不再放在发行目录里，改住用户配置目录
+  （Windows `%LOCALAPPDATA%\AgentLink\agentlink.json`，Linux `~/.config/agentlink/agentlink.json`），
+  **升级换目录/换二进制不会覆盖它**。旧版就地配置会在首次启动时自动迁移过去
+  （node_id/token/data_dir 全保留，相对 data_dir 锚回旧目录，数据不搬家）。
+  查路径：`agentlink config` / `agentlink config --path`；手动迁移：`agentlink config --migrate`。
 - **fleet agents 在线判定联动节点**：节点掉线后其 agent 不再显示 online=true（幽灵在线）。
 - **web 节点列表**：本机行有「本机」标记；离线节点有「遗忘」按钮——移除并忽略自动发现，
   持久化在 `data_dir/forgotten_peers.json`，该节点下次真实握手会自动回来。
