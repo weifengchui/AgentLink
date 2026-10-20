@@ -4240,28 +4240,86 @@ struct SubParams {
     client: Option<String>,
 }
 
+/// `token` → WS 可见范围：
+/// - `local_api.token` → `Some(None)`：全局观察者（旧行为）；
+/// - 静态 `auth.tokens` + `auth.token_namespaces` 非 Admin → `Some(Some(ns))`；
+/// - 其余（含未绑定静态 token、Admin、OIDC token）→ `None`（拒绝）。
+///
+/// OIDC token 暂不支持 WS：token 只能放 query，避免把短期 access token 写进
+/// URL/代理日志；浏览器 OIDC 登录流是后续波次。
+fn ws_scope(state: &AppState, token: &str) -> Option<Option<String>> {
+    if constant_time_eq(token.as_bytes(), state.config.local_api.token.as_bytes()) {
+        return Some(None);
+    }
+    let role = state.config.auth.tokens.get(token)?;
+    if matches!(role, &Role::Admin) {
+        return None;
+    }
+    let ns = state.config.auth.token_namespaces.get(token)?;
+    if ns == "*" {
+        return None;
+    }
+    Some(Some(ns.clone()))
+}
+
+/// 帧是否属于某租户：`from_agent` 或 `to_agent` 的 namespace 精确匹配。
+/// 未知 agent / `"*"` 共享池 / 无 agent 的节点级帧对租户不可见，宁可少发。
+fn envelope_in_namespace(state: &AppState, env: &Envelope, scope: &str) -> bool {
+    let from = env
+        .from_agent
+        .as_deref()
+        .and_then(|a| state.router.agent_namespace(a));
+    let to = env
+        .to_agent
+        .as_deref()
+        .and_then(|a| state.router.agent_namespace(a));
+    from.as_deref() == Some(scope) || to.as_deref() == Some(scope)
+}
+
 /// Subscribe to inbound messages/events (ws://127.0.0.1:8765/v1/ws).
 async fn subscribe_ws(
     ws: WebSocketUpgrade,
     Query(params): Query<SubParams>,
     State(state): State<SharedState>,
 ) -> Response {
-    let expected = state.config.local_api.token.as_bytes();
-    if !constant_time_eq(params.token.as_bytes(), expected) {
+    let Some(scope) = ws_scope(&state, &params.token) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "bad token" })),
         )
             .into_response();
-    }
+    };
     let client = params.client.unwrap_or_default();
-    ws.on_upgrade(move |socket| handle_subscriber(socket, state, client))
+    if let Some(ns) = scope.as_deref() {
+        if !client.is_empty() {
+            match state.router.agent_namespace(&client) {
+                // 共享池 agent 会跨租户，不能拿租户 token 订阅。
+                Some(agent_ns) if agent_ns == "*" || agent_ns != ns => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": "agent namespace mismatch" })),
+                    )
+                        .into_response();
+                }
+                // 未注册 agent 先放行，帧过滤仍会因未知 namespace 丢弃；
+                // agent 桥可在注册前建连，保持兼容。
+                _ => {}
+            }
+        }
+    }
+    ws.on_upgrade(move |socket| handle_subscriber(socket, state, client, scope))
 }
 
 /// Forward events/messages to a local WS client (an agent).
 /// The `client` id is the agent id: messages carrying `to_agent` only reach the
-/// matching client.
-async fn handle_subscriber(socket: WebSocket, state: SharedState, client_id: String) {
+/// matching client. `scope=Some(ns)` 的观察者/agent 只收 from/to agent 属于
+/// 该 namespace 的帧。
+async fn handle_subscriber(
+    socket: WebSocket,
+    state: SharedState,
+    client_id: String,
+    scope: Option<String>,
+) {
     if !client_id.is_empty() {
         state.router.client_online(&client_id);
     }
@@ -4276,11 +4334,14 @@ async fn handle_subscriber(socket: WebSocket, state: SharedState, client_id: Str
                         // this client, or to the node in general.
                         // 第十轮 R1：不带 client 的连接 = 观察者（Web 星图页），可见本机全部
                         // 事件含定向消息；agent 桥恒带 client，语义不变。
-                        let pass = client_id.is_empty()
+                        let pass = (client_id.is_empty()
                             || env
-                            .to_agent
-                            .as_deref()
-                            .is_none_or(|a| a == client_id.as_str());
+                                .to_agent
+                                .as_deref()
+                                .is_none_or(|a| a == client_id.as_str()))
+                            && scope
+                                .as_deref()
+                                .is_none_or(|ns| envelope_in_namespace(&state, &env, ns));
                         if !pass {
                             continue;
                         }

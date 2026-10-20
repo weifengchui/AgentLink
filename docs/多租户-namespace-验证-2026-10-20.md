@@ -99,7 +99,10 @@ webhook 7/7、warmpool 6/6、circuit 3/3。
    是管理面）；HTTP 写面才做 token 绑定。
 6. **共享池是显式信任**：`namespace="*"` 的 agent 能执行所有租户任务；只应在
    受控的公共算力上使用。
-7. **WS/local API 仍是全局**：`/v1/ws` 只接受 `local_api.token`（配置禁止把
-   它绑定 namespace）；租户实时订阅尚未提供按 namespace 过滤的通道。
+7. **WS 实时面（第三波已交付）**：`/v1/ws` 接受 `local_api.token`（全局）
+   或静态 `auth.tokens` + `auth.token_namespaces` 绑定 token（仅本租户）；
+   绑定 token 按 from/to agent namespace 过滤，跨租户 client/共享池 403。
+   OIDC token、历史回放与 topic/task 级订阅仍未支持
+   （见 `docs/WS-namespace-订阅-验证-2026-10-20.md`）。
 8. **同名 agent 刷新**：同 namespace 内允许按 agent_id 覆盖注册（执行器重连
    语义）；跨 namespace 409。

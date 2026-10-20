@@ -1,0 +1,5 @@
+{"scenario": "W0 local 可连；绑定 token 可连；未绑定/ Admin 静态 401；跨租户/共享池 client 403", "pass": true, "detail": {"local": 101, "a": 101, "unbound": 401, "admin_static": 401, "cross_client": 403, "shared_client": 403}}
+{"scenario": "W1 观察者 A/B 只收本租户 from/to 帧（跨租户仅双方可见），不串租", "pass": true, "detail": {"A": ["m1", "m2", "m4"], "B": ["m2", "m3", "m4"]}}
+{"scenario": "W2 A token + client=ws-a 只收 to_agent=ws-a（本租户出站 m2 不投）", "pass": true, "detail": {"client_a": ["m1", "m4"]}}
+{"scenario": "W3 local token 观察者仍收全量（含全局 agent m5）", "pass": true, "detail": {"admin": ["m1", "m2", "m3", "m4", "m5"]}}
+{"scenario": "W4 进程存活、日志无 panic", "pass": true, "detail": {"alive": true, "panic": false}}
