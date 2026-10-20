@@ -225,7 +225,11 @@ impl MeshRuntime {
 /// - `mesh.enabled=false`（默认）：直接返回，引擎态**完全不实例化**；
 /// - enabled 但 license 缺失/验签失败/存储打开失败：`tracing::error` 后
 ///   退化免费层，绝不 crash-loop（对齐 store.rs"空态好过崩"哲学）。
-pub fn build_mesh(cfg: &Config, config_file: &Path) -> Option<Arc<MeshRuntime>> {
+pub fn build_mesh(
+    cfg: &Config,
+    config_file: &Path,
+    chaos: Arc<crate::chaos::Chaos>,
+) -> Option<Arc<MeshRuntime>> {
     if !cfg.mesh.enabled {
         return None;
     }
@@ -255,13 +259,15 @@ pub fn build_mesh(cfg: &Config, config_file: &Path) -> Option<Arc<MeshRuntime>> 
             return None;
         }
     };
-    let store = match TaskStore::open(&cfg.data_dir) {
+    let mut store = match TaskStore::open(&cfg.data_dir) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, data_dir = %cfg.data_dir.display(), "mesh: 任务存储打开失败；按免费层运行");
             return None;
         }
     };
+    // v0.7 chaos：与 Router 共享故障表（latency 在 router，disk_full 在 store）。
+    store.set_chaos(chaos);
     let records = match store.rebuild() {
         Ok(r) => r,
         Err(e) => {
@@ -382,6 +388,12 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/config", get(config_get).put(config_put))
         .route("/v1/mesh/status", get(mesh_status_get))
         .route("/v1/mesh/quota", get(mesh_quota_get))
+        .route(
+            "/v1/mesh/chaos",
+            get(mesh_chaos_get)
+                .post(mesh_chaos_post)
+                .delete(mesh_chaos_delete),
+        )
         .route("/v1/mesh/slo", get(mesh_slo_get))
         .route("/v1/mesh/mode", get(mesh_mode_get).post(mesh_mode_post))
         .route("/v1/audit/verify", get(audit_verify_get))
@@ -438,6 +450,153 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
 
 /// M3 P3-4：AgentMesh 运维面——显示 license 配额/用量、引擎状态。
 /// Requires a valid local API token.
+/// `GET /v1/mesh/chaos`（Admin）：故障注入开关、上限与当前生效项。
+async fn mesh_chaos_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized();
+    };
+    if !role.allows("/v1/mesh/chaos") {
+        return forbidden();
+    }
+    if state.mesh.is_none() {
+        return mesh_required();
+    }
+    let cfg = &state.config.mesh.chaos;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "enabled": cfg.enabled,
+            "max_duration_seconds": cfg.max_duration_seconds,
+            "max_latency_ms": cfg.max_latency_ms,
+            "active": state.router.chaos.snapshot(),
+        })),
+    )
+}
+
+/// `POST /v1/mesh/chaos`（Admin）：注入 latency / disk_full，TTL 自动过期。
+async fn mesh_chaos_post(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized();
+    };
+    if !role.allows("/v1/mesh/chaos") {
+        return forbidden();
+    }
+    if state.mesh.is_none() {
+        return mesh_required();
+    }
+    let cfg = &state.config.mesh.chaos;
+    if !cfg.enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "ok": false,
+                "error": "chaos injection disabled (mesh.chaos.enabled=false)",
+            })),
+        );
+    }
+    let kind = match body.get("kind").and_then(|v| v.as_str()) {
+        Some("latency") => crate::chaos::ChaosKind::Latency,
+        Some("disk_full") => crate::chaos::ChaosKind::DiskFull,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": "kind must be `latency` or `disk_full`",
+                })),
+            )
+        }
+    };
+    let duration = body
+        .get("duration_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5);
+    if duration == 0 || duration > cfg.max_duration_seconds {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": format!(
+                    "duration_seconds must be 1..={}",
+                    cfg.max_duration_seconds
+                ),
+            })),
+        );
+    }
+    let latency_ms = body.get("latency_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+    if kind == crate::chaos::ChaosKind::Latency
+        && (latency_ms == 0 || latency_ms > cfg.max_latency_ms)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": format!("latency_ms must be 1..={}", cfg.max_latency_ms),
+            })),
+        );
+    }
+    state.router.chaos.start(
+        kind,
+        std::time::Duration::from_secs(duration),
+        if kind == crate::chaos::ChaosKind::Latency {
+            latency_ms
+        } else {
+            0
+        },
+    );
+    state.router.audit_event(
+        "chaos.start",
+        role.as_str(),
+        json!({
+            "kind": kind.as_str(),
+            "duration_seconds": duration,
+            "latency_ms": if kind == crate::chaos::ChaosKind::Latency { latency_ms } else { 0 },
+        }),
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "active": state.router.chaos.snapshot(),
+        })),
+    )
+}
+
+/// `DELETE /v1/mesh/chaos`（Admin）：提前解除全部故障。
+async fn mesh_chaos_delete(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized();
+    };
+    if !role.allows("/v1/mesh/chaos") {
+        return forbidden();
+    }
+    if state.mesh.is_none() {
+        return mesh_required();
+    }
+    if !state.config.mesh.chaos.enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "ok": false,
+                "error": "chaos injection disabled (mesh.chaos.enabled=false)",
+            })),
+        );
+    }
+    state.router.chaos.clear();
+    state
+        .router
+        .audit_event("chaos.stop", role.as_str(), json!({"scope": "all"}));
+    (StatusCode::OK, Json(json!({"ok": true, "active": []})))
+}
+
 /// `GET /v1/mesh/quota`（Admin）：per-namespace 配额配置与实时用量。
 /// 观察面只含计数，不含任务 payload。
 async fn mesh_quota_get(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
@@ -4536,8 +4695,12 @@ mod tests {
     /// 有效 license 的活 mesh 运行态（走真实 build_mesh 装配路径）。
     fn live_mesh(dir: &Path) -> (Config, Arc<MeshRuntime>) {
         let cfg = mesh_test_cfg(dir, Some(write_valid_license(dir)));
-        let mesh = build_mesh(&cfg, &cfg.data_dir.join("agentlink.json"))
-            .expect("有效 license 应装配成功");
+        let mesh = build_mesh(
+            &cfg,
+            &cfg.data_dir.join("agentlink.json"),
+            std::sync::Arc::new(crate::chaos::Chaos::default()),
+        )
+        .expect("有效 license 应装配成功");
         (cfg, mesh)
     }
 
@@ -4623,21 +4786,41 @@ mod tests {
         let config_file = dir.join("agentlink.json");
         // 门一：mesh.enabled=false（默认）
         let cfg_off = mesh_test_cfg(&dir, None);
-        assert!(build_mesh(&cfg_off, &config_file).is_none());
+        assert!(build_mesh(
+            &cfg_off,
+            &config_file,
+            std::sync::Arc::new(crate::chaos::Chaos::default()),
+        )
+        .is_none());
         // 门二：enabled 但 license_file 未设
         let mut cfg_nolic = cfg_off.clone();
         cfg_nolic.mesh.enabled = true;
-        assert!(build_mesh(&cfg_nolic, &config_file).is_none());
+        assert!(build_mesh(
+            &cfg_nolic,
+            &config_file,
+            std::sync::Arc::new(crate::chaos::Chaos::default()),
+        )
+        .is_none());
         // 门三：license 文件结构坏（无 signature 字段）
         std::fs::write(dir.join("license.toml"), "tier = \"starter\"\n").unwrap();
         let cfg_bad = mesh_test_cfg(&dir, Some(dir.join("license.toml")));
-        assert!(build_mesh(&cfg_bad, &config_file).is_none());
+        assert!(build_mesh(
+            &cfg_bad,
+            &config_file,
+            std::sync::Arc::new(crate::chaos::Chaos::default()),
+        )
+        .is_none());
         // 篡改签（quota 越权抬升）同样拒
         let good = std::fs::read_to_string(write_valid_license(&dir)).unwrap();
         let tampered = good.replace("node_quota = 10", "node_quota = 50");
         std::fs::write(dir.join("license.toml"), &tampered).unwrap();
         let cfg_tampered = mesh_test_cfg(&dir, Some(dir.join("license.toml")));
-        assert!(build_mesh(&cfg_tampered, &config_file).is_none());
+        assert!(build_mesh(
+            &cfg_tampered,
+            &config_file,
+            std::sync::Arc::new(crate::chaos::Chaos::default()),
+        )
+        .is_none());
         // 免费层态：写面四端点 403 + 拍板文案
         let api = Api::open(state_for(cfg_off.clone(), None)).await;
         let calls = [
@@ -4795,7 +4978,12 @@ mod tests {
         let dir = tmp_dir("restart");
         let cfg = mesh_test_cfg(&dir, Some(write_valid_license(&dir)));
         let config_file = dir.join("agentlink.json");
-        let mesh1 = build_mesh(&cfg, &config_file).unwrap();
+        let mesh1 = build_mesh(
+            &cfg,
+            &config_file,
+            std::sync::Arc::new(crate::chaos::Chaos::default()),
+        )
+        .unwrap();
         let api = Api::open(state_for(cfg.clone(), Some(mesh1))).await;
         assert_eq!(
             api.post(
@@ -4807,7 +4995,12 @@ mod tests {
             StatusCode::ACCEPTED
         );
         // 模拟进程重启：重新走一遍启动装配
-        let mesh2 = build_mesh(&cfg, &config_file).unwrap();
+        let mesh2 = build_mesh(
+            &cfg,
+            &config_file,
+            std::sync::Arc::new(crate::chaos::Chaos::default()),
+        )
+        .unwrap();
         {
             let t2 = mesh2.table.lock().unwrap();
             let rec = t2.get("t-persist").expect("重启必须恢复任务行");

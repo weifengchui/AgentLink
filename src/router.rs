@@ -995,6 +995,9 @@ pub struct Router {
     webhook: Option<Arc<crate::api::WebhookClient>>,
     /// v0.7 spine/relay 中继参数（enabled / spine / upstream / max_hops 快照）。
     relay: crate::config::RelayConfig,
+    /// v0.7 chaos §6.4：latency 注入在 `send` 出口生效；与 TaskStore 共享
+    /// 同一实例（disk_full 由 store 检查）。缺省空表，零行为。
+    pub chaos: Arc<crate::chaos::Chaos>,
     /// v0.7 第二波：经中继学到的**节点目录**（非直连；TTL 见
     /// `DIR_TTL_SECONDS`，由中继节点每 `DIR_SYNC_INTERVAL_SECS` 刷新）。
     /// 只用于 `/v1/peers` 展示与 fleet 的 node_online 判定，不参与拨号。
@@ -1158,6 +1161,7 @@ impl Router {
             started: Instant::now(),
             webhook: crate::api::WebhookClient::new(&cfg.webhook).map(Arc::new),
             relay: cfg.relay.clone(),
+            chaos: Arc::new(crate::chaos::Chaos::default()),
             dir: Mutex::new(HashMap::new()),
             offline_nodes: Mutex::new(HashMap::new()),
             audit: crate::audit::AuditLog::new(
@@ -1577,6 +1581,11 @@ impl Router {
             return Err(anyhow::anyhow!(
                 "lockdown: 总线熔断开启，业务帧已拦截（累计 {n}，恢复后不补投）"
             ));
+        }
+        // v0.7 chaotic latency：出口前注入（锁已释放；不持任何 Router 锁）。
+        let latency_ms = self.chaos.latency_ms();
+        if latency_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(latency_ms)).await;
         }
         // Trace metadata is resolved *before* signing; the signature input
         // does not include it, so strict-mode verification is unaffected.

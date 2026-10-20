@@ -7,6 +7,7 @@ mod abac;
 mod admission;
 mod api;
 mod audit;
+mod chaos;
 mod circuit;
 mod cli;
 mod config;
@@ -849,7 +850,8 @@ async fn run(cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()> {
     // - enabled=true → 验 license（失败只 tracing::error 并退化免费层，
     //   绝不炸进程）→ TaskStore 打开 + rebuild 灌表（引擎休眠：只恢复表，
     //   不起 reconcile loop——loop/总线派发/调度全在 M2/M3 接线）。
-    state_inner.mesh = api::build_mesh(&state_inner.config, &state_inner.config_file);
+    let mesh_chaos = state_inner.router.chaos.clone();
+    state_inner.mesh = api::build_mesh(&state_inner.config, &state_inner.config_file, mesh_chaos);
     // v0.6 P1 mTLS：把运行态交给连接层（拨号按需升级 wss://；对等链路触发 CA 领取）。
     state_inner.mtls = mtls_runtime.clone();
     // v0.6 P1 新节点准入：本机硬件指纹（启动时算一次，进程内不变）。

@@ -1,0 +1,8 @@
+{"scenario": "C0 初始：chaos enabled、上限生效、active 为空", "pass": true, "detail": {"view": {"enabled": true, "max_duration_seconds": 10, "max_latency_ms": 2000}, "active": {}}}
+{"scenario": "C1 latency 400ms：注入成功、/v1/send 实测被延迟", "pass": true, "detail": {"start": 200, "ms": [404, 404], "active": {"kind": "latency", "latency_ms": 400, "remaining_seconds": 2}}}
+{"scenario": "C2 TTL 到期自动失效：active 清空、发送恢复", "pass": true, "detail": {"active": {}, "ms": 3}}
+{"scenario": "C3 disk_full：提交 500 且不落表；到期后 202 并可查", "pass": true, "detail": {"start": 200, "active": {"kind": "disk_full", "latency_ms": 0, "remaining_seconds": 2}, "during": 500, "body": "task journal append failed", "get_during": 404, "after": 202, "after_get": 200, "state": "pending"}}
+{"scenario": "C4 非法 kind/duration/latency 400；Operator 403", "pass": true, "detail": {"kind": 400, "duration": 400, "latency": 400, "op_get": 403, "op_post": 403}}
+{"scenario": "C5 DELETE 提前解除：active 清空、发送立即恢复", "pass": true, "detail": {"start": 200, "del": 200, "active_before": ["latency"], "active_after": {}, "ms": 3}}
+{"scenario": "C6 chaos.start / chaos.stop 入审计链且链有效", "pass": true, "detail": {"start": 3, "stop": 1, "valid": true, "count": 5}}
+{"scenario": "C7 进程存活、日志无 panic", "pass": true, "detail": {"alive": true, "panic": false}}

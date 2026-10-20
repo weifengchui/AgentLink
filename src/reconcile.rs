@@ -1350,6 +1350,7 @@ mod tests {
                 license_file: None,
                 degraded: Default::default(),
                 quota: Default::default(),
+                chaos: Default::default(),
                 engine: EngineConfig {
                     max_retries: 2,
                     backoff_secs: 30,

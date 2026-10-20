@@ -104,6 +104,8 @@ pub struct TaskStore {
     journal_path: PathBuf,
     state_path: PathBuf,
     inner: Mutex<Inner>,
+    /// v0.7 chaos §6.4：disk_full 模拟（None=不注入，测试/默认路径）。
+    chaos: Option<std::sync::Arc<crate::chaos::Chaos>>,
 }
 
 impl TaskStore {
@@ -120,6 +122,7 @@ impl TaskStore {
                 writer: None,
                 records: HashMap::new(),
             }),
+            chaos: None,
         })
     }
 
@@ -129,10 +132,23 @@ impl TaskStore {
         &self.dir
     }
 
+    /// v0.7 chaos：把故障注入表接到本 store（正常启动由 build_mesh 接线；
+    /// 单元测试不调用 = 无注入）。
+    pub fn set_chaos(&mut self, chaos: std::sync::Arc<crate::chaos::Chaos>) {
+        self.chaos = Some(chaos);
+    }
+
     /// 追加一条事件：序列化 → 写行 → flush → fsync（对齐 `Journal::record`，
     /// 掉电不丢）；成功后同步应用到内存表。写失败时丢句柄下次重开并返回 Err，
     /// 内存表保持不动（引擎可据此拒绝后续状态推进）。
     pub fn append(&self, ev: &TaskEvent) -> std::io::Result<()> {
+        // v0.7 chaos：模拟 ENOSPC（不实际写满磁盘）。先于任何写操作返回，
+        // 调用方的回滚路径与真实磁盘错误完全一致。
+        if self.chaos.as_ref().is_some_and(|c| c.disk_full()) {
+            return Err(std::io::Error::other(
+                "chaos: simulated disk full (task journal append rejected)",
+            ));
+        }
         let line = serde_json::to_string(ev)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let mut guard = self.inner.lock().unwrap();
