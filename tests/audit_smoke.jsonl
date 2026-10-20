@@ -1,0 +1,7 @@
+{"scenario": "S0 初始空链有效（enabled=true/valid=true/count=0）", "pass": true, "detail": {"enabled": true, "valid": true, "count": 0, "head": ""}}
+{"scenario": "S1/S2 写面 + 控制面拒绝全部入链（≥8 条）", "pass": true, "detail": {"count": 8, "valid": true, "head": "fb6c4120e1b58bda"}}
+{"scenario": "S3 verify 有效且导出含全部关键事件", "pass": true, "detail": {"count": 8, "events": ["task.submit", "task.cancel", "task.submit", "task.delete", "lockdown.set", "lockdown.set", "config.update", "handshake_rejected"]}}
+{"scenario": "S4 export?limit=5 只回最近 5 条且末条为 handshake_rejected", "pass": true, "detail": {"returned": 5, "last": "handshake_rejected", "count": 8}}
+{"scenario": "S5 篡改被 verify 发现，重启后拒绝追加（计数不增、服务可用）", "pass": true, "detail": {"valid": false, "error": "line 1: hash 链不匹配（篡改或截断）", "count": 0, "submit_status": 202}}
+{"scenario": "S6 未启用节点 enabled=false、无审计文件", "pass": true, "detail": {"verify": {"count": 0, "enabled": false, "head": "", "ok": true, "valid": true}, "export_enabled": false, "file_exists": false}}
+{"scenario": "S7 进程存活、日志无 panic", "pass": true, "detail": {"alive": 2, "panics": []}}

@@ -403,6 +403,16 @@ pub struct SecurityConfig {
     /// 否则未签名控制帧会被丢弃（agent 表/目录不更新，不影响业务消息）。
     #[serde(default)]
     pub control_auth: bool,
+    /// 不可变审计日志（v0.7 §4.4）。缺省 false：不建目录、不落盘。
+    #[serde(default)]
+    pub audit: AuditConfig,
+}
+
+/// 不可变审计日志配置：hash 链 append-only，落 `<data_dir>/audit/audit.jsonl`。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuditConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// 新节点准入配置（v0.6 P1）：bootstrap 令牌 + 硬件指纹**双验证**。
@@ -455,13 +465,29 @@ pub enum Role {
 }
 
 impl Role {
+    /// 审计/日志用的稳定小写名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::Operator => "operator",
+            Role::Viewer => "viewer",
+            Role::Executor => "executor",
+        }
+    }
+
     /// 是否允许访问给定端点。
     pub fn allows(self, endpoint: &str) -> bool {
         match self {
             Role::Admin => true,
             Role::Operator => !matches!(
                 endpoint,
-                "/v1/config" | "/v1/mesh/status" | "/v1/metrics" | "/v1/lockdown" | "/v1/admission"
+                "/v1/config"
+                    | "/v1/mesh/status"
+                    | "/v1/metrics"
+                    | "/v1/lockdown"
+                    | "/v1/admission"
+                    | "/v1/audit/verify"
+                    | "/v1/audit/export"
             ),
             Role::Viewer => matches!(
                 endpoint,
@@ -889,6 +915,7 @@ impl Default for SecurityConfig {
             cluster_token: default_placeholder_token(),
             admission: AdmissionConfig::default(),
             control_auth: false,
+            audit: AuditConfig::default(),
         }
     }
 }
@@ -1011,6 +1038,7 @@ impl Config {
                 cluster_token: cluster_token.unwrap_or_else(new_secret),
                 admission: AdmissionConfig::default(),
                 control_auth: false,
+                audit: AuditConfig::default(),
             },
             local_api: LocalApiConfig {
                 host: default_local_host(),

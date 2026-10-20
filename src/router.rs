@@ -966,6 +966,8 @@ pub struct Router {
     /// `node_online` 从「不在 peer 表」细化为「明确离线」，避免未知节点
     /// 被误判离线；重连即清除。
     offline_nodes: Mutex<HashMap<String, std::time::Instant>>,
+    /// v0.7 §4.4 不可变审计日志（hash 链 append-only；关闭时 no-op）。
+    audit: crate::audit::AuditLog,
 }
 
 /// 一条中继学到的节点目录记录。
@@ -1110,6 +1112,11 @@ impl Router {
             relay: cfg.relay.clone(),
             dir: Mutex::new(HashMap::new()),
             offline_nodes: Mutex::new(HashMap::new()),
+            audit: crate::audit::AuditLog::new(
+                cfg.data_dir.join("audit").join("audit.jsonl"),
+                cfg.security.audit.enabled,
+                &cfg.node_id,
+            ),
         }
     }
 
@@ -1344,7 +1351,35 @@ impl Router {
 
     /// v0.6 P2 wake-kit 收敛：出站 webhook 派发帮手（事件名先过事件清单门，
     /// 再 spawn 异步发送——永不阻塞消息路径、不在运行时外 panic）。
+    /// v0.7 §4.4：追加不可变审计记录（actor=角色/peer；detail 不得含密钥）。
+    /// 关闭/链损坏/写入失败返回 None（调用方不因此改变业务语义）。
+    pub fn audit_event(&self, event: &str, actor: &str, detail: serde_json::Value) -> Option<u64> {
+        self.audit.append(event, actor, detail)
+    }
+
+    /// 重新读盘校验 hash 链。
+    pub fn audit_verify(&self) -> crate::audit::AuditVerify {
+        self.audit.verify()
+    }
+
+    /// 导出最近 `limit` 条审计记录 + 清单。
+    pub fn audit_export(&self, limit: usize) -> serde_json::Value {
+        self.audit.export(limit)
+    }
+
     pub fn notify(&self, event: &str, payload: serde_json::Value) {
+        // v0.7 §4.4：所有 audit_alert 同步落不可变审计链（模块内开关控制）。
+        // lockdown 由 API 处理器显式写（带 admin/operator 角色，payload 同形），
+        // 这里跳过以免同一次切换落两条。
+        if event == "audit_alert" {
+            let kind = payload
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("audit_alert");
+            if kind != "lockdown" {
+                self.audit.append(kind, "peer", payload.clone());
+            }
+        }
         if let Some(wh) = &self.webhook {
             if wh.should_fire(event) {
                 let wh = wh.clone();

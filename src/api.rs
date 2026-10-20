@@ -366,6 +366,8 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/config", get(config_get).put(config_put))
         .route("/v1/mesh/status", get(mesh_status_get))
         .route("/v1/mesh/slo", get(mesh_slo_get))
+        .route("/v1/audit/verify", get(audit_verify_get))
+        .route("/v1/audit/export", get(audit_export_get))
         .route("/v1/metrics", get(metrics_get))
         .route("/v1/admission", get(admission_get))
         .route("/web", get(web_page))
@@ -523,6 +525,45 @@ async fn mesh_status_get(
             "engine": engine_stats,
         })),
     )
+}
+
+/// `GET /v1/audit/verify` — v0.7 §4.4 重新读盘校验 hash 链（Admin）。
+async fn audit_verify_get(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized().into_response();
+    };
+    if !role.allows("/v1/audit/verify") {
+        return forbidden().into_response();
+    }
+    let mut body = serde_json::to_value(state.router.audit_verify())
+        .unwrap_or_else(|_| json!({"enabled": false, "valid": false}));
+    body["ok"] = json!(true);
+    Json(body).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditExportQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `GET /v1/audit/export?limit=N` — 最近 N 条审计记录 + 清单（Admin）。
+/// 记录含明文 detail（调用方写入时已保证不含密钥）；按 JSON 返回便于合规
+/// 归档，后续可加 ELK/文件包格式。
+async fn audit_export_get(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(q): Query<AuditExportQuery>,
+) -> Response {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized().into_response();
+    };
+    if !role.allows("/v1/audit/export") {
+        return forbidden().into_response();
+    }
+    let mut body = state.router.audit_export(q.limit.unwrap_or(500));
+    body["ok"] = json!(true);
+    Json(body).into_response()
 }
 
 /// `GET /v1/mesh/slo` — v0.7 §7.2 SLO 告警 + 历史基线视图（只读）。
@@ -1627,10 +1668,22 @@ async fn tasks_post(
         .unwrap_or_default()
         .to_string();
     match reconcile::apply_task_spec(&mesh, &body) {
-        Ok(state_str) => (
-            StatusCode::ACCEPTED,
-            Json(json!({ "ok": true, "task_id": task_id, "state": state_str })),
-        ),
+        Ok(state_str) => {
+            // v0.7 §4.4：声明式提交进不可变审计链（不含 payload 原文）。
+            state.router.audit_event(
+                "task.submit",
+                role.as_str(),
+                json!({
+                    "task_id": task_id,
+                    "type": body.get("type").and_then(|v| v.as_str()),
+                    "state": state_str,
+                }),
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "ok": true, "task_id": task_id, "state": state_str })),
+            )
+        }
         Err(reconcile::ApplyFail::NotObject) => bad_request("task_spec 必须是 JSON 对象"),
         Err(reconcile::ApplyFail::MissingTaskId) => bad_request("task_spec 缺必填字段 task_id"),
         Err(reconcile::ApplyFail::MissingType) => bad_request("task_spec 缺必填字段 type"),
@@ -1778,6 +1831,11 @@ async fn tasks_cancel_post(
         .unwrap_or_default();
     drop(table);
     mesh.maybe_snapshot();
+    state.router.audit_event(
+        "task.cancel",
+        role.as_str(),
+        json!({ "task_id": task_id, "state": final_state }),
+    );
     (
         StatusCode::OK,
         Json(json!({ "ok": true, "task_id": task_id, "state": final_state })),
@@ -1835,6 +1893,9 @@ async fn tasks_delete(
             table.remove(&task_id);
             drop(table);
             mesh.maybe_snapshot();
+            state
+                .router
+                .audit_event("task.delete", role.as_str(), json!({ "task_id": task_id }));
             (
                 StatusCode::OK,
                 Json(json!({ "ok": true, "task_id": task_id, "deleted": true })),
@@ -1900,6 +1961,11 @@ async fn lockdown_post(
     }
     state.router.set_lockdown(req.on);
     let (on, out, inn) = state.router.lockdown_stats();
+    state.router.audit_event(
+        "lockdown.set",
+        role.as_str(),
+        json!({ "on": on, "blocked_out": out, "blocked_in": inn }),
+    );
     (StatusCode::OK, lockdown_json(on, out, inn))
 }
 
@@ -2477,6 +2543,32 @@ async fn config_put(
     if !role.allows("/v1/config") {
         return forbidden();
     }
+    // 审计只记「改了哪些键」，不记任何值（cluster_token 等密钥绝不入链）。
+    let mut changed: Vec<&str> = Vec::new();
+    if req.name.is_some() {
+        changed.push("name");
+    }
+    if req.tags.is_some() {
+        changed.push("tags");
+    }
+    if req.log_level.is_some() {
+        changed.push("log_level");
+    }
+    if req.history_len.is_some() {
+        changed.push("history_len");
+    }
+    if req.max_file_size.is_some() {
+        changed.push("max_file_size");
+    }
+    if req.static_peers.is_some() {
+        changed.push("static_peers");
+    }
+    if req.cluster_token.is_some() {
+        changed.push("cluster_token");
+    }
+    if req.auto_open_web.is_some() {
+        changed.push("auto_open_web");
+    }
     let name = req
         .name
         .as_deref()
@@ -2547,6 +2639,9 @@ async fn config_put(
             Json(json!({ "ok": false, "error": e.to_string() })),
         );
     }
+    state
+        .router
+        .audit_event("config.update", role.as_str(), json!({ "keys": changed }));
     (
         StatusCode::OK,
         Json(json!({
