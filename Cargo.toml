@@ -25,7 +25,10 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
+# v0.7.1 OIDC 第二波：RS256 JWKS 本地验签。纯 Rust（num-bigint-dig），无 C 依赖。
+rsa = "0.9"
+rand = "0.8"
 hmac = "0.12"
 hex = "0.4"
 socket2 = "0.5"
