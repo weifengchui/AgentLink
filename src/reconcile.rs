@@ -1424,6 +1424,7 @@ mod tests {
             online: true,
             node_id: node.to_string(),
             last_seen: 0,
+            namespace: None,
         };
         // 在线池位 w2@n2；ghost 未注册（离线位）。
         engine
@@ -1555,6 +1556,7 @@ mod tests {
             online: true,
             node_id: node.to_string(),
             last_seen: 0,
+            namespace: None,
         };
         engine.router.on_agents_update("n2", vec![mk("w2", "n2")]);
         engine.router.on_agents_update("n3", vec![mk("w3", "n3")]);

@@ -39,11 +39,27 @@ impl Scheduler {
     }
 
     /// 从 agents 中筛选满足 spec 的 candidate（带节点 tag 过滤）。
+    /// 任务 namespace（`spec.namespace`，缺省/空 = "default"）。
+    fn task_namespace(spec: &Value) -> String {
+        crate::router::task_namespace(Some(spec)).to_string()
+    }
+
+    /// agent 是否服务该 namespace（"*" = 共享池）。
+    fn agent_serves(agent: &AgentRecord, namespace: &str) -> bool {
+        let ns = agent
+            .namespace
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("default");
+        ns == "*" || ns == namespace
+    }
+
     pub fn candidates<'a>(
         spec: &Value,
         agents: &'a [AgentRecord],
         node_tags: &HashMap<String, Vec<String>>,
     ) -> Vec<&'a AgentRecord> {
+        let namespace = Self::task_namespace(spec);
         let requires: Vec<String> = spec
             .get("requires")
             .and_then(|v| v.as_array())
@@ -68,6 +84,8 @@ impl Scheduler {
         agents
             .iter()
             .filter(|a| a.online)
+            // v0.7 §4.2 多租户：任务只能落到同 namespace 或共享池 agent。
+            .filter(|a| Self::agent_serves(a, &namespace))
             .filter(|a| {
                 // requires ⊆ capabilities（cap_matches 逐条满足）
                 requires.iter().all(|r| {
@@ -219,6 +237,7 @@ mod tests {
             online,
             node_id: node_id.to_string(),
             last_seen: 0,
+            namespace: None,
         }
     }
 
@@ -403,6 +422,38 @@ mod tests {
         ];
         let result = sched.schedule_batch(&tasks, &agents, &node_tags, &mut loads, 1);
         assert_eq!(result.len(), 0, "已达全局 in-flight 上限应不调度");
+    }
+
+    #[test]
+    fn namespace_isolation_and_shared_pool() {
+        let agents = vec![
+            agent("n1", "a1", &["cap:file"], true),
+            agent("n2", "a2", &["cap:file"], true),
+            agent("n3", "a3", &["cap:file"], true),
+        ];
+        let mut agents = agents;
+        agents[0].namespace = Some("team-a".to_string());
+        agents[1].namespace = Some("team-b".to_string());
+        agents[2].namespace = Some("*".to_string());
+        let node_tags: HashMap<String, Vec<String>> = HashMap::new();
+
+        let mut ta = spec(&["cap:file"], 100, "2026-01-01T00:00:00Z");
+        ta.as_object_mut()
+            .unwrap()
+            .insert("namespace".to_string(), json!("team-a"));
+        let ids: Vec<&str> = Scheduler::candidates(&ta, &agents, &node_tags)
+            .iter()
+            .map(|a| a.agent_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a1", "a3"], "team-a + 共享池");
+
+        // 未声明 namespace = default：只有共享池 agent。
+        let plain = spec(&["cap:file"], 100, "2026-01-01T00:00:00Z");
+        let ids: Vec<&str> = Scheduler::candidates(&plain, &agents, &node_tags)
+            .iter()
+            .map(|a| a.agent_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a3"], "default 只匹配共享池");
     }
 
     #[test]

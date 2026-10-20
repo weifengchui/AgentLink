@@ -748,6 +748,9 @@ async fn metrics_get(State(state): State<SharedState>, headers: HeaderMap) -> Re
     if !role.allows("/v1/metrics") {
         return forbidden().into_response();
     }
+    if let Some(r) = namespace_global_read_forbidden(&state, &headers) {
+        return r.into_response();
+    }
 
     let router_m = state.router.router_metrics();
 
@@ -1169,6 +1172,23 @@ async fn send(
     if !role.allows("/v1/send") {
         return forbidden();
     }
+    // v0.7 §4.2：绑定 namespace 的 token 不能借 from_agent/to_agent 跨租户
+    // 冒充（仅对已知 agent 生效；未知 agent 由注册方责任，见文档残留）。
+    if let Some(scope) = token_namespace(&state, &headers) {
+        for id in [req.from_agent.as_deref(), req.to_agent.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(ns) = state.router.agent_namespace(id) {
+                if ns != "*" && ns != scope {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "ok": false, "error": "agent namespace mismatch" })),
+                    );
+                }
+            }
+        }
+    }
     let to = match resolve_target(&state, &req.to) {
         Ok(t) => t,
         Err(e) => {
@@ -1413,6 +1433,9 @@ struct RegisterAgentRequest {
     name: Option<String>,
     #[serde(default)]
     capabilities: Vec<String>,
+    /// v0.7 §4.2：所属 namespace（缺省 = token 绑定值，否则 "default"；"*"=共享池）。
+    #[serde(default)]
+    namespace: Option<String>,
 }
 
 /// Register (or refresh) a local AI agent. Capabilities are broadcast to peers.
@@ -1442,10 +1465,57 @@ async fn agents_post(
             Json(json!({ "ok": false, "error": "agent_id must be 1-64 chars of [A-Za-z0-9_.-]" })),
         );
     }
-    let rec =
-        state
-            .router
-            .register_agent(id, req.name.map(|s| s.trim().to_string()), req.capabilities);
+    // v0.7 §4.2 多租户：token 绑定 namespace 时强制落在该 namespace；
+    // 未显式给 namespace 则自动继承 token 的 namespace。
+    let scope = token_namespace(&state, &headers);
+    let namespace = match req.namespace {
+        Some(ns) => ns.trim().to_string(),
+        None => scope.clone().unwrap_or_else(|| "default".to_string()),
+    };
+    if !valid_agent_namespace(&namespace) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "ok": false, "error": "namespace must be 1-64 chars of [A-Za-z0-9_.-] or '*'" }),
+            ),
+        );
+    }
+    if let Some(scope) = scope.as_deref() {
+        if namespace != scope {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "ok": false, "error": "token is bound to a different namespace" })),
+            );
+        }
+    }
+    // 同名 agent 跨 namespace 不允许静默接管（refresh 仅限同 namespace）。
+    if let Some(existing) = state
+        .router
+        .local_agents()
+        .into_iter()
+        .find(|a| a.agent_id == id)
+    {
+        let own = existing
+            .namespace
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("default");
+        if own != namespace {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("agent_id {id} already belongs to namespace {own}"),
+                })),
+            );
+        }
+    }
+    let rec = state.router.register_agent(
+        id,
+        req.name.map(|s| s.trim().to_string()),
+        req.capabilities,
+        Some(namespace),
+    );
     (StatusCode::OK, Json(json!({ "ok": true, "agent": rec })))
 }
 
@@ -1464,7 +1534,27 @@ async fn agents_delete(
     if let Some(r) = read_only_guard(&state) {
         return r;
     }
-    let removed = state.router.unregister_agent(req.agent_id.trim());
+    // v0.7 §4.2：绑定 namespace 的 token 不能注销其它租户的 agent。
+    let id = req.agent_id.trim();
+    if let Some(scope) = token_namespace(&state, &headers) {
+        match state.router.agent_namespace(id) {
+            Some(ns) if ns == "*" || ns == scope => {}
+            Some(_) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "ok": false, "error": "agent namespace mismatch" })),
+                )
+            }
+            // 绑定 token 不能借此探测/操作未知 agent。
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "ok": false, "error": format!("agent {id} not found") })),
+                )
+            }
+        }
+    }
+    let removed = state.router.unregister_agent(id);
     (
         StatusCode::OK,
         Json(json!({ "ok": true, "removed": removed })),
@@ -1479,12 +1569,19 @@ async fn agents_get(State(state): State<SharedState>, headers: HeaderMap) -> imp
     if !role.allows("/v1/agents") {
         return forbidden();
     }
+    let scope = token_namespace(&state, &headers);
+    let agents: Vec<crate::router::AgentRecord> = state
+        .router
+        .local_agents()
+        .into_iter()
+        .filter(|a| agent_in_scope(a, scope.as_deref()))
+        .collect();
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "node": { "node_id": state.config.node_id, "name": state.config.name },
-            "agents": state.router.local_agents(),
+            "agents": agents,
         })),
     )
 }
@@ -1534,10 +1631,12 @@ async fn fleet_agents(
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
         .unwrap_or_default();
+    let scope = token_namespace(&state, &headers);
     let agents: Vec<serde_json::Value> = state
         .router
         .fleet_agents()
         .iter()
+        .filter(|a| agent_in_scope(a, scope.as_deref()))
         .filter(|a| {
             requires.is_empty()
                 || (a.online
@@ -1584,6 +1683,9 @@ async fn history_get(State(state): State<SharedState>, headers: HeaderMap) -> im
     if !role.allows("/v1/history") {
         return forbidden();
     }
+    if let Some(r) = namespace_global_read_forbidden(&state, &headers) {
+        return r;
+    }
     (
         StatusCode::OK,
         Json(json!({ "ok": true, "history": state.router.history() })),
@@ -1625,6 +1727,9 @@ async fn events_get(
     };
     if !role.allows("/v1/events") {
         return forbidden();
+    }
+    if let Some(r) = namespace_global_read_forbidden(&state, &headers) {
+        return r;
     }
     let since = q.since.unwrap_or(0);
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
@@ -1719,12 +1824,14 @@ async fn tasks_get(
     let correlation = clean(q.correlation);
     let task_id = clean(q.task_id);
     let agent = clean(q.agent);
+    let scope = token_namespace(&state, &headers);
     let filter = crate::router::TaskFilter {
         correlation: correlation.as_deref(),
         states: states.as_deref(),
         task_id: task_id.as_deref(),
         agent: agent.as_deref(),
         limit,
+        namespace: scope.as_deref(),
     };
     let (tasks, total) = state.router.tasks_view(&filter);
     let tasks: Vec<serde_json::Value> = tasks
@@ -1758,7 +1865,7 @@ async fn tasks_get(
 async fn tasks_post(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    JsonAny(body): JsonAny<serde_json::Value>,
+    JsonAny(mut body): JsonAny<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let Some(role) = authorized_role(&state, &headers) else {
         return unauthorized();
@@ -1772,6 +1879,31 @@ async fn tasks_post(
     };
     if let Some(r) = read_only_guard(&state) {
         return r;
+    }
+    // v0.7 §4.2 多租户：namespace 校验 + token 绑定；未显式给定时继承
+    // token 的 namespace，避免绑定 token 的任务落到 default。
+    let scope = token_namespace(&state, &headers);
+    match body.get("namespace").and_then(|v| v.as_str()) {
+        Some(ns) => {
+            if !valid_tenant_name(ns) {
+                return bad_request("namespace must be 1-64 chars of [A-Za-z0-9_.-]");
+            }
+            if let Some(scope) = scope.as_deref() {
+                if ns != scope {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": "token is bound to a different namespace" })),
+                    );
+                }
+            }
+        }
+        None => {
+            if let Some(scope) = scope.as_deref() {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("namespace".to_string(), json!(scope));
+                }
+            }
+        }
     }
     // 协议 §2 必填门：task_id / type 为非空字符串。其余字段（requires、
     // deadline、payload、budget、priority、correlation…）原样透传——
@@ -1790,6 +1922,7 @@ async fn tasks_post(
                 json!({
                     "task_id": task_id,
                     "type": body.get("type").and_then(|v| v.as_str()),
+                    "namespace": body.get("namespace").and_then(|v| v.as_str()),
                     "state": state_str,
                 }),
             );
@@ -1861,16 +1994,21 @@ async fn tasks_get_one(
     let Some(mesh) = state.mesh.as_ref() else {
         return mesh_required();
     };
+    let scope = token_namespace(&state, &headers);
     let table = mesh.table.lock().unwrap();
     match table.get(&task_id) {
-        Some(rec) => {
+        Some(rec)
+            if scope
+                .as_deref()
+                .is_none_or(|ns| crate::router::task_namespace(rec.spec.as_ref()) == ns) =>
+        {
             let value = serde_json::to_value(rec).unwrap_or(serde_json::Value::Null);
             (
                 StatusCode::OK,
                 Json(json!({ "ok": true, "task_id": task_id, "task": value })),
             )
         }
-        None => (
+        _ => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("task {task_id} not found") })),
         ),
@@ -1897,7 +2035,18 @@ async fn tasks_cancel_post(
     let Some(mesh) = state.mesh.as_ref().cloned() else {
         return mesh_required();
     };
+    let scope = token_namespace(&state, &headers);
     let mut table = mesh.table.lock().unwrap();
+    if scope.as_deref().is_some_and(|ns| {
+        table
+            .get(&task_id)
+            .is_none_or(|r| crate::router::task_namespace(r.spec.as_ref()) != ns)
+    }) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("task {task_id} not found") })),
+        );
+    }
     // 先取值判定再动表（避免 match 持有借用期间 mutate 的 NLL 边缘问题）。
     let current = table.get(&task_id).map(|r| r.state.as_str().to_string());
     match current {
@@ -1979,7 +2128,18 @@ async fn tasks_delete(
     let Some(mesh) = state.mesh.as_ref().cloned() else {
         return mesh_required();
     };
+    let scope = token_namespace(&state, &headers);
     let mut table = mesh.table.lock().unwrap();
+    if scope.as_deref().is_some_and(|ns| {
+        table
+            .get(&task_id)
+            .is_none_or(|r| crate::router::task_namespace(r.spec.as_ref()) != ns)
+    }) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("task {task_id} not found") })),
+        );
+    }
     // 先取值判定（同上，规避 match 借用跨 mutate）。
     let entry = table
         .get(&task_id)
@@ -2101,6 +2261,9 @@ async fn history_stats_get(
     if !role.allows("/v1/history/stats") {
         return forbidden();
     }
+    if let Some(r) = namespace_global_read_forbidden(&state, &headers) {
+        return r;
+    }
     let h = &state.config.history;
     if !h.enabled || h.file.is_empty() || h.file == "-" {
         return (
@@ -2166,6 +2329,9 @@ async fn history_search_get(
     };
     if !role.allows("/v1/history/search") {
         return forbidden().into_response();
+    }
+    if let Some(r) = namespace_global_read_forbidden(&state, &headers) {
+        return r.into_response();
     }
     let h = &state.config.history;
     if !h.enabled || h.file.is_empty() || h.file == "-" {
@@ -2298,6 +2464,9 @@ async fn history_export_get(
     };
     if !role.allows("/v1/history/export") {
         return forbidden().into_response();
+    }
+    if let Some(r) = namespace_global_read_forbidden(&state, &headers) {
+        return r.into_response();
     }
     let h = &state.config.history;
     if !h.enabled || h.file.is_empty() || h.file == "-" {
@@ -2433,6 +2602,9 @@ async fn file_download(
     };
     if !role.allows("/v1/files/:file_name") {
         return forbidden().into_response();
+    }
+    if let Some(r) = namespace_global_read_forbidden(&state, &headers) {
+        return r.into_response();
     }
     let Some(name) = crate::file::sanitize_name(&file_name) else {
         return (
@@ -3755,6 +3927,58 @@ fn authorized_role(state: &AppState, headers: &HeaderMap) -> Option<Role> {
     }
 
     None
+}
+
+/// v0.7 §4.2：token 绑定的 namespace（未绑定 → None，即全局）。
+fn token_namespace(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    let token = headers.get("x-auth-token").and_then(|v| v.to_str().ok())?;
+    state
+        .config
+        .auth
+        .token_namespaces
+        .get(token)
+        .cloned()
+        .filter(|s| !s.is_empty())
+}
+
+/// 租户名：1-64 字符 `[A-Za-z0-9_.-]`（任务/agent namespace 不允许 `*`）。
+fn valid_tenant_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// agent namespace 允许 `*`（共享池）。
+fn valid_agent_namespace(s: &str) -> bool {
+    valid_tenant_name(s) || s == "*"
+}
+
+/// agent 是否对给定 scope 可见：同 namespace 或共享池；scope=None 全可见。
+fn agent_in_scope(a: &crate::router::AgentRecord, scope: Option<&str>) -> bool {
+    let Some(scope) = scope else { return true };
+    let own = a
+        .namespace
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default");
+    own == scope || own == "*"
+}
+
+/// 绑定 namespace 的 token 不得读取全局可观测面（history/events/files/metrics）。
+fn namespace_global_read_forbidden(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    token_namespace(state, headers).map(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "ok": false,
+                "error": "namespace-scoped token cannot read global history/events/files/metrics; use /v1/tasks or /v1/fleet/agents"
+            })),
+        )
+    })
 }
 
 /// 兼容 0.5.x 的 bool 鉴权：任意有效 token 即通过（角色缺省 Admin）。

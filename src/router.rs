@@ -140,6 +140,9 @@ pub struct AgentRecord {
     /// Stale agents are auto-cleaned (`delivery.agent_stale_ttl_seconds`).
     #[serde(default)]
     pub last_seen: i64,
+    /// v0.7 §4.2 多租户：agent 所属 namespace（缺省 = "default"；"*" = 共享池）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[cfg(test)]
@@ -639,6 +642,16 @@ pub struct TaskFilter<'a> {
     /// Max tasks per response; applied by [`Router::tasks_view`] so the
     /// caller can still report `total` beyond the page.
     pub limit: usize,
+    /// v0.7 §4.2 多租户：只看该 namespace 的任务（`None` = 全部）。
+    pub namespace: Option<&'a str>,
+}
+
+/// 任务 spec 的 namespace（缺省/空 = `"default"`）。
+pub fn task_namespace(spec: Option<&serde_json::Value>) -> &str {
+    spec.and_then(|s| s.get("namespace"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default")
 }
 
 /// One task projected from its message trajectory (v0.5 §4). Derived view
@@ -896,6 +909,9 @@ pub fn tasks_projection(entries: &[HistoryEntry], f: &TaskFilter) -> Vec<TaskVie
         tasks.retain(|t| {
             t.from_agent.as_deref() == Some(agent) || t.to_agent.as_deref() == Some(agent)
         });
+    }
+    if let Some(ns) = f.namespace {
+        tasks.retain(|t| task_namespace(t.spec.as_ref()) == ns);
     }
     // Newest activity first: seq is the append-only ring order; ts breaks
     // ties for legacy entries (seq == 0).
@@ -2394,6 +2410,7 @@ impl Router {
         agent_id: &str,
         name: Option<String>,
         capabilities: Vec<String>,
+        namespace: Option<String>,
     ) -> AgentRecord {
         let online = self.clients.lock().unwrap().contains_key(agent_id);
         let rec = AgentRecord {
@@ -2403,6 +2420,7 @@ impl Router {
             online,
             node_id: self.cfg.node_id.clone(),
             last_seen: store::now_wall(),
+            namespace,
         };
         self.agents
             .lock()
@@ -2417,6 +2435,30 @@ impl Router {
         self.persist_agents();
         self.sync_push_agents();
         rec
+    }
+
+    /// v0.7 §4.2：按 agent_id 查 namespace（本机优先，其次 fleet 缓存）。
+    /// 未注册/未知 → None（调用方决定 fail-open/fail-closed）。
+    pub fn agent_namespace(&self, agent_id: &str) -> Option<String> {
+        if let Some(a) = self.agents.lock().unwrap().get(agent_id) {
+            return Some(
+                a.namespace
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "default".to_string()),
+            );
+        }
+        for agents in self.fleet_agents.lock().unwrap().values() {
+            if let Some(a) = agents.iter().find(|a| a.agent_id == agent_id) {
+                return Some(
+                    a.namespace
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "default".to_string()),
+                );
+            }
+        }
+        None
     }
 
     pub fn unregister_agent(&self, agent_id: &str) -> bool {

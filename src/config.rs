@@ -544,6 +544,11 @@ pub struct AuthConfig {
     /// 缺省 Admin 以保持与 0.5.9 行为一致。
     #[serde(default = "default_auth_fallback_role")]
     pub fallback_role: Role,
+    /// v0.7 §4.2 多租户：token → namespace 绑定（加性，缺省空=不限制）。
+    /// 绑定后的 token 只能提交/查看/操作该 namespace 的任务与 agent；
+    /// Admin 角色也不例外（要全局视角请用未绑定 token）。
+    #[serde(default)]
+    pub token_namespaces: std::collections::HashMap<String, String>,
 }
 
 fn default_auth_fallback_role() -> Role {
@@ -1172,6 +1177,35 @@ impl Config {
             anyhow::bail!("log.format must be 'text' or 'json'");
         }
         crate::abac::validate(&self.security.abac)?;
+        // v0.7 §4.2 多租户：绑定 token 不能是 Admin（Admin 是集群级角色），
+        // 也不能是 local_api.token（WS/全局管理入口必须保持全局）。
+        for (token, ns) in &self.auth.token_namespaces {
+            if ns.is_empty()
+                || ns.len() > 64
+                || ns == "*"
+                || !ns
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            {
+                anyhow::bail!(
+                    "auth.token_namespaces[{token:?}] must be 1-64 chars of [A-Za-z0-9_.-] (no '*')"
+                );
+            }
+            if token == &self.local_api.token {
+                anyhow::bail!(
+                    "local_api.token cannot be namespace-bound (needed for WS / global admin)"
+                );
+            }
+            match self.auth.tokens.get(token) {
+                Some(Role::Admin) => anyhow::bail!(
+                    "auth.token_namespaces[{token:?}] cannot bind an Admin token; use Operator/Viewer/Executor"
+                ),
+                Some(_) => {}
+                None => anyhow::bail!(
+                    "auth.token_namespaces[{token:?}] refers to an unknown token"
+                ),
+            }
+        }
         Ok(())
     }
 }
@@ -1260,6 +1294,36 @@ mod tests {
         assert!(!cfg.security.admission.enabled);
         assert!(!cfg.security.admission.boot_token_configured());
         assert!(cfg.security.admission.allowed_hardware.is_empty());
+    }
+
+    /// v0.7 §4.2：namespace 绑定 token 不能是 Admin / local_api.token。
+    #[test]
+    fn namespace_token_binding_rejects_admin_and_local_token() {
+        let mut cfg = Config::generate(
+            Some("ns-test".to_string()),
+            Some("local-token".to_string()),
+            Some("strict".to_string()),
+        );
+        cfg.auth.tokens.insert("op".to_string(), Role::Operator);
+        cfg.auth
+            .token_namespaces
+            .insert("op".to_string(), "team-a".to_string());
+        assert!(cfg.validate().is_ok());
+
+        cfg.auth.tokens.insert("adm".to_string(), Role::Admin);
+        cfg.auth
+            .token_namespaces
+            .insert("adm".to_string(), "team-b".to_string());
+        assert!(cfg.validate().is_err(), "Admin token 不能绑定 namespace");
+
+        cfg.auth.token_namespaces.remove("adm");
+        cfg.auth
+            .token_namespaces
+            .insert("local-token".to_string(), "team-c".to_string());
+        assert!(
+            cfg.validate().is_err(),
+            "local_api.token 不能绑定 namespace"
+        );
     }
 
     /// 准入段（v0.6 P1）：缺省关闭；显式配置后 token/白名单语义正确。

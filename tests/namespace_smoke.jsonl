@@ -1,0 +1,9 @@
+{"scenario": "S0 fleet 带 namespace；绑定 token 只看到本租户 agent", "pass": true, "detail": {"namespaces": {"ns-w1": "team-a", "ns-w2": "team-b"}, "team_a_view": ["ns-w1"]}}
+{"scenario": "S1 team-a / team-b 任务分别只落各自执行器", "pass": true, "detail": {"ta": ["succeeded", true, false], "tb": ["succeeded", true, false]}}
+{"scenario": "S2 绑定 token 跨租户提交 403；省略 namespace 自动归位 team-a", "pass": true, "detail": {"bad": 403, "ok": 202, "state": "succeeded", "namespace": "team-a"}}
+{"scenario": "S3 绑定 token 只看到本租户任务；跨租户单查/撤销 404", "pass": true, "detail": {"tasks": ["ns-ta-1", "ns-ta-2"], "get": 404, "cancel": 404}}
+{"scenario": "S4 team-c 无匹配时 pending；namespace=* 共享池上线后接管", "pass": true, "detail": {"pending": true, "nobody": true, "state": "succeeded", "shared": true}}
+{"scenario": "S5 agent 注册自动归位 team-a；跨租户注册/删除 403；同名接管 409", "pass": true, "detail": {"reg_bad": 403, "reg_ok": 200, "auto_ns": "team-a", "del_bad": 403, "del_ok": 200, "collision": 409}}
+{"scenario": "S6 绑定 token 用其它租户 from_agent 发信 403，本租户 200", "pass": true, "detail": {"spoof": 403, "own": 200}}
+{"scenario": "S7 绑定 token 读全局 history/events/files 403，任务面仍可用", "pass": true, "detail": {"history": 403, "events": 403, "files": 403, "tasks": 200}}
+{"scenario": "S8 三进程存活、日志无 panic", "pass": true, "detail": {"alive": 3, "panics": []}}
