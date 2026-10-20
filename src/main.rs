@@ -484,13 +484,13 @@ fn config_cmd(config_path: &Path, show: bool, migrate: bool, path: bool) -> Resu
     );
 
     if !migrate {
-        if config_path != &stable {
+        if config_path != stable {
             println!("\n提示: 当前配置不在稳定位置，可用 `agentlink config --migrate` 搬迁。");
         }
         return Ok(());
     }
 
-    if config_path == &stable {
+    if config_path == stable {
         println!("\n已在稳定位置，无需迁移。");
         return Ok(());
     }
@@ -659,7 +659,7 @@ fn identity_candidates(config_path: &Path, cfg: &Config) -> Vec<(String, String)
             backups.push((path, mtime));
         }
     }
-    backups.sort_by(|a, b| b.1.cmp(&a.1));
+    backups.sort_by_key(|a| std::cmp::Reverse(a.1));
     for (dir, _) in backups {
         let backup_cfg = dir.join("agentlink.json");
         if let Some(id) = json_node_id(&backup_cfg) {
