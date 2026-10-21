@@ -2625,6 +2625,30 @@ impl Router {
         Some(env)
     }
 
+    /// v0.8 HA：构造一条已签名的复制帧（`ctrl/ha`）。
+    /// 旧节点收到未知 `ctrl` 帧会直接忽略（conn 底部分支），零破坏。
+    pub fn ha_envelope(&self, to: &str, payload: serde_json::Value) -> Envelope {
+        let mut env = Envelope::business(
+            &self.cfg.node_id,
+            to,
+            "ctrl",
+            "ha",
+            payload,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        self.sign_control(&mut env);
+        env
+    }
+
+    /// 取某个对端的连接句柄（HA 复制帧发送用）。
+    pub fn peer_sink(&self, node_id: &str) -> Option<PeerSink> {
+        self.registry.get(node_id)
+    }
+
     /// 控制面帧签名（v0.7 第二波）：strict 模式下所有新发出的控制面帧都带
     /// `sig`（HMAC 覆盖 from|msg_id|ts，与业务帧同一把 cluster_token）。
     /// 未开启 strict 时不签（保持 open 模式零开销）。

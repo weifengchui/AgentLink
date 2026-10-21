@@ -549,6 +549,53 @@ async fn handle_text(
             true
         }
 
+        // v0.8 HA 复制帧（ctrl/ha）：只接受已握手对端（peer_id 已知）、
+        // strict 模式验签通过的控制面帧。旧节点不认识该 action -> 忽略。
+        "ha" => {
+            let Some(pid) = peer_id.clone() else {
+                return true;
+            };
+            let Some(ha) = state.ha.clone() else {
+                tracing::debug!(from = %pid, "conn: ha frame ignored (ha disabled)");
+                return true;
+            };
+            let Ok(env) = serde_json::from_value::<Envelope>(value.clone()) else {
+                return true;
+            };
+            if !state.router.verify_control(&env) {
+                tracing::warn!(from = %env.from, "conn: ha frame rejected (control signature)");
+                return true;
+            }
+            if env.from != pid {
+                // 帧里的 from 必须与握手对端一致（防冒名）
+                tracing::warn!(from = %env.from, peer = %pid, "conn: ha frame from mismatch");
+                return true;
+            }
+            let Some(raw) = env.payload.get("msg") else {
+                return true;
+            };
+            let Ok(msg) = serde_json::from_value::<crate::ha::RaftMessage>(raw.clone()) else {
+                return true;
+            };
+            let now = ha.now_ms();
+            let out = ha.on_message(&env.from, msg, now);
+            for (to, m) in out {
+                if to == env.from {
+                    let resp = state.router.ha_envelope(&to, serde_json::json!({"msg": m}));
+                    let _ = send_text(send, &resp).await;
+                } else {
+                    // 非请求方：交给路由注册表投递（当前协议里极少发生）
+                    if let Some(sink) = state.router.peer_sink(&to) {
+                        let env = state.router.ha_envelope(&to, serde_json::json!({"msg": m}));
+                        if let Ok(text) = serde_json::to_string(&env) {
+                            let _ = sink.tx.send(Frame::Text(text)).await;
+                        }
+                    }
+                }
+            }
+            true
+        }
+
         "heartbeat" => {
             if let Some(pid) = peer_id {
                 state.peers.touch(pid);

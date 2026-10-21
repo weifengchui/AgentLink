@@ -316,6 +316,17 @@ impl RaftNode {
         self.log.len().saturating_sub(1)
     }
 
+    /// 本 term 投给谁（持久化边界）。
+    pub fn voted_for(&self) -> Option<&str> {
+        self.voted_for.as_deref()
+    }
+
+    /// 取 `index >= from` 的日志条目（持久化增量用）。
+    pub fn log_entries_from(&self, from: u64) -> &[LogEntry] {
+        let start = (from.max(1) as usize).min(self.log.len());
+        &self.log[start..]
+    }
+
     /// 集群规模（含自己）。
     pub fn cluster_size(&self) -> usize {
         self.peers.len() + 1
@@ -557,6 +568,7 @@ impl RaftNode {
             return None;
         }
         let index = self.last_log_index() + 1;
+        tracing::debug!(index, log_len = self.log.len(), "ha: propose");
         self.log.push(LogEntry {
             index,
             term: self.current_term,
@@ -881,14 +893,21 @@ impl RaftNode {
         if self.role != Role::Leader || term < self.current_term {
             return out;
         }
+        tracing::debug!(from = %from_id, success, match_index, "ha: append resp");
         if success {
             let m = match_index.max(self.match_index.get(&from_id).copied().unwrap_or(0));
             self.match_index.insert(from_id.clone(), m);
             self.next_index.insert(from_id.clone(), m + 1);
             self.try_advance_commit();
-            // 继续发下一批（流水线）
-            let msg = self.append_msg_for(&from_id);
-            out.push((from_id.clone(), msg));
+            // 流水线：**仅当对端还没追平**（还有条目要发）才立刻补发下一批。
+            // 没有新条目时**不**回发——follower 对每条 AppendEntries 都会回一条
+            // resp，若 leader 无条件回发就会形成无限 ping-pong（打满 peer 通道、
+            // 把真消息挤掉）。无事可发时等下一次心跳。
+            let next = self.next_index.get(&from_id).copied().unwrap_or(1);
+            if next <= self.last_log_index() {
+                let msg = self.append_msg_for(&from_id);
+                out.push((from_id.clone(), msg));
+            }
         } else {
             // 失败：回退 next_index，**不立即重发**（避免与 follower 互刷死循环）；
             // 下一次心跳会带新的 prev_log_index 重试。
@@ -1079,6 +1098,336 @@ pub fn validate(cfg: &crate::config::HaConfig, node_id: &str) -> anyhow::Result<
         anyhow::bail!("ha.fsync must be 'batch' or 'always'");
     }
     Ok(())
+}
+
+// ---- 持久化（M2）--------------------------------------------------------
+
+/// 落盘的状态文件。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct StateFile {
+    current_term: u64,
+    #[serde(default)]
+    voted_for: Option<String>,
+}
+
+/// 落盘的快照文件。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SnapshotFile {
+    last_included_index: u64,
+    last_included_term: u64,
+    #[serde(default)]
+    data: SnapshotData,
+}
+
+/// 启动时从磁盘恢复出来的内容。
+#[derive(Debug, Clone, Default)]
+pub struct HaPersisted {
+    pub current_term: u64,
+    pub voted_for: Option<String>,
+    pub log: Vec<LogEntry>,
+    pub snapshot: Option<(u64, u64, SnapshotData)>,
+}
+
+/// HA 落盘存储：`<data_dir>/ha/` 下 `state.json` / `log.jsonl` / `snapshot.json`。
+pub struct HaStore {
+    dir: std::path::PathBuf,
+    fsync: bool,
+}
+
+impl HaStore {
+    pub fn new(dir: impl Into<std::path::PathBuf>, fsync: bool) -> Self {
+        HaStore {
+            dir: dir.into(),
+            fsync,
+        }
+    }
+
+    fn state_path(&self) -> std::path::PathBuf {
+        self.dir.join("state.json")
+    }
+
+    fn log_path(&self) -> std::path::PathBuf {
+        self.dir.join("log.jsonl")
+    }
+
+    fn snapshot_path(&self) -> std::path::PathBuf {
+        self.dir.join("snapshot.json")
+    }
+
+    /// 启动恢复：状态文件 + 日志重放 + 快照。
+    pub fn load(&self) -> HaPersisted {
+        let mut out = HaPersisted::default();
+        if let Ok(text) = std::fs::read_to_string(self.state_path()) {
+            if let Ok(sf) = serde_json::from_str::<StateFile>(&text) {
+                out.current_term = sf.current_term;
+                out.voted_for = sf.voted_for;
+            }
+        }
+        if let Ok(text) = std::fs::read_to_string(self.log_path()) {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<LogEntry>(line) {
+                    Ok(e) => out.log.push(e),
+                    // 半行/坏行：截断语义（宁可少日志，不用坏日志）
+                    Err(_) => break,
+                }
+            }
+        }
+        if let Ok(text) = std::fs::read_to_string(self.snapshot_path()) {
+            if let Ok(sf) = serde_json::from_str::<SnapshotFile>(&text) {
+                out.snapshot = Some((sf.last_included_index, sf.last_included_term, sf.data));
+            }
+        }
+        out
+    }
+
+    /// 持久化 term / 投票（原子写：temp + rename）。
+    pub fn save_state(&self, current_term: u64, voted_for: Option<&str>) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let sf = StateFile {
+            current_term,
+            voted_for: voted_for.map(str::to_string),
+        };
+        let text = serde_json::to_string(&sf).map_err(std::io::Error::other)?;
+        let tmp = self.state_path().with_extension("json.tmp");
+        std::fs::write(&tmp, text.as_bytes())?;
+        if self.fsync {
+            if let Ok(f) = std::fs::File::open(&tmp) {
+                let _ = f.sync_all();
+            }
+        }
+        std::fs::rename(&tmp, self.state_path())
+    }
+
+    /// 追加日志条目（一行一条 JSON）。
+    pub fn append_log(&self, entries: &[LogEntry]) -> std::io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.log_path())?;
+        let mut buf = String::new();
+        for e in entries {
+            let line = serde_json::to_string(e).map_err(std::io::Error::other)?;
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        std::io::Write::write_all(&mut f, buf.as_bytes())?;
+        if self.fsync {
+            let _ = f.sync_all();
+        }
+        Ok(())
+    }
+
+    /// 保存快照（原子写）。
+    pub fn save_snapshot(
+        &self,
+        last_included_index: u64,
+        last_included_term: u64,
+        data: &SnapshotData,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let sf = SnapshotFile {
+            last_included_index,
+            last_included_term,
+            data: data.clone(),
+        };
+        let text = serde_json::to_string(&sf).map_err(std::io::Error::other)?;
+        let tmp = self.snapshot_path().with_extension("json.tmp");
+        std::fs::write(&tmp, text.as_bytes())?;
+        if self.fsync {
+            if let Ok(f) = std::fs::File::open(&tmp) {
+                let _ = f.sync_all();
+            }
+        }
+        std::fs::rename(&tmp, self.snapshot_path())
+    }
+}
+
+/// 对外可观测的 HA 状态。
+#[derive(Debug, Clone, Serialize)]
+pub struct HaStatus {
+    pub enabled: bool,
+    pub role: String,
+    pub term: u64,
+    pub commit_index: u64,
+    pub applied_index: u64,
+    pub leader_id: Option<String>,
+    pub cluster_size: usize,
+    pub quorum: usize,
+    pub has_quorum: bool,
+    pub log_len: usize,
+    pub state_keys: usize,
+}
+
+/// HA 运行时：内核 + 落盘。
+pub struct HaRuntime {
+    node: RaftNode,
+    store: HaStore,
+    persisted_term: u64,
+    persisted_log_len: usize,
+}
+
+impl HaRuntime {
+    /// 新建运行时并从磁盘恢复。
+    pub fn new(
+        cfg: &crate::config::HaConfig,
+        node_id: &str,
+        peers: Vec<String>,
+        dir: impl Into<std::path::PathBuf>,
+    ) -> anyhow::Result<HaRuntime> {
+        let raft_cfg = RaftConfig {
+            election_timeout_ms: cfg.election_timeout_ms,
+            heartbeat_interval_ms: cfg.heartbeat_interval_ms,
+            snapshot_threshold_entries: cfg.snapshot_threshold_entries,
+        };
+        let mut node = RaftNode::new(node_id.to_string(), peers, raft_cfg);
+        let store = HaStore::new(dir, cfg.fsync == "always");
+        let persisted = store.load();
+        node.restore(PersistentState {
+            current_term: persisted.current_term,
+            voted_for: persisted.voted_for.clone(),
+            log: persisted.log.clone(),
+        });
+        let persisted_log_len = persisted.log.len();
+        let persisted_term = persisted.current_term;
+        Ok(HaRuntime {
+            node,
+            store,
+            persisted_term,
+            persisted_log_len,
+        })
+    }
+
+    /// 把未落盘的状态补齐（term 变化 / 新增日志条目）。
+    fn persist(&mut self) {
+        let term = self.node.term();
+        if term != self.persisted_term {
+            if let Err(e) = self.store.save_state(term, self.node.voted_for()) {
+                tracing::warn!(error = %e, "ha: failed to persist term/vote");
+            }
+            self.persisted_term = term;
+        }
+        let log_len = self.node.log_len();
+        if log_len > self.persisted_log_len {
+            let new_entries: Vec<LogEntry> = self
+                .node
+                .log_entries_from(self.persisted_log_len as u64 + 1)
+                .to_vec();
+            if let Err(e) = self.store.append_log(&new_entries) {
+                tracing::warn!(error = %e, "ha: failed to persist log entries");
+            } else {
+                self.persisted_log_len = log_len;
+            }
+        }
+    }
+
+    /// 达到阈值时导出快照（调用方负责发送）。
+    pub fn maybe_snapshot(&mut self) -> Option<(u64, u64, SnapshotData)> {
+        let snap = self.node.snapshot()?;
+        if let Err(e) = self.store.save_snapshot(snap.0, snap.1, &snap.2) {
+            tracing::warn!(error = %e, "ha: failed to persist snapshot");
+        }
+        Some(snap)
+    }
+}
+
+/// 共享句柄：可在多个任务里用（tokio 任务 + 连接处理）。
+#[derive(Clone)]
+pub struct HaHandle {
+    inner: std::sync::Arc<std::sync::Mutex<HaRuntime>>,
+    started_at: std::time::Instant,
+}
+
+impl HaHandle {
+    pub fn new(
+        cfg: &crate::config::HaConfig,
+        node_id: &str,
+        peers: Vec<String>,
+        dir: impl Into<std::path::PathBuf>,
+    ) -> anyhow::Result<HaHandle> {
+        Ok(HaHandle {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(HaRuntime::new(
+                cfg, node_id, peers, dir,
+            )?)),
+            started_at: std::time::Instant::now(),
+        })
+    }
+
+    /// 单调时钟（毫秒）——内核不读墙钟，测试可确定复现。
+    pub fn now_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
+    /// 推进内核（定时器驱动），返回要发出的消息。
+    pub fn tick(&self, now_ms: u64) -> Vec<(String, RaftMessage)> {
+        let mut g = self.inner.lock().unwrap();
+        let out = g.node.tick(now_ms);
+        g.persist();
+        out
+    }
+
+    /// 处理一条对端消息，返回要发出的消息。
+    pub fn on_message(
+        &self,
+        from: &str,
+        msg: RaftMessage,
+        now_ms: u64,
+    ) -> Vec<(String, RaftMessage)> {
+        let mut g = self.inner.lock().unwrap();
+        let out = g.node.handle(from, msg, now_ms);
+        g.persist();
+        out
+    }
+
+    /// leader 提交一条命令；非 leader 返回 `None`。
+    pub fn propose(&self, cmd: Command) -> Option<u64> {
+        let mut g = self.inner.lock().unwrap();
+        let idx = g.node.propose(cmd);
+        g.persist();
+        idx
+    }
+
+    /// 读状态机（本地视图；leader 强一致，follower 可能滞后）。
+    pub fn get(&self, ns: &str, key: &str) -> Option<Vec<u8>> {
+        let g = self.inner.lock().unwrap();
+        g.node.state().get(ns, key).cloned()
+    }
+
+    /// 状态快照。
+    pub fn status(&self) -> HaStatus {
+        let g = self.inner.lock().unwrap();
+        HaStatus {
+            enabled: true,
+            role: g.node.role().as_str().to_string(),
+            term: g.node.term(),
+            commit_index: g.node.commit_index(),
+            applied_index: g.node.last_applied(),
+            leader_id: g.node.leader_id().map(str::to_string),
+            cluster_size: g.node.cluster_size(),
+            quorum: g.node.quorum(),
+            has_quorum: g.node.has_quorum(),
+            log_len: g.node.log_len(),
+            state_keys: g.node.state().len(),
+        }
+    }
+
+    /// 当前是否已是 leader。
+    pub fn is_leader(&self) -> bool {
+        self.inner.lock().unwrap().node.role() == Role::Leader
+    }
+
+    /// 需要发给落后节点的快照（leader 侧）。
+    pub fn maybe_snapshot(&self) -> Option<(u64, u64, SnapshotData)> {
+        let mut g = self.inner.lock().unwrap();
+        g.maybe_snapshot()
+    }
 }
 
 #[cfg(test)]
@@ -1291,9 +1640,10 @@ mod tests {
             .get_mut(&leader)
             .unwrap()
             .propose(put("task", "t1", "hello"));
-        net.tick(50);
-        net.tick(50);
-        net.tick(50);
+        // 心跳 200ms 一拍：给足时间让 leader 把条目发出去并收到 ack
+        for _ in 0..8 {
+            net.tick(50);
+        }
         for (id, n) in &net.nodes {
             assert_eq!(
                 n.state().get("task", "t1").map(|v| v.as_slice()),
@@ -1309,8 +1659,9 @@ mod tests {
                 ns: "task".into(),
                 key: "t1".into(),
             });
-        net.tick(50);
-        net.tick(50);
+        for _ in 0..8 {
+            net.tick(50);
+        }
         for (id, n) in &net.nodes {
             assert!(n.state().get("task", "t1").is_none(), "{id} 删除未生效");
         }
@@ -1324,9 +1675,9 @@ mod tests {
             .get_mut(&leader)
             .unwrap()
             .propose(put("task", "committed", "v"));
-        net.tick(50);
-        net.tick(50);
-        net.tick(50);
+        for _ in 0..8 {
+            net.tick(50);
+        }
         // 隔离 leader
         net.dropped.insert(leader.clone());
         // 其余节点重新选主并保留已提交日志
@@ -1427,9 +1778,9 @@ mod tests {
             .get_mut(&leader)
             .unwrap()
             .propose(put("kv", "a", "1"));
-        net.tick(50);
-        net.tick(50);
-        net.tick(50);
+        for _ in 0..8 {
+            net.tick(50);
+        }
         // 手工构造快照并安装到 n3
         let data = net.nodes[&leader].state().dump();
         let term = net.nodes[&leader].term();
@@ -1486,8 +1837,9 @@ mod tests {
             .get_mut(&leader)
             .unwrap()
             .propose(put("task", "t", "v"));
-        net.tick(50);
-        net.tick(50);
+        for _ in 0..8 {
+            net.tick(50);
+        }
         let saved = net.nodes[&leader].persistent();
         let mut restarted = RaftNode::new(
             leader.clone(),

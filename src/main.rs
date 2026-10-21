@@ -1347,6 +1347,32 @@ async fn run(mut cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()>
             ),
         }
     }
+    // v0.8 HA：装配内嵌 Raft 运行态（ha.enabled=true 时）。
+    // 成员来自 ha.cluster（`node_id@host:port`），自身 node_id 已在配置校验
+    // 里要求必须出现在 cluster 中；这里只取对端 node_id 列表。
+    if cfg.ha.enabled {
+        let peers: Vec<String> = cfg
+            .ha
+            .cluster
+            .iter()
+            .filter_map(|e| e.split('@').next().map(str::to_string))
+            .filter(|id| id != &cfg.node_id)
+            .collect();
+        let ha_dir = cfg.data_dir.join("ha");
+        match ha::HaHandle::new(&cfg.ha, &cfg.node_id, peers.clone(), &ha_dir) {
+            Ok(h) => {
+                tracing::info!(
+                    node_id = %cfg.node_id,
+                    peers = peers.len(),
+                    "ha: raft runtime started (M2 transport wiring)"
+                );
+                state_inner.ha = Some(h);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "ha: failed to start raft runtime");
+            }
+        }
+    }
     let state = Arc::new(state_inner);
     // Restore the user's "forget this node" list (ghost-peer cleanup,
     // paired with DELETE /v1/peers/{node_id}).
@@ -1375,6 +1401,39 @@ async fn run(mut cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()>
     // v0.6 P1 GitOps 目录驱动：enabled 才 spawn（mesh 未启用时 spawn 内自拒）。
     if cfg.gitops.enabled {
         gitops::spawn(state.clone(), shutdown_rx.clone());
+    }
+
+    // v0.8 HA：Raft ticker（50ms 一拍）——驱动选举/心跳，并把复制帧发给对端。
+    // 未启用 HA 时不 spawn（零流量、零行为变化）。
+    if let Some(ha) = state.ha.clone() {
+        let ha_state = state.clone();
+        let mut ha_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
+            loop {
+                tokio::select! {
+                    _ = ha_shutdown.changed() => break,
+                    _ = ticker.tick() => {}
+                }
+                if *ha_shutdown.borrow() {
+                    break;
+                }
+                let now = ha.now_ms();
+                let msgs = ha.tick(now);
+                for (to, msg) in msgs {
+                    let Some(sink) = ha_state.router.peer_sink(&to) else {
+                        continue; // 对端尚未连上：下一拍再试
+                    };
+                    let env = ha_state
+                        .router
+                        .ha_envelope(&to, serde_json::json!({"msg": msg}));
+                    if let Ok(text) = serde_json::to_string(&env) {
+                        let _ = sink.tx.send(conn::Frame::Text(text)).await;
+                    }
+                }
+            }
+            tracing::info!("ha: raft ticker stopped");
+        });
     }
 
     let discovery = if cfg.discovery.enabled {

@@ -88,6 +88,8 @@ pub struct AppState {
     pub oidc_logins: Mutex<crate::oidc::LoginStore>,
     /// 浏览器登录签发的本节点短期会话 token。
     pub oidc_sessions: Mutex<crate::oidc::SessionStore>,
+    /// v0.8 HA 运行态。`None` = 未启用 HA（行为与 v0.7 逐字相同）。
+    pub ha: Option<crate::ha::HaHandle>,
 }
 
 impl AppState {
@@ -129,6 +131,7 @@ impl AppState {
             oidc_jwks_last_attempt: Mutex::new(None),
             oidc_logins: Mutex::new(crate::oidc::LoginStore::default()),
             oidc_sessions: Mutex::new(crate::oidc::SessionStore::default()),
+            ha: None,
         }
     }
 
@@ -363,6 +366,9 @@ pub fn router(state: SharedState) -> AxRouter {
     AxRouter::new()
         .route("/v1/health", get(health))
         .route("/v1/auth/oidc/status", get(oidc_status))
+        .route("/v1/ha/status", get(ha_status))
+        .route("/v1/ha/propose", post(ha_propose))
+        .route("/v1/ha/get", post(ha_get))
         .route("/v1/auth/oidc/login", get(oidc_login))
         .route(
             "/v1/auth/oidc/callback",
@@ -4775,6 +4781,130 @@ async fn verify_oidc_jwt(
         .unwrap_or("")
         .to_string();
     Ok((resolved, exp, sub, alg))
+}
+
+/// v0.8 HA 状态：角色/任期/提交位点/成员/quorum（未启用 HA 时返回 enabled=false）。
+async fn ha_status(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized().into_response();
+    };
+    if !role.allows("/v1/ha/status") {
+        return forbidden().into_response();
+    }
+    let Some(ha) = state.ha.as_ref() else {
+        return Json(json!({
+            "enabled": false,
+            "role": "standalone",
+            "term": 0,
+            "commit_index": 0,
+            "applied_index": 0,
+            "leader_id": serde_json::Value::Null,
+            "cluster_size": 0,
+            "quorum": 0,
+            "has_quorum": false,
+            "log_len": 0,
+            "state_keys": 0,
+        }))
+        .into_response();
+    };
+    Json(serde_json::to_value(ha.status()).unwrap_or(json!({"enabled": true}))).into_response()
+}
+
+/// v0.8 HA 写入口（Admin）：提交一条复制命令（当前仅 KV 写，供 M4 模块接线前的
+/// 联调与冒烟使用）。非 leader 一律 409（写必须线性一致）。
+#[derive(Debug, Deserialize)]
+struct HaProposeReq {
+    #[serde(default)]
+    ns: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    delete: bool,
+}
+
+async fn ha_propose(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<HaProposeReq>,
+) -> Response {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized().into_response();
+    };
+    if !role.allows("/v1/ha/propose") {
+        return forbidden().into_response();
+    }
+    let Some(ha) = state.ha.as_ref() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "ha is not enabled"})),
+        )
+            .into_response();
+    };
+    let ns = req.ns.unwrap_or_else(|| "kv".to_string());
+    let Some(key) = req.key.filter(|k| !k.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "key is required"})),
+        )
+            .into_response();
+    };
+    let cmd = if req.delete {
+        crate::ha::Command::Delete {
+            ns,
+            key: key.clone(),
+        }
+    } else {
+        crate::ha::Command::Put {
+            ns,
+            key: key.clone(),
+            value: req.value.unwrap_or_default().into_bytes(),
+        }
+    };
+    match ha.propose(cmd) {
+        Some(index) => Json(json!({"ok": true, "index": index, "key": key})).into_response(),
+        None => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "not the leader (write requires a leader)"})),
+        )
+            .into_response(),
+    }
+}
+
+/// v0.8 HA 读入口：读本节点状态机视图（leader 强一致；follower 可能滞后）。
+#[derive(Debug, Deserialize)]
+struct HaGetReq {
+    #[serde(default)]
+    ns: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+}
+
+async fn ha_get(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<HaGetReq>,
+) -> Response {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized().into_response();
+    };
+    if !role.allows("/v1/ha/get") {
+        return forbidden().into_response();
+    }
+    let Some(ha) = state.ha.as_ref() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "ha is not enabled"})),
+        )
+            .into_response();
+    };
+    let ns = req.ns.unwrap_or_else(|| "kv".to_string());
+    let key = req.key.unwrap_or_default();
+    let value = ha
+        .get(&ns, &key)
+        .map(|v| String::from_utf8_lossy(&v).to_string());
+    Json(json!({"ok": true, "key": key, "value": value})).into_response()
 }
 
 /// 浏览器登录状态（公开、无敏感信息）：Web UI 据此显示 SSO 按钮。

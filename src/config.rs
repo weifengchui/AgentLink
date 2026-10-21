@@ -121,6 +121,10 @@ pub struct Config {
     pub relay: RelayConfig,
     /// v0.8 高可用（内嵌 Raft）。缺省 `enabled=false` = 行为与 v0.7 逐字相同。
     /// 设计见 `docs/v0.8-HA-Raft设计-2026-10-21.md`。
+    ///
+    /// ⚠️ **M2 预览状态**：共识内核 + peer 传输已接线（选主/日志复制/快照
+    /// 安装可用），但**业务模块尚未接入复制状态机**（任务/配额/审计/SSO
+    /// 会话仍各节点本地，见 RFC §3.4 的 M4 计划）。生产 HA 需等 M4。
     #[serde(default)]
     pub ha: HaConfig,
 }
@@ -1371,13 +1375,6 @@ impl Config {
         crate::oidc::validate(&self.auth.oidc)?;
         crate::chaos::validate(&self.mesh.chaos)?;
         crate::ha::validate(&self.ha, &self.node_id)?;
-        // v0.8 M1：HA 内核已实现但尚未接入运行时（M2 才接线 peer 传输）。
-        // 这里直接拒绝启用，避免现场误以为已经具备 HA 保护。
-        if self.ha.enabled {
-            anyhow::bail!(
-                "ha.enabled=true is not implemented yet (v0.8 M2 pending); keep ha.enabled=false"
-            );
-        }
         // v0.7 §4.2 多租户：绑定 token 不能是 Admin（Admin 是集群级角色），
         // 也不能是 local_api.token（WS/全局管理入口必须保持全局）。
         for (token, ns) in &self.auth.token_namespaces {
