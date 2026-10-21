@@ -596,6 +596,163 @@ async fn handle_text(
             true
         }
 
+        // v0.8 M4：follower → leader 的复制 KV 请求（OIDC state/session）。
+        // 执行放到 blocking 池：多数派 ack 也走本连接，同步等提交会让
+        // 2 节点/最后一票场景必然超时。
+        "ha_kv" => {
+            let Some(pid) = peer_id.clone() else {
+                return true;
+            };
+            let Ok(env) = serde_json::from_value::<Envelope>(value.clone()) else {
+                return true;
+            };
+            if !state.router.verify_control(&env) || env.from != pid {
+                return true;
+            }
+            let req = env
+                .payload
+                .get("req")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if req.is_empty() {
+                return true;
+            }
+            let from = env.from.clone();
+            let op = env.payload.get("op").cloned();
+            let router = state.router.clone();
+            let ha = state.ha.clone();
+            let tx = send.clone();
+            tokio::task::spawn_blocking(move || {
+                let resp = match (ha, op) {
+                    (Some(ha), Some(op)) => {
+                        if !ha.is_leader() {
+                            crate::api::HaKvResp {
+                                req: req.clone(),
+                                value: None,
+                                error: Some("not leader".to_string()),
+                            }
+                        } else {
+                            match serde_json::from_value::<crate::api::HaKvOp>(op) {
+                                Ok(op) => match crate::api::execute_ha_kv(&ha, op) {
+                                    Ok(value) => crate::api::HaKvResp {
+                                        req: req.clone(),
+                                        value,
+                                        error: None,
+                                    },
+                                    Err(e) => crate::api::HaKvResp {
+                                        req: req.clone(),
+                                        value: None,
+                                        error: Some(e.to_string()),
+                                    },
+                                },
+                                Err(e) => crate::api::HaKvResp {
+                                    req: req.clone(),
+                                    value: None,
+                                    error: Some(format!("bad kv op: {e}")),
+                                },
+                            }
+                        }
+                    }
+                    _ => crate::api::HaKvResp {
+                        req: req.clone(),
+                        value: None,
+                        error: Some("ha disabled".to_string()),
+                    },
+                };
+                let env = router.signed_ctrl_envelope(
+                    &from,
+                    "ha_kv_resp",
+                    serde_json::to_value(resp).unwrap_or(serde_json::Value::Null),
+                );
+                if let Ok(text) = serde_json::to_string(&env) {
+                    let _ = tx.blocking_send(Frame::Text(text));
+                }
+            });
+            true
+        }
+
+        // v0.8 M4：复制 KV 应答（回填等待表；超时的请求已被移除，丢弃即可）。
+        "ha_kv_resp" => {
+            let Some(pid) = peer_id.clone() else {
+                return true;
+            };
+            let Ok(env) = serde_json::from_value::<Envelope>(value.clone()) else {
+                return true;
+            };
+            if !state.router.verify_control(&env) || env.from != pid {
+                return true;
+            }
+            let Ok(resp) = serde_json::from_value::<crate::api::HaKvResp>(env.payload.clone())
+            else {
+                return true;
+            };
+            if let Some(tx) = state.ha_kv_pending.lock().unwrap().remove(&resp.req) {
+                let _ = tx.send(resp);
+            }
+            true
+        }
+
+        // v0.8 M4：follower 转发的审计事件（leader 串行追加到复制链）。
+        "ha_audit" => {
+            let Some(pid) = peer_id.clone() else {
+                return true;
+            };
+            let Ok(env) = serde_json::from_value::<Envelope>(value.clone()) else {
+                return true;
+            };
+            if !state.router.verify_control(&env) || env.from != pid {
+                return true;
+            }
+            if !state.ha.as_ref().is_some_and(|h| h.is_leader()) {
+                return true;
+            }
+            let Some(event) = env.payload.get("event").and_then(|v| v.as_str()) else {
+                return true;
+            };
+            let actor = env
+                .payload
+                .get("actor")
+                .and_then(|v| v.as_str())
+                .unwrap_or("peer")
+                .to_string();
+            let detail = env
+                .payload
+                .get("detail")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let event = event.to_string();
+            let router = state.router.clone();
+            tokio::task::spawn_blocking(move || {
+                router.audit_event(&event, &actor, detail);
+            });
+            true
+        }
+
+        // v0.8 M4：follower 转发的任务事件（leader 注入事件总线，由引擎收敛）。
+        "ha_event" => {
+            let Some(pid) = peer_id.clone() else {
+                return true;
+            };
+            let Ok(env) = serde_json::from_value::<Envelope>(value.clone()) else {
+                return true;
+            };
+            if !state.router.verify_control(&env) || env.from != pid {
+                return true;
+            }
+            if !state.ha.as_ref().is_some_and(|h| h.is_leader()) {
+                return true;
+            }
+            let Some(inner) = env.payload.get("env") else {
+                return true;
+            };
+            let Ok(inner) = serde_json::from_value::<Envelope>(inner.clone()) else {
+                return true;
+            };
+            state.router.inject_event(inner);
+            true
+        }
+
         "heartbeat" => {
             if let Some(pid) = peer_id {
                 state.peers.touch(pid);

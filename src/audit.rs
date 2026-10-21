@@ -152,6 +152,11 @@ impl AuditLog {
         Some(seq)
     }
 
+    /// 审计是否启用（关闭时追加/校验皆为 no-op）。
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// 重新读盘校验整条链（外部篡改可被发现）。
     pub fn verify(&self) -> AuditVerify {
         verify_path(&self.path, self.enabled)
@@ -195,7 +200,7 @@ impl AuditLog {
     }
 }
 
-fn body_bytes(rec: &AuditRecord) -> Vec<u8> {
+pub(crate) fn body_bytes(rec: &AuditRecord) -> Vec<u8> {
     // serde_json::Value 的 Map 默认 BTreeMap（无 preserve_order feature），
     // json! 宏输出键序确定；同一记录重放时逐字节一致。
     serde_json::to_vec(&json!({
@@ -209,7 +214,7 @@ fn body_bytes(rec: &AuditRecord) -> Vec<u8> {
     .unwrap_or_default()
 }
 
-fn hash_for(prev: &str, body: &[u8]) -> String {
+pub(crate) fn hash_for(prev: &str, body: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(prev.as_bytes());
     h.update(b"\n");
@@ -279,6 +284,43 @@ pub fn verify_path(path: &Path, enabled: bool) -> AuditVerify {
         }
         count = rec.seq;
         head = rec.hash;
+    }
+    AuditVerify {
+        enabled: true,
+        valid: true,
+        count,
+        head,
+        error: None,
+    }
+}
+
+/// 校验一组内存中的审计记录（v0.8 M4：从复制状态机读出的整链）。
+/// 语义与 `verify_path` 一致，只是数据源不是本地文件。
+pub fn verify_records(records: &[AuditRecord], enabled: bool) -> AuditVerify {
+    if !enabled {
+        return AuditVerify {
+            enabled: false,
+            valid: true,
+            count: 0,
+            head: String::new(),
+            error: None,
+        };
+    }
+    let mut count = 0u64;
+    let mut head = String::new();
+    for (idx, rec) in records.iter().enumerate() {
+        let expect = hash_for(&head, &body_bytes(rec));
+        if rec.seq != count + 1 || rec.prev != head || rec.hash != expect {
+            return AuditVerify {
+                enabled: true,
+                valid: false,
+                count,
+                head,
+                error: Some(format!("record {}: hash 链不匹配（篡改或截断）", idx + 1)),
+            };
+        }
+        count = rec.seq;
+        head = rec.hash.clone();
     }
     AuditVerify {
         enabled: true,

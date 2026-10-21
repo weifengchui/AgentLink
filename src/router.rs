@@ -1008,6 +1008,10 @@ pub struct Router {
     offline_nodes: Mutex<HashMap<String, std::time::Instant>>,
     /// v0.7 §4.4 不可变审计日志（hash 链 append-only；关闭时 no-op）。
     audit: crate::audit::AuditLog,
+    /// v0.8 M4：HA 句柄（Some 时审计链写 `audit` 命名空间，leader 串行追加）。
+    audit_ha: Mutex<Option<crate::ha::HaHandle>>,
+    /// leader 侧审计链头缓存（term 变化时从状态机重建）。
+    audit_ha_view: Mutex<AuditHaView>,
     /// v0.7 §6.3 运行时只读开关（配置值只是启动初值）。
     read_only: AtomicBool,
     /// 自动 standalone 阈值（秒；0=关闭）。
@@ -1019,6 +1023,16 @@ pub struct Router {
     draining: Mutex<HashSet<String>>,
     /// v0.7 §4.2 远端节点 tags（随 agents_update 同步）：ABAC 调度过滤用。
     peer_tags: Mutex<HashMap<String, Vec<String>>>,
+}
+
+/// leader 侧审计链头缓存：term 变化或链头未知时从 `audit` 命名空间重建。
+#[derive(Debug, Clone, Default)]
+struct AuditHaView {
+    term: u64,
+    count: u64,
+    head: String,
+    /// 状态机里的链已损坏：拒绝继续追加（fail-closed，与本地链同口径）。
+    broken: bool,
 }
 
 /// 一条中继学到的节点目录记录。
@@ -1169,6 +1183,8 @@ impl Router {
                 cfg.security.audit.enabled,
                 &cfg.node_id,
             ),
+            audit_ha: Mutex::new(None),
+            audit_ha_view: Mutex::new(AuditHaView::default()),
             read_only: AtomicBool::new(cfg.mesh.degraded.read_only),
             standalone_after_secs: cfg.mesh.degraded.standalone_after_seconds,
             last_peer_seen: Mutex::new(Instant::now()),
@@ -1412,18 +1428,179 @@ impl Router {
     /// 再 spawn 异步发送——永不阻塞消息路径、不在运行时外 panic）。
     /// v0.7 §4.4：追加不可变审计记录（actor=角色/peer；detail 不得含密钥）。
     /// 关闭/链损坏/写入失败返回 None（调用方不因此改变业务语义）。
+    /// v0.8 M4：HA 启用后写 `audit` 命名空间（leader 串行、多数派提交）；
+    /// follower 把记录转给 leader。
     pub fn audit_event(&self, event: &str, actor: &str, detail: serde_json::Value) -> Option<u64> {
-        self.audit.append(event, actor, detail)
+        if !self.audit.is_enabled() {
+            return None;
+        }
+        let ha = self.audit_ha.lock().unwrap().clone();
+        let Some(ha) = ha else {
+            return self.audit.append(event, actor, detail);
+        };
+        if !ha.is_leader() {
+            if let Some(leader) = ha.leader_id() {
+                self.forward_ctrl(
+                    &leader,
+                    "ha_audit",
+                    serde_json::json!({
+                        "event": event,
+                        "actor": actor,
+                        "detail": detail,
+                    }),
+                );
+            }
+            return None;
+        }
+        self.audit_event_ha(&ha, event, actor, detail)
     }
 
-    /// 重新读盘校验 hash 链。
+    /// 挂接 HA 句柄（main 启动时调用一次）。审计链头在首次 leader 追加时
+    /// 从状态机重建，因此这里无需预扫描。
+    pub fn attach_ha(&self, ha: crate::ha::HaHandle) {
+        *self.audit_ha.lock().unwrap() = Some(ha);
+        *self.audit_ha_view.lock().unwrap() = AuditHaView::default();
+    }
+
+    fn audit_event_ha(
+        &self,
+        ha: &crate::ha::HaHandle,
+        event: &str,
+        actor: &str,
+        detail: serde_json::Value,
+    ) -> Option<u64> {
+        let status = ha.status();
+        // 串行化 seq 分配（同一 leader 上并发追加不能拿到同一个 seq）。
+        let mut view = self.audit_ha_view.lock().unwrap();
+        if view.term != status.term {
+            // 新 leader 先追平前任已提交的审计记录，否则链头落后、seq 会
+            // 与已提交记录撞车（同 key 覆盖 → 链断）。
+            if let Err(e) = ha.await_caught_up(crate::ha::APPLY_TIMEOUT) {
+                tracing::warn!(error = %e, "audit: leader 状态机未追平，暂缓追加");
+                return None;
+            }
+            let term = ha.status().term;
+            let (_, entries) = ha.scan_at(crate::ha::NS_AUDIT);
+            let mut records: Vec<crate::audit::AuditRecord> = entries
+                .iter()
+                .filter_map(|(_, bytes)| {
+                    serde_json::from_slice::<crate::audit::AuditRecord>(bytes).ok()
+                })
+                .collect();
+            records.sort_by_key(|r| r.seq);
+            let verified = crate::audit::verify_records(&records, true);
+            view.term = term;
+            view.count = verified.count;
+            view.head = verified.head.clone();
+            view.broken = !verified.valid;
+            if view.broken {
+                tracing::error!(
+                    error = ?verified.error,
+                    "audit: HA 状态机链校验失败，拒绝继续追加"
+                );
+            }
+        }
+        if view.broken {
+            return None;
+        }
+        let seq = view.count + 1;
+        let mut rec = crate::audit::AuditRecord {
+            seq,
+            ts: crate::store::now_wall(),
+            event: event.to_string(),
+            actor: actor.to_string(),
+            node_id: self.cfg.node_id.clone(),
+            detail,
+            prev: view.head.clone(),
+            hash: String::new(),
+        };
+        rec.hash = crate::audit::hash_for(&view.head, &crate::audit::body_bytes(&rec));
+        let value = match serde_json::to_vec(&rec) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "audit: HA 记录序列化失败");
+                return None;
+            }
+        };
+        let cmd = crate::ha::Command::Put {
+            ns: crate::ha::NS_AUDIT.to_string(),
+            key: format!("{seq:020}"),
+            value,
+        };
+        match ha.propose_and_wait(cmd, crate::ha::APPLY_TIMEOUT) {
+            Ok(_) => {
+                view.count = seq;
+                view.head = rec.hash;
+                Some(seq)
+            }
+            Err(e) => {
+                // 失败后链头可能已变化：下一拍强制重建。
+                view.term = 0;
+                tracing::warn!(error = %e, event, "audit: HA 追加失败");
+                None
+            }
+        }
+    }
+
+    /// 重新校验 hash 链（HA 启用时读复制状态机）。
     pub fn audit_verify(&self) -> crate::audit::AuditVerify {
-        self.audit.verify()
+        let ha = self.audit_ha.lock().unwrap().clone();
+        let Some(ha) = ha else {
+            return self.audit.verify();
+        };
+        let enabled = self.audit.is_enabled();
+        let mut records: Vec<crate::audit::AuditRecord> = ha
+            .scan(crate::ha::NS_AUDIT)
+            .iter()
+            .filter_map(|(_, bytes)| {
+                serde_json::from_slice::<crate::audit::AuditRecord>(bytes).ok()
+            })
+            .collect();
+        records.sort_by_key(|r| r.seq);
+        crate::audit::verify_records(&records, enabled)
     }
 
     /// 导出最近 `limit` 条审计记录 + 清单。
     pub fn audit_export(&self, limit: usize) -> serde_json::Value {
-        self.audit.export(limit)
+        let ha = self.audit_ha.lock().unwrap().clone();
+        let Some(ha) = ha else {
+            return self.audit.export(limit);
+        };
+        let verified = self.audit_verify();
+        if !verified.enabled {
+            return serde_json::json!({
+                "enabled": false,
+                "valid": true,
+                "count": 0,
+                "head": "",
+                "records": [],
+            });
+        }
+        let limit = limit.clamp(1, 5000);
+        let mut records: Vec<crate::audit::AuditRecord> = ha
+            .scan(crate::ha::NS_AUDIT)
+            .iter()
+            .filter_map(|(_, bytes)| {
+                serde_json::from_slice::<crate::audit::AuditRecord>(bytes).ok()
+            })
+            .collect();
+        records.sort_by_key(|r| r.seq);
+        let records: Vec<serde_json::Value> = records
+            .iter()
+            .rev()
+            .take(limit)
+            .rev()
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect();
+        serde_json::json!({
+            "enabled": true,
+            "valid": verified.valid,
+            "count": verified.count,
+            "head": verified.head,
+            "error": verified.error,
+            "records": records,
+            "limit": limit,
+        })
     }
 
     pub fn notify(&self, event: &str, payload: serde_json::Value) {
@@ -1436,7 +1613,7 @@ impl Router {
                 .and_then(|v| v.as_str())
                 .unwrap_or("audit_alert");
             if kind != "lockdown" {
-                self.audit.append(kind, "peer", payload.clone());
+                self.audit_event(kind, "peer", payload.clone());
             }
         }
         if let Some(wh) = &self.webhook {
@@ -2628,11 +2805,21 @@ impl Router {
     /// v0.8 HA：构造一条已签名的复制帧（`ctrl/ha`）。
     /// 旧节点收到未知 `ctrl` 帧会直接忽略（conn 底部分支），零破坏。
     pub fn ha_envelope(&self, to: &str, payload: serde_json::Value) -> Envelope {
+        self.signed_ctrl_envelope(to, "ha", payload)
+    }
+
+    /// v0.8 M4：构造任意已签名控制面帧（`ctrl/<action>`）。
+    pub fn signed_ctrl_envelope(
+        &self,
+        to: &str,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Envelope {
         let mut env = Envelope::business(
             &self.cfg.node_id,
             to,
             "ctrl",
-            "ha",
+            action,
             payload,
             None,
             None,
@@ -2642,6 +2829,28 @@ impl Router {
         );
         self.sign_control(&mut env);
         env
+    }
+
+    /// v0.8 M4：尽力转发一条控制面帧（非阻塞；连接不存在/队列满返回 false）。
+    /// 仅用于 follower → leader 的业务转发（任务事件/审计/KV），丢帧由调用方
+    /// 的业务幂等/重试语义兜底。
+    pub fn forward_ctrl(&self, to: &str, action: &str, payload: serde_json::Value) -> bool {
+        let Some(sink) = self.peer_sink(to) else {
+            return false;
+        };
+        let env = self.signed_ctrl_envelope(to, action, payload);
+        let Ok(text) = serde_json::to_string(&env) else {
+            return false;
+        };
+        sink.tx.try_send(Frame::Text(text)).is_ok()
+    }
+
+    /// v0.8 M4：把 follower 收到的事件注入本节点事件总线（leader 引擎消费）。
+    pub fn inject_event(&self, env: Envelope) {
+        if self.events.receiver_count() == 0 {
+            return;
+        }
+        let _ = self.events.send(env);
     }
 
     /// 取某个对端的连接句柄（HA 复制帧发送用）。

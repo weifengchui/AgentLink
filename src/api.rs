@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -45,6 +45,36 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct Runtime {
     pub name: String,
     pub tags: Vec<String>,
+}
+
+/// v0.8 M4：follower → leader 的复制 KV 请求（OIDC session/state 等）。
+/// `Take` 是原子的「读旧值 + 删除」，用于一次性登录 state 的跨节点消费。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum HaKvOp {
+    Put {
+        ns: String,
+        key: String,
+        value: serde_json::Value,
+    },
+    Delete {
+        ns: String,
+        key: String,
+    },
+    Take {
+        ns: String,
+        key: String,
+    },
+}
+
+/// 复制 KV 请求的应答（`req` 回显请求 id；error 非空即失败）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HaKvResp {
+    pub req: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Shared state for the running node.
@@ -90,6 +120,11 @@ pub struct AppState {
     pub oidc_sessions: Mutex<crate::oidc::SessionStore>,
     /// v0.8 HA 运行态。`None` = 未启用 HA（行为与 v0.7 逐字相同）。
     pub ha: Option<crate::ha::HaHandle>,
+    /// v0.8 M4：follower 发出的复制 KV 请求等待表（req id → oneshot）。
+    /// conn.rs 收到 `ha_kv_resp` 后按 req 回填。
+    pub ha_kv_pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<HaKvResp>>>,
+    /// 复制 KV 请求 id 生成器（node_id + 序号，进程内唯一）。
+    pub ha_kv_seq: AtomicU64,
 }
 
 impl AppState {
@@ -132,7 +167,79 @@ impl AppState {
             oidc_logins: Mutex::new(crate::oidc::LoginStore::default()),
             oidc_sessions: Mutex::new(crate::oidc::SessionStore::default()),
             ha: None,
+            ha_kv_pending: Mutex::new(HashMap::new()),
+            ha_kv_seq: AtomicU64::new(0),
         }
+    }
+
+    /// v0.8 M4：执行一次复制 KV 操作。未启用 HA 返回 `Ok(None)`（调用方走
+    /// 本地路径）；leader 就地提交；follower 经已签名对端链路转发给 leader
+    /// 并等待应答（超时 [`crate::ha::APPLY_TIMEOUT`]）。
+    pub async fn ha_kv(&self, op: HaKvOp) -> Result<Option<serde_json::Value>, crate::ha::HaError> {
+        let Some(ha) = self.ha.clone() else {
+            return Ok(None);
+        };
+        if ha.is_leader() {
+            return execute_ha_kv(&ha, op);
+        }
+        let Some(leader) = ha.leader_id() else {
+            return Err(crate::ha::HaError::NotLeader { leader: None });
+        };
+        let req = format!(
+            "{}-{}",
+            self.config.node_id,
+            self.ha_kv_seq.fetch_add(1, Ordering::Relaxed)
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.ha_kv_pending.lock().unwrap().insert(req.clone(), tx);
+        let sent =
+            self.router
+                .forward_ctrl(&leader, "ha_kv", json!({ "req": req.clone(), "op": op }));
+        if !sent {
+            self.ha_kv_pending.lock().unwrap().remove(&req);
+            return Err(crate::ha::HaError::Unavailable(format!(
+                "leader {leader} unreachable"
+            )));
+        }
+        match tokio::time::timeout(crate::ha::APPLY_TIMEOUT, rx).await {
+            Ok(Ok(resp)) => match resp.error {
+                Some(e) => Err(crate::ha::HaError::Unavailable(e)),
+                None => Ok(resp.value),
+            },
+            _ => {
+                self.ha_kv_pending.lock().unwrap().remove(&req);
+                Err(crate::ha::HaError::Timeout { index: 0 })
+            }
+        }
+    }
+
+    /// v0.8 M4：读 OIDC 浏览器 session。HA 启用时直接读本地复制的状态机
+    /// （leader 强一致，follower 最多滞后一拍）；否则读进程内 store。
+    /// `grace=true` 时允许已过期但仍在续期宽限窗内的 session。
+    fn oidc_session(&self, token: &str, grace: bool) -> Option<crate::oidc::Session> {
+        let Some(ha) = self.ha.as_ref() else {
+            let mut store = self.oidc_sessions.lock().unwrap();
+            return if grace {
+                store.get_for_refresh(token)
+            } else {
+                store.get(token)
+            };
+        };
+        let bytes = ha.get(crate::ha::NS_OIDC, &format!("sess:{token}"))?;
+        let rec: crate::oidc::HaSession = serde_json::from_slice(&bytes).ok()?;
+        let now_ms = unix_now().saturating_mul(1000);
+        if !crate::oidc::ha_session_live(&rec, now_ms, grace) {
+            return None;
+        }
+        Some(crate::oidc::Session {
+            role: rec.role,
+            namespace: rec.namespace,
+            sub: rec.sub,
+            expires: Instant::now()
+                + std::time::Duration::from_millis((rec.expires_ms - now_ms).max(1) as u64),
+            id_token: rec.id_token,
+            refresh_token: rec.refresh_token,
+        })
     }
 
     /// 本节点当前集群 CA 指纹（未启用/未领取 mTLS 时为 `None`）。
@@ -180,10 +287,164 @@ impl AppState {
 
 pub type SharedState = Arc<AppState>;
 
+/// leader 侧执行复制 KV 操作（conn.rs 的 `ha_kv` 分支与 [`AppState::ha_kv`]
+/// 共用同一实现）。
+pub fn execute_ha_kv(
+    ha: &crate::ha::HaHandle,
+    op: HaKvOp,
+) -> Result<Option<serde_json::Value>, crate::ha::HaError> {
+    let raw = match op {
+        HaKvOp::Put { ns, key, value } => {
+            let bytes = serde_json::to_vec(&value)
+                .map_err(|e| crate::ha::HaError::Unavailable(format!("encode kv: {e}")))?;
+            ha.propose_and_wait(
+                crate::ha::Command::Put {
+                    ns,
+                    key,
+                    value: bytes,
+                },
+                crate::ha::APPLY_TIMEOUT,
+            )?;
+            None
+        }
+        HaKvOp::Delete { ns, key } => {
+            ha.propose_and_wait(
+                crate::ha::Command::Delete { ns, key },
+                crate::ha::APPLY_TIMEOUT,
+            )?;
+            None
+        }
+        HaKvOp::Take { ns, key } => ha.take(&ns, &key, crate::ha::APPLY_TIMEOUT)?,
+    };
+    Ok(raw.map(|bytes| serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)))
+}
+
+/// v0.8 M4：HA 写面 leader 门。启用 HA 且本节点非 leader → 409（带 leader
+/// 提示，客户端/LB 据此重投）；无已知 leader → 503。未启用 HA → 放行。
+fn ha_write_guard(state: &AppState) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let ha = state.ha.as_ref()?;
+    if ha.is_leader() {
+        return None;
+    }
+    match ha.leader_id() {
+        Some(leader) => Some((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": "not leader",
+                "leader_id": leader,
+            })),
+        )),
+        None => Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": "ha: no leader (write rejected)",
+            })),
+        )),
+    }
+}
+
+/// v0.8 M4：提交速率准入。HA 启用时窗口存复制状态机 `quota/rate/<ns>`
+/// （leader 串行读改写，全局一致）；否则沿用进程内滑窗。
+/// 返回 `(是否允许, 窗口内提交数)`；提交计数与本地实现一致（`limit=0` 不记账）。
+async fn quota_rate_admit(
+    mesh: &MeshRuntime,
+    namespace: &str,
+    limit: usize,
+) -> Result<(bool, usize), crate::ha::HaError> {
+    let Some(ha) = mesh.ha() else {
+        let now = Instant::now();
+        let mut rl = mesh.quota_rate.lock().unwrap();
+        let ok = rl.allow(namespace, limit, now);
+        let recent = rl.recent(namespace, now);
+        return Ok((ok, recent));
+    };
+    if limit == 0 {
+        return Ok((true, 0));
+    }
+    // 新 leader 先追平已提交日志：否则会读到旧窗口，写回时覆盖前任刚记的提交。
+    ha.await_caught_up(crate::ha::APPLY_TIMEOUT)?;
+    // 并发提交的读改写必须串行，否则两个请求会读到同一个窗口同时放行。
+    let _guard = mesh.quota_ha_lock.lock().await;
+    let key = format!("rate/{namespace}");
+    let now_ms = unix_now().saturating_mul(1000);
+    let mut window: Vec<i64> = ha
+        .get(crate::ha::NS_QUOTA, &key)
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    window.retain(|t| *t > now_ms - 60_000);
+    if window.len() >= limit {
+        return Ok((false, window.len()));
+    }
+    window.push(now_ms);
+    let value = serde_json::to_vec(&window).unwrap_or_default();
+    ha.propose_and_wait(
+        crate::ha::Command::Put {
+            ns: crate::ha::NS_QUOTA.to_string(),
+            key,
+            value,
+        },
+        crate::ha::APPLY_TIMEOUT,
+    )?;
+    Ok((true, window.len()))
+}
+
+/// v0.8 M4：窗口内提交数（观测面；HA 读复制窗口，否则读进程内滑窗）。
+fn quota_recent(mesh: &MeshRuntime, namespace: &str) -> usize {
+    let Some(ha) = mesh.ha() else {
+        let now = Instant::now();
+        return mesh.quota_rate.lock().unwrap().recent(namespace, now);
+    };
+    let now_ms = unix_now().saturating_mul(1000);
+    ha.get(crate::ha::NS_QUOTA, &format!("rate/{namespace}"))
+        .and_then(|b| serde_json::from_slice::<Vec<i64>>(&b).ok())
+        .map(|w| w.iter().filter(|t| **t > now_ms - 60_000).count())
+        .unwrap_or(0)
+}
+
+/// v0.8 M4：HA 写失败统一映射 503（`NotLeader` 由 [`ha_write_guard`] 预拦）。
+fn ha_unavailable(e: crate::ha::HaError) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "ok": false,
+            "error": "ha unavailable",
+            "reason": e.to_string(),
+        })),
+    )
+}
+
+/// v0.8 M4：leader 侧清理复制 OIDC 表里的过期项（session 宽限窗外丢弃、
+/// 登录 state 超 5 分钟丢弃）。异步 propose、不等待提交；清理失败下轮再试。
+pub fn sweep_ha_oidc(ha: &crate::ha::HaHandle) {
+    let now_ms = unix_now().saturating_mul(1000);
+    for (key, bytes) in ha.scan(crate::ha::NS_OIDC) {
+        let stale = if key.starts_with("sess:") {
+            serde_json::from_slice::<crate::oidc::HaSession>(&bytes)
+                .map(|s| !crate::oidc::ha_session_live(&s, now_ms, true))
+                .unwrap_or(true)
+        } else if key.starts_with("login:") {
+            serde_json::from_slice::<crate::oidc::HaLogin>(&bytes)
+                .map(|l| l.created_ms + crate::oidc::LOGIN_TTL_MS <= now_ms)
+                .unwrap_or(true)
+        } else {
+            false
+        };
+        if stale {
+            ha.propose(crate::ha::Command::Delete {
+                ns: crate::ha::NS_OIDC.to_string(),
+                key,
+            });
+        }
+    }
+}
+
 /// 快照节流阈值：每 N 次成功 append 落一次全量快照（顺带 compact journal）。
 /// M1 简单计数即可——重启不丢由 journal 逐条 fsync 保证，快照只是压缩增量。
 const MESH_SNAPSHOT_EVERY: u64 = 32;
-
+/// 首次启用 HA 的迁移完成标记（`cfg/task_seed_v1`）。
+const TASK_SEED_KEY: &str = "task_seed_v1";
 /// AgentMesh 任务引擎运行态（v0.6 M1，设计 §2.1/§2.2，引擎休眠版）。
 ///
 /// 组成：持久存储 `TaskStore`（journal+快照）+ 内存任务表 `TaskTable`
@@ -213,6 +474,15 @@ pub struct MeshRuntime {
     pub slo: Mutex<crate::slo::SloState>,
     /// v0.7 §5.4 per-namespace 提交限流窗口（进程内，重启清零）。
     pub quota_rate: Mutex<crate::quota::RateLimiter>,
+    /// v0.8 M4：最近一次从 HA 状态机同步到本表的 applied 位点。
+    pub ha_synced: AtomicU64,
+    /// v0.8 M4：本表对齐时观察到的 leader 任期。任期变化（换主）后新
+    /// leader 的表可能仍停在前任已提交写入之前，写面前必须先全量对齐。
+    pub ha_table_term: AtomicU64,
+    /// v0.8 M4：首次启用 HA 时，本地 journal 还没灌入状态机（leader 负责）。
+    pub ha_seed_pending: AtomicBool,
+    /// v0.8 M4：`quota` 命名空间读改写串行化（避免并发提交同时通过预检）。
+    pub quota_ha_lock: tokio::sync::Mutex<()>,
 }
 
 impl MeshRuntime {
@@ -224,6 +494,9 @@ impl MeshRuntime {
     /// 节流快照：每积满阈值落一次 state.json 并 compact journal；失败只
     /// log——journal 有逐条 fsync，快照丢了不丢数据，下轮再试。
     pub fn maybe_snapshot(&self) {
+        if self.store.ha_enabled() {
+            return; // HA：状态机权威，本地 journal/快照不参与
+        }
         let n = self.appends_since_snapshot.fetch_add(1, Ordering::Relaxed) + 1;
         if n >= MESH_SNAPSHOT_EVERY {
             self.appends_since_snapshot.store(0, Ordering::Relaxed);
@@ -231,6 +504,172 @@ impl MeshRuntime {
                 tracing::error!(error = %e, "mesh: 任务快照失败（journal 已 fsync，重启不丢）");
             }
         }
+    }
+
+    /// 当前 HA 句柄（未启用返回 None）。
+    pub fn ha(&self) -> Option<crate::ha::HaHandle> {
+        self.store.ha()
+    }
+
+    /// 启动时对齐状态机：HA 已 seeded → 全量覆盖本地表；本地 journal 非空
+    /// 且状态机为空（首次启用 HA）→ 标记待 leader 灌入种子。
+    pub fn init_ha(&self) {
+        let Some(ha) = self.store.ha() else { return };
+        let seeded = ha.get(crate::ha::NS_CFG, TASK_SEED_KEY).is_some();
+        let (index, entries) = ha.scan_at(crate::ha::NS_TASK);
+        if seeded || !entries.is_empty() {
+            self.install_ha_records();
+            self.ha_seed_pending.store(false, Ordering::Release);
+            return;
+        }
+        let local_nonempty = !self.table.lock().unwrap().is_empty();
+        if local_nonempty {
+            self.ha_seed_pending.store(true, Ordering::Release);
+            tracing::info!(
+                tasks = self.table.lock().unwrap().len(),
+                "mesh: HA 状态机为空，等待 leader 把本地 journal 灌入（迁移）"
+            );
+        } else {
+            self.ha_seed_pending.store(false, Ordering::Release);
+            self.ha_synced.store(index, Ordering::Release);
+        }
+    }
+
+    /// follower 追赶：状态机 applied 前进时全量替换本地表（leader 本地即权威，
+    /// 不做回灌，避免覆盖正在写入的行）。
+    pub fn sync_from_ha(&self) {
+        let Some(ha) = self.store.ha() else { return };
+        if ha.is_leader() {
+            return;
+        }
+        let (index, entries) = ha.scan_at(crate::ha::NS_TASK);
+        if index <= self.ha_synced.load(Ordering::Acquire) {
+            return;
+        }
+        // 尚未完成首次迁移：保留本地 journal 视图，等 leader 写 marker。
+        if ha.get(crate::ha::NS_CFG, TASK_SEED_KEY).is_none() && entries.is_empty() {
+            self.ha_synced.store(index, Ordering::Release);
+            return;
+        }
+        // 已 catch-up（看到 marker 或复制行）：加入既有集群的节点不得再用
+        // 本地旧 journal 灌种子。
+        self.ha_seed_pending.store(false, Ordering::Release);
+        self.install_ha_records();
+    }
+
+    /// 写面/引擎事件前的换主屏障：任期变化时先等本地状态机追平已提交
+    /// 日志，再全量对齐任务表。steady-state 只做一次原子读，零扫描开销；
+    /// 任务写路径一律在表锁内 append 并等本地 apply，因此对齐不会吞写。
+    /// 重启后 applied 落后已提交日志（要等本轮选举 no-op 重放）也由这里的
+    /// 任期变化兜住——新任期第一次 tick/写必然触发一次全量对齐。
+    pub fn ensure_leader_table(&self) {
+        let Some(ha) = self.store.ha() else { return };
+        if !ha.is_leader() || self.ha_seed_pending.load(Ordering::Acquire) {
+            return;
+        }
+        let term = ha.status().term;
+        if term == self.ha_table_term.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err(e) = ha.await_caught_up(crate::ha::APPLY_TIMEOUT) {
+            tracing::warn!(error = %e, "mesh: leader 状态机未追平，跳过换主对齐");
+            return;
+        }
+        self.install_ha_records();
+        self.ha_table_term.store(term, Ordering::Release);
+    }
+
+    /// 用状态机全量记录替换本地表。扫描在表锁内完成：锁外预扫与实际安装
+    /// 之间可能有新提交，拿旧快照覆盖会把已收敛的行回退。所有写路径都在
+    /// 表锁内 append 并等本地 apply，因此锁内 `scan_at` 一定包含全部已
+    /// 返回的写（锁顺序 table → store/ha，与写路径一致）。
+    fn install_ha_records(&self) {
+        let Some(ha) = self.store.ha() else { return };
+        let mut table_guard = self.table.lock().unwrap();
+        let (index, entries) = ha.scan_at(crate::ha::NS_TASK);
+        let mut table = TaskTable::new();
+        let mut records = std::collections::HashMap::new();
+        for (task_id, bytes) in entries {
+            match serde_json::from_slice::<taskengine::TaskRecord>(&bytes) {
+                Ok(rec) => {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        records.insert(task_id.clone(), value);
+                    }
+                    table.insert(task_id, rec);
+                }
+                Err(e) => {
+                    tracing::warn!(task_id = %task_id, error = %e, "mesh: HA 任务行形状非法，跳过");
+                }
+            }
+        }
+        *table_guard = table;
+        self.store.replace_records(records);
+        self.ha_synced.store(index, Ordering::Release);
+    }
+
+    /// 首次启用 HA：leader 把本地 journal 的存量任务灌入 `task` 命名空间，
+    /// 最后写 `cfg/task_seed_v1` marker。幂等（marker 存在即跳过）。
+    pub fn maybe_seed_ha(&self) {
+        if !self.ha_seed_pending.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(ha) = self.ha() else { return };
+        if !ha.is_leader() {
+            return;
+        }
+        // 状态机已有内容（加入既有集群/已恢复）→ 状态机权威，不得用本地旧
+        // journal 覆盖；只清理迁移标记。
+        let seeded = ha.get(crate::ha::NS_CFG, TASK_SEED_KEY).is_some();
+        let (_, entries) = ha.scan_at(crate::ha::NS_TASK);
+        if seeded || !entries.is_empty() {
+            self.install_ha_records();
+            self.ha_seed_pending.store(false, Ordering::Release);
+            return;
+        }
+        let rows: Vec<(String, serde_json::Value)> = self
+            .table
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(tid, rec)| {
+                serde_json::to_value(rec)
+                    .ok()
+                    .map(|value| (tid.clone(), value))
+            })
+            .collect();
+        for (task_id, value) in &rows {
+            let bytes = match serde_json::to_vec(value) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(task_id = %task_id, error = %e, "mesh: HA 迁移序列化失败");
+                    return;
+                }
+            };
+            let cmd = crate::ha::Command::Put {
+                ns: crate::ha::NS_TASK.to_string(),
+                key: task_id.clone(),
+                value: bytes,
+            };
+            if let Err(e) = ha.propose_and_wait(cmd, crate::ha::APPLY_TIMEOUT) {
+                tracing::warn!(error = %e, "mesh: HA 迁移写入失败，下轮重试");
+                return;
+            }
+        }
+        let marker = crate::ha::Command::Put {
+            ns: crate::ha::NS_CFG.to_string(),
+            key: TASK_SEED_KEY.to_string(),
+            value: b"1".to_vec(),
+        };
+        if let Err(e) = ha.propose_and_wait(marker, crate::ha::APPLY_TIMEOUT) {
+            tracing::warn!(error = %e, "mesh: HA 迁移 marker 写入失败，下轮重试");
+            return;
+        }
+        self.ha_seed_pending.store(false, Ordering::Release);
+        self.ha_synced.store(ha.applied_index(), Ordering::Release);
+        tracing::info!(
+            tasks = rows.len(),
+            "mesh: 本地任务已灌入 HA 状态机（一次性迁移完成）"
+        );
     }
 }
 
@@ -331,6 +770,10 @@ pub fn build_mesh(
             cfg.mesh.engine.slo.enabled,
         )),
         quota_rate: Mutex::new(crate::quota::RateLimiter::default()),
+        ha_synced: AtomicU64::new(0),
+        ha_table_term: AtomicU64::new(0),
+        ha_seed_pending: AtomicBool::new(false),
+        quota_ha_lock: tokio::sync::Mutex::new(()),
     }))
 }
 
@@ -664,8 +1107,6 @@ async fn mesh_quota_get(State(state): State<SharedState>, headers: HeaderMap) ->
         }
         usage
     };
-    let now = std::time::Instant::now();
-    let mut rl = mesh.quota_rate.lock().unwrap();
     let namespaces: Vec<String> = match scope.as_deref() {
         Some(ns) => vec![ns.to_string()],
         None => cfg.known_namespaces(usage.keys().cloned()),
@@ -681,7 +1122,7 @@ async fn mesh_quota_get(State(state): State<SharedState>, headers: HeaderMap) ->
                 "max_submit_per_minute": cfg.max_submit_per_minute(&ns),
                 "open": open,
                 "inflight": inflight,
-                "submit_last_minute": rl.recent(&ns, now),
+                "submit_last_minute": quota_recent(mesh, &ns),
             })
         })
         .collect();
@@ -2221,6 +2662,14 @@ async fn tasks_post(
     if let Some(r) = read_only_guard(&state) {
         return r;
     }
+    if let Some(r) = ha_write_guard(&state) {
+        return r;
+    }
+    // 首次启用 HA 的迁移窗口：先灌种子再做任何任务写，避免新任务让状态机
+    // 先有内容、存量本地 journal 被判定为"已迁移"而丢掉。
+    mesh.maybe_seed_ha();
+    // 换主后的首个写面：先对齐前任已提交的任务（否则冲突判定/配额按旧表算）。
+    mesh.ensure_leader_table();
     // v0.7 §4.2 多租户：namespace 校验 + token 绑定；未显式给定时继承
     // token 的 namespace，避免绑定 token 的任务落到 default。
     let scope = token_namespace(&state, &headers);
@@ -2315,12 +2764,11 @@ async fn tasks_post(
     if required_ok && state.config.mesh.quota.enabled {
         let quota = &state.config.mesh.quota;
         let namespace = crate::router::task_namespace(Some(&body)).to_string();
-        let now = std::time::Instant::now();
         let rate_limit = quota.max_submit_per_minute(&namespace);
-        let mut rl = mesh.quota_rate.lock().unwrap();
-        let rate_ok = rl.allow(&namespace, rate_limit, now);
-        let recent = rl.recent(&namespace, now);
-        drop(rl);
+        let (rate_ok, recent) = match quota_rate_admit(&mesh, &namespace, rate_limit).await {
+            Ok(v) => v,
+            Err(e) => return ha_unavailable(e),
+        };
         if !rate_ok {
             state.router.audit_event(
                 "quota.reject",
@@ -2539,9 +2987,14 @@ async fn tasks_cancel_post(
     if let Some(r) = read_only_guard(&state) {
         return r;
     }
+    if let Some(r) = ha_write_guard(&state) {
+        return r;
+    }
     let Some(mesh) = state.mesh.as_ref().cloned() else {
         return mesh_required();
     };
+    mesh.maybe_seed_ha();
+    mesh.ensure_leader_table();
     let scope = token_namespace(&state, &headers);
     let mut table = mesh.table.lock().unwrap();
     if scope.as_deref().is_some_and(|ns| {
@@ -2632,9 +3085,14 @@ async fn tasks_delete(
     if let Some(r) = read_only_guard(&state) {
         return r;
     }
+    if let Some(r) = ha_write_guard(&state) {
+        return r;
+    }
     let Some(mesh) = state.mesh.as_ref().cloned() else {
         return mesh_required();
     };
+    mesh.maybe_seed_ha();
+    mesh.ensure_leader_table();
     let scope = token_namespace(&state, &headers);
     let mut table = mesh.table.lock().unwrap();
     if scope.as_deref().is_some_and(|ns| {
@@ -4599,14 +5057,7 @@ async fn oidc_middleware(
     // refresh 续期：允许**已过期但仍在宽限窗内**的浏览器 session 通过，
     // 由 refresh 端点自己判定（续期成功才恢复该 token）。
     if path == "/v1/auth/oidc/refresh" {
-        if token.starts_with("al_sess_")
-            && state
-                .oidc_sessions
-                .lock()
-                .unwrap()
-                .get_for_refresh(&token)
-                .is_some()
-        {
+        if token.starts_with("al_sess_") && state.oidc_session(&token, true).is_some() {
             return next.run(req).await;
         }
         return unauthorized().into_response();
@@ -5113,12 +5564,40 @@ async fn oidc_login(State(state): State<SharedState>) -> Response {
     let verifier = crate::oidc::random_b64(32);
     let nonce = crate::oidc::random_b64(16);
     let challenge = crate::oidc::pkce_challenge(&verifier);
-    state.oidc_logins.lock().unwrap().put(
-        state_param.clone(),
-        verifier,
-        nonce.clone(),
-        redirect_uri.to_string(),
-    );
+    if state.ha.is_some() {
+        // v0.8 M4：登录 state 写复制状态机，IdP 回调可落到任意副本。
+        let rec = crate::oidc::HaLogin {
+            verifier,
+            nonce: nonce.clone(),
+            redirect_uri: redirect_uri.to_string(),
+            created_ms: unix_now().saturating_mul(1000),
+        };
+        let value = serde_json::to_value(rec).unwrap_or(serde_json::Value::Null);
+        if let Err(e) = state
+            .ha_kv(HaKvOp::Put {
+                ns: crate::ha::NS_OIDC.to_string(),
+                key: format!("login:{state_param}"),
+                value,
+            })
+            .await
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "ha login state not committed",
+                    "reason": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    } else {
+        state.oidc_logins.lock().unwrap().put(
+            state_param.clone(),
+            verifier,
+            nonce.clone(),
+            redirect_uri.to_string(),
+        );
+    }
     {
         let mut q = url.query_pairs_mut();
         q.append_pair("response_type", "code");
@@ -5253,8 +5732,46 @@ async fn oidc_callback_finish(
     if !constant_time_eq(cookie_state.as_bytes(), state_param.as_bytes()) {
         return oidc_login_failed(&state, "callback: state cookie mismatch");
     }
-    let Some(pending) = state.oidc_logins.lock().unwrap().take(&state_param) else {
-        return oidc_login_failed(&state, "callback: unknown or expired state");
+    // v0.8 M4：HA 启用时从复制状态机原子消费一次性 state（leader 提交删除，
+    // 回调落在任意副本都只放行一次）。
+    let pending = if state.ha.is_some() {
+        let value = match state
+            .ha_kv(HaKvOp::Take {
+                ns: crate::ha::NS_OIDC.to_string(),
+                key: format!("login:{state_param}"),
+            })
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "ha login state unavailable",
+                        "reason": e.to_string(),
+                    })),
+                )
+                    .into_response()
+            }
+        };
+        let rec = value.and_then(|v| serde_json::from_value::<crate::oidc::HaLogin>(v).ok());
+        let Some(rec) = rec else {
+            return oidc_login_failed(&state, "callback: unknown or expired state");
+        };
+        if rec.created_ms + crate::oidc::LOGIN_TTL_MS <= unix_now().saturating_mul(1000) {
+            return oidc_login_failed(&state, "callback: unknown or expired state");
+        }
+        crate::oidc::PendingLogin {
+            verifier: rec.verifier,
+            nonce: rec.nonce,
+            redirect_uri: rec.redirect_uri,
+            created: std::time::Instant::now(),
+        }
+    } else {
+        let Some(p) = state.oidc_logins.lock().unwrap().take(&state_param) else {
+            return oidc_login_failed(&state, "callback: unknown or expired state");
+        };
+        p
     };
     if let Some(err) = q.error {
         let detail = q.error_description.unwrap_or_default();
@@ -5336,19 +5853,53 @@ async fn oidc_callback_finish(
     }
     let remaining = (exp - unix_now()).max(1) as u64;
     let ttl = std::time::Duration::from_secs(cfg.session_seconds.min(remaining).max(1));
-    let session_token = state
-        .oidc_sessions
-        .lock()
-        .unwrap()
-        .issue(crate::oidc::SessionIssue {
+    let session_token = if state.ha.is_some() {
+        // v0.8 M4：session 写复制状态机，任意副本都能校验/登出/续期。
+        let token = format!("al_sess_{}", crate::oidc::random_b64(32));
+        let rec = crate::oidc::HaSession {
             role: resolved.role,
             namespace: resolved.namespace.clone(),
             sub: sub.clone(),
-            ttl,
-            // IdP token 只留服务端内存（登出 id_token_hint / refresh 续期）。
+            expires_ms: unix_now()
+                .saturating_add(ttl.as_secs() as i64)
+                .saturating_mul(1000),
             id_token: Some(id_token.to_string()),
             refresh_token: tr.refresh_token.clone(),
-        });
+        };
+        let value = serde_json::to_value(rec).unwrap_or(serde_json::Value::Null);
+        if let Err(e) = state
+            .ha_kv(HaKvOp::Put {
+                ns: crate::ha::NS_OIDC.to_string(),
+                key: format!("sess:{token}"),
+                value,
+            })
+            .await
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "ha session not committed",
+                    "reason": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+        token
+    } else {
+        state
+            .oidc_sessions
+            .lock()
+            .unwrap()
+            .issue(crate::oidc::SessionIssue {
+                role: resolved.role,
+                namespace: resolved.namespace.clone(),
+                sub: sub.clone(),
+                ttl,
+                // IdP token 只留服务端内存（登出 id_token_hint / refresh 续期）。
+                id_token: Some(id_token.to_string()),
+                refresh_token: tr.refresh_token.clone(),
+            })
+    };
     let sub_hash = token_cache_key(&sub);
     state.router.audit_event(
         "auth.oidc_login",
@@ -5382,8 +5933,35 @@ async fn oidc_logout(State(state): State<SharedState>, headers: HeaderMap) -> Re
         return unauthorized().into_response();
     }
     let cfg = &state.config.auth.oidc;
-    let removed =
-        header_token(&headers).and_then(|t| state.oidc_sessions.lock().unwrap().remove(&t));
+    let removed = match header_token(&headers) {
+        Some(token) => {
+            let session = state.oidc_session(&token, true);
+            if session.is_some() {
+                if state.ha.is_some() {
+                    if let Err(e) = state
+                        .ha_kv(HaKvOp::Delete {
+                            ns: crate::ha::NS_OIDC.to_string(),
+                            key: format!("sess:{token}"),
+                        })
+                        .await
+                    {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({
+                                "error": "ha logout not committed",
+                                "reason": e.to_string(),
+                            })),
+                        )
+                            .into_response();
+                    }
+                } else {
+                    state.oidc_sessions.lock().unwrap().remove(&token);
+                }
+            }
+            session
+        }
+        None => None,
+    };
     let mut end_session_url: Option<String> = None;
     if let Some(session) = removed {
         let sub_hash = token_cache_key(&session.sub);
@@ -5448,7 +6026,7 @@ async fn oidc_refresh(State(state): State<SharedState>, headers: HeaderMap) -> R
         return unauthorized().into_response();
     };
     // 已过期但在续期宽限窗内的 session 也允许续期。
-    let Some(session) = state.oidc_sessions.lock().unwrap().get_for_refresh(&token) else {
+    let Some(session) = state.oidc_session(&token, true) else {
         return unauthorized().into_response();
     };
     let Some(refresh_token) = session.refresh_token.clone().filter(|t| !t.is_empty()) else {
@@ -5544,12 +6122,49 @@ async fn oidc_refresh(State(state): State<SharedState>, headers: HeaderMap) -> R
     }
     let remaining = (exp - unix_now()).max(1) as u64;
     let ttl = std::time::Duration::from_secs(cfg.session_seconds.min(remaining).max(1));
-    let ok = state.oidc_sessions.lock().unwrap().extend(
-        &token,
-        ttl,
-        Some(id_token.to_string()),
-        tr.refresh_token.clone(),
-    );
+    let ok = if state.ha.is_some() {
+        let rec = crate::oidc::HaSession {
+            role: session.role,
+            namespace: session.namespace.clone(),
+            sub: session.sub.clone(),
+            expires_ms: unix_now()
+                .saturating_add(ttl.as_secs() as i64)
+                .saturating_mul(1000),
+            id_token: Some(id_token.to_string()),
+            refresh_token: tr
+                .refresh_token
+                .clone()
+                .or_else(|| session.refresh_token.clone()),
+        };
+        let value = serde_json::to_value(rec).unwrap_or(serde_json::Value::Null);
+        match state
+            .ha_kv(HaKvOp::Put {
+                ns: crate::ha::NS_OIDC.to_string(),
+                key: format!("sess:{token}"),
+                value,
+            })
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "ha refresh not committed",
+                        "reason": e.to_string(),
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        state.oidc_sessions.lock().unwrap().extend(
+            &token,
+            ttl,
+            Some(id_token.to_string()),
+            tr.refresh_token.clone(),
+        )
+    };
     if !ok {
         return unauthorized().into_response();
     }
@@ -5577,7 +6192,7 @@ fn session_from_token(state: &AppState, token: &str) -> Option<crate::oidc::Sess
     if !cfg.enabled || !cfg.browser_login {
         return None;
     }
-    state.oidc_sessions.lock().unwrap().get(token)
+    state.oidc_session(token, false)
 }
 
 /// 鉴权并返回调用者角色（v0.6 P0 RBAC；v0.7 支持 OIDC 中间件注入）。

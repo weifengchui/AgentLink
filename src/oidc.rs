@@ -46,6 +46,11 @@ const MAX_SESSIONS: usize = 4096;
 /// （浏览器 401 -> 静默续期 -> 重试）。宽限窗外才真正丢弃。
 const REFRESH_GRACE: Duration = Duration::from_secs(900);
 
+/// v0.8 M4：复制登录 state 的存活时间（毫秒，跨节点 clock 用绝对墙钟）。
+pub(crate) const LOGIN_TTL_MS: i64 = LOGIN_TTL.as_millis() as i64;
+/// v0.8 M4：复制 session 的续期宽限窗（毫秒）。
+pub(crate) const REFRESH_GRACE_MS: i64 = REFRESH_GRACE.as_millis() as i64;
+
 /// API token 验证模式。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -886,6 +891,39 @@ pub struct SessionIssue {
     pub ttl: Duration,
     pub id_token: Option<String>,
     pub refresh_token: Option<String>,
+}
+
+/// v0.8 M4：复制状态机里的登录 state（绝对毫秒过期，跨节点共享）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HaLogin {
+    pub verifier: String,
+    pub nonce: String,
+    pub redirect_uri: String,
+    pub created_ms: i64,
+}
+
+/// v0.8 M4：复制状态机里的浏览器 session（绝对毫秒过期）。
+/// IdP token 只随状态机在集群内部复制，永不下发浏览器。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HaSession {
+    pub role: Role,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    pub sub: String,
+    pub expires_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+}
+
+/// 复制 session 是否可用（未过期；`grace` 时允许续期宽限窗内过期）。
+pub fn ha_session_live(s: &HaSession, now_ms: i64, grace: bool) -> bool {
+    if grace {
+        s.expires_ms + REFRESH_GRACE_MS > now_ms
+    } else {
+        s.expires_ms > now_ms
+    }
 }
 
 #[derive(Debug, Default)]

@@ -25,6 +25,18 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Condvar, Mutex as StdMutex};
+use std::time::{Duration, Instant};
+
+/// v0.8 M4：业务命名空间（与设计 §3.3 一一对应）。
+pub const NS_TASK: &str = "task";
+pub const NS_QUOTA: &str = "quota";
+pub const NS_AUDIT: &str = "audit";
+pub const NS_OIDC: &str = "oidc";
+pub const NS_CFG: &str = "cfg";
+
+/// 业务写入等待 apply 的默认上限。超过即视为多数派不可用（503）。
+pub const APPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 复制日志里的命令（状态机写入）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +268,18 @@ impl KvState {
 
     pub fn get(&self, ns: &str, key: &str) -> Option<&Vec<u8>> {
         self.data.get(&format!("{ns}/{key}"))
+    }
+
+    /// 按命名空间前缀扫描（key 去掉 `<ns>/` 前缀）。返回顺序为 key 字典序。
+    pub fn scan(&self, ns: &str) -> Vec<(String, Vec<u8>)> {
+        let prefix = format!("{ns}/");
+        self.data
+            .iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix(&prefix)
+                    .map(|rest| (rest.to_string(), v.clone()))
+            })
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -1447,6 +1471,17 @@ impl RaftNode {
         if self.role != Role::Leader || term < self.current_term {
             return out;
         }
+        // CheckQuorum：投票成员在当前任期的有效回执即为「leader 租约」。
+        // 在任 leader 有回执时拒绝 pre-vote；否则 follower 偶发丢一拍心跳
+        // 就能把健康 leader 顶下台（term 反复抬升，换主窗口内写入全部超时）。
+        if self.voters.contains(&from_id)
+            || self
+                .joint_old
+                .as_ref()
+                .is_some_and(|old| old.contains(&from_id))
+        {
+            self.leader_lease_until = now + self.cfg.election_timeout_ms;
+        }
         tracing::debug!(from = %from_id, success, match_index, "ha: append resp");
         if success {
             // ReadIndex：记录该对端最近确认到的读序号（用于判断读是否安全）。
@@ -1958,6 +1993,32 @@ pub struct HaStatus {
     pub joint: Option<Vec<String>>,
 }
 
+/// M4 业务写入失败分类（API 层据此映射 409/503）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HaError {
+    /// 本节点不是 leader（`leader` 为已知的当前 leader）。
+    NotLeader { leader: Option<String> },
+    /// 已 propose，但在超时内未被多数派提交（多数派不可用/正在切主）。
+    Timeout { index: u64 },
+    /// 运行时未启用或其它不可用原因。
+    Unavailable(String),
+}
+
+impl std::fmt::Display for HaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HaError::NotLeader { leader: Some(id) } => write!(f, "not the leader (leader={id})"),
+            HaError::NotLeader { leader: None } => write!(f, "not the leader"),
+            HaError::Timeout { index } => {
+                write!(f, "apply timeout (index={index})")
+            }
+            HaError::Unavailable(reason) => write!(f, "ha unavailable: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for HaError {}
+
 /// HA 运行时：内核 + 落盘。
 pub struct HaRuntime {
     node: RaftNode,
@@ -2048,6 +2109,7 @@ impl HaRuntime {
             || applied != self.persisted_applied
             || membership != self.persisted_membership
         {
+            let t0 = std::time::Instant::now();
             if let Err(e) = self.store.save_state(
                 term,
                 self.node.voted_for(),
@@ -2061,11 +2123,19 @@ impl HaRuntime {
                 self.persisted_applied = applied;
                 self.persisted_membership = membership;
             }
+            let elapsed = t0.elapsed();
+            if elapsed > std::time::Duration::from_millis(300) {
+                tracing::warn!(
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "ha: save_state 落盘慢（可能拖慢心跳）"
+                );
+            }
         }
         let last = self.node.last_log_index();
         if self.node.log_rewrite_needed() {
             // 压缩 / 冲突截断：整文件重写（前缀已压缩掉，不能靠增量 append）。
             let entries = self.node.log_entries_after(self.node.snapshot_index());
+            let t0 = std::time::Instant::now();
             match self.store.rewrite_log(&entries) {
                 Ok(()) => {
                     self.node.clear_log_rewrite();
@@ -2073,12 +2143,27 @@ impl HaRuntime {
                 }
                 Err(e) => tracing::warn!(error = %e, "ha: failed to rewrite log"),
             }
+            let elapsed = t0.elapsed();
+            if elapsed > std::time::Duration::from_millis(300) {
+                tracing::warn!(
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "ha: rewrite_log 落盘慢（可能拖慢心跳）"
+                );
+            }
         } else if last > self.persisted_last_index {
             let new_entries = self.node.log_entries_after(self.persisted_last_index);
+            let t0 = std::time::Instant::now();
             if let Err(e) = self.store.append_log(&new_entries) {
                 tracing::warn!(error = %e, "ha: failed to persist log entries");
             } else {
                 self.persisted_last_index = last;
+            }
+            let elapsed = t0.elapsed();
+            if elapsed > std::time::Duration::from_millis(300) {
+                tracing::warn!(
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "ha: append_log 落盘慢（可能拖慢心跳）"
+                );
             }
         }
     }
@@ -2118,10 +2203,26 @@ impl HaRuntime {
     }
 }
 
+/// 在 tokio 多线程 runtime 的 worker 上执行阻塞等待。`block_in_place` 会把
+/// worker core 移交给阻塞池线程继续驱动，避免一次 apply 等待把 worker 的
+/// 定时器/I-O driver 一起占住。阻塞池/非 runtime 线程直接执行。
+fn block_wait<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// 共享句柄：可在多个任务里用（tokio 任务 + 连接处理）。
 #[derive(Clone)]
 pub struct HaHandle {
     inner: std::sync::Arc<std::sync::Mutex<HaRuntime>>,
+    /// M4：已应用到状态机的位点镜像 + 等待通知。锁序恒为 inner → applied
+    /// （发布路径先拿 inner 再拿 applied；等待者只拿 applied，不回锁 inner，
+    /// 无环）。
+    applied: std::sync::Arc<(StdMutex<u64>, Condvar)>,
     started_at: std::time::Instant,
 }
 
@@ -2134,12 +2235,186 @@ impl HaHandle {
         learners: Vec<String>,
         dir: impl Into<std::path::PathBuf>,
     ) -> anyhow::Result<HaHandle> {
+        let runtime = HaRuntime::new(cfg, node_id, peers, voters, learners, dir)?;
+        let applied =
+            std::sync::Arc::new((StdMutex::new(runtime.node.last_applied()), Condvar::new()));
         Ok(HaHandle {
-            inner: std::sync::Arc::new(std::sync::Mutex::new(HaRuntime::new(
-                cfg, node_id, peers, voters, learners, dir,
-            )?)),
+            inner: std::sync::Arc::new(std::sync::Mutex::new(runtime)),
+            applied,
             started_at: std::time::Instant::now(),
         })
+    }
+
+    /// 把当前 applied 位点发布给等待者（调用方持有 inner 锁）。
+    fn publish_applied(&self, g: &HaRuntime) {
+        let applied = g.node.last_applied();
+        let (lock, cv) = &*self.applied;
+        let mut cur = lock.lock().unwrap();
+        if applied > *cur {
+            *cur = applied;
+            cv.notify_all();
+        }
+    }
+
+    /// 当前已应用位点（本地视图）。
+    pub fn applied_index(&self) -> u64 {
+        let g = self.inner.lock().unwrap();
+        g.node.last_applied()
+    }
+
+    /// 等待状态机应用到 `index`（本地已 apply）。超时返回 [`HaError::Timeout`]。
+    pub fn wait_applied(&self, index: u64, timeout: Duration) -> Result<(), HaError> {
+        block_wait(|| self.wait_applied_blocking(index, timeout))
+    }
+
+    fn wait_applied_blocking(&self, index: u64, timeout: Duration) -> Result<(), HaError> {
+        let deadline = Instant::now() + timeout;
+        let (lock, cv) = &*self.applied;
+        let mut cur = lock.lock().unwrap();
+        loop {
+            if *cur >= index {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                drop(cur);
+                return Err(self.timeout_error(index));
+            }
+            let (guard, _) = cv.wait_timeout(cur, deadline - now).unwrap();
+            cur = guard;
+            if Instant::now() >= deadline {
+                // 先放 applied 再取 inner：锁序恒为 inner → applied，反向持有
+                // 会与 publish_applied（inner → applied）形成死锁。
+                drop(cur);
+                return Err(self.timeout_error_logged(index));
+            }
+        }
+    }
+
+    /// leader 就绪屏障：等待本地状态机追上**已提交**日志。新 leader 在任期
+    /// 切换瞬间可能还没 apply 前任已提交的条目；读改写（配额窗口、审计链头、
+    /// 任务表冲突判定）必须先越过这个窗口，否则会拿旧视图覆盖已提交状态。
+    pub fn await_caught_up(&self, timeout: Duration) -> Result<(), HaError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (commit, applied) = {
+                let g = self.inner.lock().unwrap();
+                (g.node.commit_index(), g.node.last_applied())
+            };
+            if applied >= commit {
+                return Ok(());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(self.timeout_error(commit));
+            }
+            let _ = self.wait_applied(commit, left);
+        }
+    }
+
+    fn timeout_error(&self, index: u64) -> HaError {
+        let g = self.inner.lock().unwrap();
+        if g.node.role() != Role::Leader {
+            HaError::NotLeader {
+                leader: g.node.leader_id().map(str::to_string),
+            }
+        } else {
+            HaError::Timeout { index }
+        }
+    }
+
+    /// 超时诊断：一次取锁同时判定错误类型并记录位点/角色。
+    fn timeout_error_logged(&self, index: u64) -> HaError {
+        let (commit, applied, role, is_leader, leader) = {
+            let g = self.inner.lock().unwrap();
+            (
+                g.node.commit_index(),
+                g.node.last_applied(),
+                format!("{:?}", g.node.role()),
+                g.node.role() == Role::Leader,
+                g.node.leader_id().map(str::to_string),
+            )
+        };
+        let err = if !is_leader {
+            HaError::NotLeader {
+                leader: leader.clone(),
+            }
+        } else {
+            HaError::Timeout { index }
+        };
+        tracing::warn!(
+            index,
+            commit,
+            applied,
+            role,
+            leader = ?leader,
+            "ha: wait_applied 超时（诊断：提交位点/角色）"
+        );
+        err
+    }
+
+    /// propose 并等待 apply（leader 专用；业务写入的线性一致入口）。
+    pub fn propose_and_wait(&self, cmd: Command, timeout: Duration) -> Result<u64, HaError> {
+        let index = {
+            let mut g = self.inner.lock().unwrap();
+            let Some(idx) = g.node.propose(cmd) else {
+                return Err(HaError::NotLeader {
+                    leader: g.node.leader_id().map(str::to_string),
+                });
+            };
+            g.maintain();
+            self.publish_applied(&g);
+            idx
+        };
+        self.wait_applied(index, timeout)?;
+        Ok(index)
+    }
+
+    /// leader 原子「读旧值 + 删除」：同一把 runtime 锁内完成读与 propose，
+    /// 返回删除前的值。用于 OIDC 一次性 state 的跨节点语义。
+    pub fn take(&self, ns: &str, key: &str, timeout: Duration) -> Result<Option<Vec<u8>>, HaError> {
+        let (old, index) = {
+            let mut g = self.inner.lock().unwrap();
+            if g.node.role() != Role::Leader {
+                return Err(HaError::NotLeader {
+                    leader: g.node.leader_id().map(str::to_string),
+                });
+            }
+            let old = g.node.state().get(ns, key).cloned();
+            let Some(idx) = g.node.propose(Command::Delete {
+                ns: ns.to_string(),
+                key: key.to_string(),
+            }) else {
+                return Err(HaError::NotLeader {
+                    leader: g.node.leader_id().map(str::to_string),
+                });
+            };
+            g.maintain();
+            (old, idx)
+        };
+        self.wait_applied(index, timeout)?;
+        Ok(old)
+    }
+
+    /// 按命名空间扫描本地状态机，并返回扫描时刻的 applied 位点。
+    pub fn scan_at(&self, ns: &str) -> (u64, Vec<(String, Vec<u8>)>) {
+        let g = self.inner.lock().unwrap();
+        (g.node.last_applied(), g.node.state().scan(ns))
+    }
+
+    /// 按命名空间扫描本地状态机。
+    pub fn scan(&self, ns: &str) -> Vec<(String, Vec<u8>)> {
+        self.inner.lock().unwrap().node.state().scan(ns)
+    }
+
+    /// 当前 leader（未知返回 None）。
+    pub fn leader_id(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .node
+            .leader_id()
+            .map(str::to_string)
     }
 
     /// 单调时钟（毫秒）——内核不读墙钟，测试可确定复现。
@@ -2149,9 +2424,21 @@ impl HaHandle {
 
     /// 推进内核（定时器驱动），返回要发出的消息。
     pub fn tick(&self, now_ms: u64) -> Vec<(String, RaftMessage)> {
+        let t0 = std::time::Instant::now();
         let mut g = self.inner.lock().unwrap();
+        let wait = t0.elapsed();
         let out = g.node.tick(now_ms);
         g.maintain();
+        self.publish_applied(&g);
+        drop(g);
+        let total = t0.elapsed();
+        if total > std::time::Duration::from_millis(200) {
+            tracing::warn!(
+                wait_ms = wait.as_millis() as u64,
+                total_ms = total.as_millis() as u64,
+                "ha: tick 慢（等锁或内核推进耗时）"
+            );
+        }
         out
     }
 
@@ -2162,9 +2449,21 @@ impl HaHandle {
         msg: RaftMessage,
         now_ms: u64,
     ) -> Vec<(String, RaftMessage)> {
+        let t0 = std::time::Instant::now();
         let mut g = self.inner.lock().unwrap();
+        let wait = t0.elapsed();
         let out = g.node.handle(from, msg, now_ms);
         g.maintain();
+        self.publish_applied(&g);
+        drop(g);
+        let total = t0.elapsed();
+        if total > std::time::Duration::from_millis(200) {
+            tracing::warn!(
+                wait_ms = wait.as_millis() as u64,
+                total_ms = total.as_millis() as u64,
+                "ha: on_message 慢（等锁或内核推进耗时）"
+            );
+        }
         out
     }
 
@@ -2173,6 +2472,7 @@ impl HaHandle {
         let mut g = self.inner.lock().unwrap();
         let idx = g.node.propose(cmd);
         g.maintain();
+        self.publish_applied(&g);
         idx
     }
 
@@ -2185,6 +2485,7 @@ impl HaHandle {
         let mut g = self.inner.lock().unwrap();
         let idx = g.node.propose_membership(voters, learners)?;
         g.maintain();
+        self.publish_applied(&g);
         Ok(idx)
     }
 
@@ -2267,6 +2568,37 @@ impl HaHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `block_wait` 必须把 worker core（含定时器驱动）让出去：否则一次
+    /// 3s 的 apply 等待会冻住整个进程的定时器（心跳断流 → 误选主）。
+    #[test]
+    fn block_wait_yields_worker_driver() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ticker = tokio::spawn(async {
+                let mut t = tokio::time::interval(Duration::from_millis(50));
+                let mut last = Instant::now();
+                let mut max_gap = 0u128;
+                for _ in 0..30 {
+                    t.tick().await;
+                    max_gap = max_gap.max(last.elapsed().as_millis());
+                    last = Instant::now();
+                }
+                max_gap
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let waiter = tokio::spawn(async {
+                block_wait(|| std::thread::sleep(Duration::from_millis(1200)));
+            });
+            waiter.await.unwrap();
+            let max_gap = ticker.await.unwrap();
+            assert!(max_gap < 400, "ticker 被冻结 {max_gap}ms");
+        });
+    }
 
     /// 内存网络：把消息投递到目标节点，返回新产生的消息。
     struct Net {

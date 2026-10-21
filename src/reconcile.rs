@@ -209,6 +209,8 @@ pub struct Engine {
     mode_last: std::sync::Mutex<crate::router::MeshMode>,
     /// v0.7 §5.4 per-namespace 配额快照（enabled=false 时派发零限制）。
     quota_cfg: crate::quota::QuotaConfig,
+    /// v0.8 M4：HA 句柄（Some 时只有 leader 执行 tick/事件收敛）。
+    ha: Option<crate::ha::HaHandle>,
 }
 
 impl Engine {
@@ -238,6 +240,7 @@ impl Engine {
             std::time::Instant::now()
                 + std::time::Duration::from_secs(warmpool_cfg.interval_secs.clamp(5, 3600_u64)),
         );
+        let ha = state.ha.clone();
         let engine = Engine {
             mesh,
             router,
@@ -255,6 +258,7 @@ impl Engine {
             slo_next: std::sync::Mutex::new(std::time::Instant::now()),
             mode_last,
             quota_cfg: state.config.mesh.quota.clone(),
+            ha,
         };
         tokio::spawn(async move {
             if let Err(e) = engine.run(shutdown_rx).await {
@@ -266,7 +270,13 @@ impl Engine {
     async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
         // P2-4 重启重建：先从 history 环把本节点曾见的 task 事件重放到表中，
         // 补齐引擎缺席期间的轨迹（幂等键 (task_id,seq) 保证重放安全）。
-        self.align_history()?;
+        // v0.8 M4：HA 模式下表以状态机为准，不做 history 重放（避免旧事件
+        // 在 follower 上二次落表）。
+        if self.ha.is_none() {
+            self.align_history()?;
+        } else {
+            self.mesh.sync_from_ha();
+        }
 
         let mut events = self.router.events_subscribe();
         let mut tick = interval(Duration::from_millis(self.params.tick_ms));
@@ -275,6 +285,7 @@ impl Engine {
             tick_ms = self.params.tick_ms,
             max_retries = self.params.max_retries,
             backoff_secs = self.params.backoff_secs,
+            ha = self.ha.is_some(),
             "task engine reconcile loop started"
         );
 
@@ -282,12 +293,22 @@ impl Engine {
             tokio::select! {
                 // 事件收敛（优先：把事件流里的新帧尽快落表）
                 Ok(env) = events.recv() => {
+                    if self.ha.as_ref().is_some_and(|ha| !ha.is_leader()) {
+                        // follower 不执行引擎：任务帧转给 leader（幂等键兜底去重）。
+                        self.forward_event(&env);
+                        continue;
+                    }
                     if let Err(e) = self.consume_event(&env) {
                         tracing::error!(error = %e, "engine: 事件收敛失败");
                     }
                 }
                 // 定时 tick：deadline/expired、backoff 重投、drift 告警
                 _ = tick.tick() => {
+                    if self.ha.as_ref().is_some_and(|ha| !ha.is_leader()) {
+                        self.mesh.sync_from_ha();
+                        continue;
+                    }
+                    self.mesh.maybe_seed_ha();
                     if let Err(e) = self.tick_once().await {
                         tracing::error!(error = %e, "engine: tick 执行失败");
                     }
@@ -302,6 +323,23 @@ impl Engine {
         }
         tracing::info!("task engine reconcile loop stopped");
         Ok(())
+    }
+
+    /// follower 侧：把任务帧转给 leader 执行（raw Envelope 由 leader 重新注入
+    /// 事件总线；leader 的引擎按既有幂等键去重）。
+    fn forward_event(&self, env: &Envelope) {
+        let topic = env
+            .payload
+            .get("topic")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !crate::router::is_task_topic(topic) {
+            return;
+        }
+        let Some(ha) = &self.ha else { return };
+        let Some(leader) = ha.leader_id() else { return };
+        let payload = serde_json::json!({ "env": env });
+        self.router.forward_ctrl(&leader, "ha_event", payload);
     }
 
     /// 把一条总线 envelope 应用到任务表 + journal（P2-1 事件收敛）。
@@ -319,6 +357,11 @@ impl Engine {
             _ => return Ok(()),
         };
         let seq = payload.get("seq").and_then(|v| v.as_u64());
+
+        // 迁移未完成时先把本地 journal 灌入状态机；刚接任 leader 时再对齐
+        // 前任已提交的行，然后才做幂等/冲突判定。
+        self.mesh.maybe_seed_ha();
+        self.mesh.ensure_leader_table();
 
         // 快速幂等前置：(task_id, seq) 已见 → 不落 journal（表零改动）
         {
@@ -365,14 +408,15 @@ impl Engine {
                 let warmpool =
                     table.get(&task_id).and_then(|r| r.correlation.as_deref()) == Some("warmpool");
                 let rev = self.mesh.next_rev();
-                drop(table); // 释放表锁再落 store（锁顺序：table → store）
+                // 表锁持有到 append 返回：HA 下 append 等待本地 apply，期间
+                // leader 若做全量对齐，锁内扫描必须已包含本帧；先放锁再
+                // propose 会让对齐装回旧行（已确认的转换被回退）。
                 if let Err(e) = self
                     .mesh
                     .store
                     .append(&TaskEvent::up(&task_id, rev, rec_json))
                 {
                     // journal 落盘失败：回滚内存表，拒绝写入（宁缺勿滥）
-                    let mut table = self.mesh.table.lock().unwrap();
                     match prev {
                         Some(p) => {
                             table.insert(task_id, p);
@@ -383,6 +427,7 @@ impl Engine {
                     }
                     return Err(anyhow!("journal append failed: {e}"));
                 }
+                drop(table);
                 self.mesh.maybe_snapshot();
                 // P3-3：终态进入时更新批次护栏状态。
                 if let Some(st) = new_state {
@@ -420,6 +465,7 @@ impl Engine {
 
     /// 一次 tick：deadline→expired、failed/backoff 重投、drift 告警（P2-3 timer 动作）。
     async fn tick_once(&self) -> Result<()> {
+        self.mesh.ensure_leader_table();
         let now_epoch = now_wall();
 
         // ---- 0. 节点失联回收（v0.7 chaos kill-node）----
@@ -1398,6 +1444,10 @@ mod tests {
             circuit: std::sync::Mutex::new(crate::circuit::Circuit::new()),
             slo: std::sync::Mutex::new(crate::slo::SloState::new(None, false)),
             quota_rate: std::sync::Mutex::new(crate::quota::RateLimiter::default()),
+            ha_synced: std::sync::atomic::AtomicU64::new(0),
+            ha_table_term: std::sync::atomic::AtomicU64::new(0),
+            ha_seed_pending: std::sync::atomic::AtomicBool::new(false),
+            quota_ha_lock: tokio::sync::Mutex::new(()),
         });
         state_inner.mesh = Some(mesh.clone());
         let state = Arc::new(state_inner);
@@ -1423,6 +1473,7 @@ mod tests {
             slo_next: std::sync::Mutex::new(std::time::Instant::now()),
             mode_last: std::sync::Mutex::new(crate::router::MeshMode::Normal),
             quota_cfg: cfg.mesh.quota.clone(),
+            ha: state.ha.clone(),
         };
         (state, mesh, engine)
     }

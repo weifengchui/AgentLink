@@ -1386,6 +1386,13 @@ async fn run(mut cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()>
                     learners = learners.len(),
                     "ha: raft runtime started (M2 transport wiring)"
                 );
+                // v0.8 M4：状态机接线——taskstore 写入改走 Raft；审计链复制；
+                // 任务表以状态机为准（首次启用时由 leader 把本地 journal 灌入）。
+                if let Some(mesh) = state_inner.mesh.as_ref() {
+                    mesh.store.set_ha(h.clone());
+                    mesh.init_ha();
+                }
+                state_inner.router.attach_ha(h.clone());
                 state_inner.ha = Some(h);
             }
             Err(e) => {
@@ -1427,33 +1434,69 @@ async fn run(mut cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()>
     // 未启用 HA 时不 spawn（零流量、零行为变化）。
     if let Some(ha) = state.ha.clone() {
         let ha_state = state.clone();
-        let mut ha_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
-            loop {
-                tokio::select! {
-                    _ = ha_shutdown.changed() => break,
-                    _ = ticker.tick() => {}
-                }
-                if *ha_shutdown.borrow() {
-                    break;
-                }
-                let now = ha.now_ms();
-                let msgs = ha.tick(now);
-                for (to, msg) in msgs {
-                    let Some(sink) = ha_state.router.peer_sink(&to) else {
-                        continue; // 对端尚未连上：下一拍再试
-                    };
-                    let env = ha_state
-                        .router
-                        .ha_envelope(&to, serde_json::json!({"msg": msg}));
-                    if let Ok(text) = serde_json::to_string(&env) {
-                        let _ = sink.tx.send(conn::Frame::Text(text)).await;
+        let ha_shutdown = shutdown_rx.clone();
+        // Raft 驱动必须独立于 async runtime：tokio 定时器在 worker 执行
+        // block_in_place 等待期间可能整体停摆数秒，而心跳/选举超时一旦停摆
+        // 就会被对端误判失联、反复重新选主（业务写随即 409/500）。专用 OS
+        // 线程只依赖 std::thread::sleep，等待者在下一拍 apply 后即可被唤醒。
+        std::thread::Builder::new()
+            .name("ha-ticker".into())
+            .spawn(move || {
+                let mut next = std::time::Instant::now();
+                let mut last_tick = std::time::Instant::now();
+                let mut last_sweep = std::time::Instant::now();
+                loop {
+                    next += std::time::Duration::from_millis(50);
+                    let now = std::time::Instant::now();
+                    if next > now {
+                        std::thread::sleep(next - now);
+                    } else {
+                        next = now;
+                    }
+                    if *ha_shutdown.borrow() {
+                        break;
+                    }
+                    // 心跳是选举超时的唯一凭据：ticker 自己被卡住 = 全员重新
+                    // 选主。发送用 try_send：单 peer 背压只丢本帧，下一拍心跳
+                    // 会重带状态与未确认日志。
+                    let gap = last_tick.elapsed();
+                    last_tick = std::time::Instant::now();
+                    if gap > std::time::Duration::from_millis(300) {
+                        tracing::warn!(gap_ms = gap.as_millis() as u64, "ha: ticker 调度延迟");
+                    }
+                    let msgs = ha.tick(ha.now_ms());
+                    for (to, msg) in msgs {
+                        let Some(sink) = ha_state.router.peer_sink(&to) else {
+                            tracing::debug!(peer = %to, "ha: peer 未连接，跳过本帧");
+                            continue;
+                        };
+                        let env = ha_state
+                            .router
+                            .ha_envelope(&to, serde_json::json!({"msg": msg}));
+                        let Ok(text) = serde_json::to_string(&env) else {
+                            continue;
+                        };
+                        match sink.tx.try_send(conn::Frame::Text(text)) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                tracing::debug!(peer = %to, "ha: peer 通道已关闭");
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                tracing::debug!(peer = %to, "ha: peer 通道背压，丢弃本帧");
+                            }
+                        }
+                    }
+                    // v0.8 M4：复制 OIDC 表的过期清理（30s 一拍，仅 leader 执行）。
+                    if last_sweep.elapsed() >= std::time::Duration::from_secs(30) {
+                        if ha.is_leader() {
+                            api::sweep_ha_oidc(&ha);
+                        }
+                        last_sweep = std::time::Instant::now();
                     }
                 }
-            }
-            tracing::info!("ha: raft ticker stopped");
-        });
+                tracing::info!("ha: raft ticker stopped");
+            })
+            .expect("spawn ha-ticker thread");
     }
 
     let discovery = if cfg.discovery.enabled {
@@ -1536,6 +1579,9 @@ async fn run(mut cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()>
         node_id = %cfg.node_id,
         name = %cfg.name,
         bind = %bind,
+        cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0),
         "agentlink node started"
     );
     tracing::info!("local API: http://127.0.0.1:{}/v1/health", cfg.listen_port);

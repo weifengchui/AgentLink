@@ -139,6 +139,10 @@ pub fn spawn(state: SharedState, shutdown: watch::Receiver<bool>) {
             tokio::select! {
                 _ = shutdown.changed() => break,
                 _ = ticker.tick() => {
+                    // v0.8 M4：只有 leader 执行 apply（避免多节点重复落任务）。
+                    if state.ha.as_ref().is_some_and(|ha| !ha.is_leader()) {
+                        continue;
+                    }
                     let mut observed = seen.seen.lock().unwrap();
                     for picked in scan_dir(&dir, &mut observed) {
                         match picked {

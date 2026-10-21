@@ -106,6 +106,9 @@ pub struct TaskStore {
     inner: Mutex<Inner>,
     /// v0.7 chaos §6.4：disk_full 模拟（None=不注入，测试/默认路径）。
     chaos: Option<std::sync::Arc<crate::chaos::Chaos>>,
+    /// v0.8 M4：HA 启用后所有任务写走复制状态机（本地 journal 仅作
+    /// 首次启用 HA 时的迁移种子，不再追加）。
+    ha: Mutex<Option<crate::ha::HaHandle>>,
 }
 
 impl TaskStore {
@@ -123,7 +126,23 @@ impl TaskStore {
                 records: HashMap::new(),
             }),
             chaos: None,
+            ha: Mutex::new(None),
         })
+    }
+
+    /// v0.8 M4：接上 Raft 句柄。此后 `append` 只走 `task` 命名空间，
+    /// 不再写本地 journal/快照（状态机是唯一权威）。
+    pub fn set_ha(&self, ha: crate::ha::HaHandle) {
+        *self.ha.lock().unwrap() = Some(ha);
+    }
+
+    /// 当前 HA 句柄（未启用返回 None）。
+    pub fn ha(&self) -> Option<crate::ha::HaHandle> {
+        self.ha.lock().unwrap().clone()
+    }
+
+    pub fn ha_enabled(&self) -> bool {
+        self.ha.lock().unwrap().is_some()
     }
 
     /// 存储子目录（诊断/测试用）。
@@ -148,6 +167,9 @@ impl TaskStore {
             return Err(std::io::Error::other(
                 "chaos: simulated disk full (task journal append rejected)",
             ));
+        }
+        if let Some(ha) = self.ha() {
+            return self.append_ha(&ha, ev);
         }
         let line = serde_json::to_string(ev)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -181,6 +203,9 @@ impl TaskStore {
     /// 已落入快照的事件段就此清扫，journal 永远只保留"快照之后"的增量。
     /// 终态任务的留存清扫是引擎语义：先 `append(del)` 再调用本函数即可。
     pub fn snapshot_save(&self) -> std::io::Result<()> {
+        if self.ha_enabled() {
+            return Ok(()); // HA：状态机是权威，本地快照不再参与恢复
+        }
         let mut guard = self.inner.lock().unwrap();
         // 先落快照：state.json 完整覆盖当前表，此后 journal 可安全清空。
         let table: BTreeMap<&str, &Value> =
@@ -255,6 +280,61 @@ impl TaskStore {
             .open(path)
             .ok()
             .map(BufWriter::new)
+    }
+
+    /// HA 写入：propose 到 `task` 命名空间并等待本地 apply，然后同步内存记录。
+    /// 失败时内存表保持不动（调用方沿用回滚路径）。
+    fn append_ha(&self, ha: &crate::ha::HaHandle, ev: &TaskEvent) -> std::io::Result<()> {
+        let cmd = match ev.op.as_str() {
+            "up" => {
+                let rec = ev.rec.as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "taskstore: up event without record",
+                    )
+                })?;
+                let value = serde_json::to_vec(rec).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
+                crate::ha::Command::Put {
+                    ns: crate::ha::NS_TASK.to_string(),
+                    key: ev.task_id.clone(),
+                    value,
+                }
+            }
+            "del" => crate::ha::Command::Delete {
+                ns: crate::ha::NS_TASK.to_string(),
+                key: ev.task_id.clone(),
+            },
+            other => {
+                tracing::warn!(op = other, task_id = %ev.task_id, "taskstore: 忽略未知 op");
+                return Ok(());
+            }
+        };
+        ha.propose_and_wait(cmd, crate::ha::APPLY_TIMEOUT)
+            .map_err(ha_to_io)?;
+        apply_event(&mut self.inner.lock().unwrap().records, ev);
+        Ok(())
+    }
+
+    /// HA 同步：用状态机全量记录替换本地记录视图（供启动/追赶）。
+    pub fn replace_records(&self, records: HashMap<String, Value>) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.records = records;
+        guard.writer = None;
+    }
+}
+
+/// HA 写错误 → io::Error（保留可判别前缀，供 HTTP 层映射 409/503）。
+fn ha_to_io(e: crate::ha::HaError) -> std::io::Error {
+    match e {
+        crate::ha::HaError::NotLeader { .. } => std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!("ha:not-leader: {e}"),
+        ),
+        crate::ha::HaError::Timeout { .. } | crate::ha::HaError::Unavailable(_) => {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, format!("ha:unavailable: {e}"))
+        }
     }
 }
 
