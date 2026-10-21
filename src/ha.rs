@@ -139,6 +139,8 @@ pub struct AppendResponse {
     pub conflict_index: u64,
     /// 对端处理完本次追加后的 commit_index。
     pub commit_index: u64,
+    /// 回显的 ReadIndex 序号。
+    pub read_seq: u64,
 }
 
 /// 追加日志请求参数。
@@ -149,6 +151,8 @@ pub struct AppendRequest {
     pub prev_log_term: u64,
     pub entries: Vec<LogEntry>,
     pub leader_commit: u64,
+    /// ReadIndex 序号（原样回显）。
+    pub read_seq: u64,
 }
 
 /// 节点间消息。
@@ -177,6 +181,9 @@ pub enum RaftMessage {
         prev_log_term: u64,
         entries: Vec<LogEntry>,
         leader_commit: u64,
+        /// ReadIndex 序号（原样回显：leader 据此确认「这条 ack 发生在读开始之后」）。
+        #[serde(default)]
+        read_seq: u64,
     },
     /// 追加结果；失败时带 `conflict_index` 提示回退位置。
     AppendEntriesResp {
@@ -188,6 +195,9 @@ pub enum RaftMessage {
         /// 对端处理完本次追加后的 commit_index（leader 判断 drain 是否完成）。
         #[serde(default)]
         commit_index: u64,
+        /// 回显 AppendEntries 里的 read_seq（ReadIndex 确认用）。
+        #[serde(default)]
+        read_seq: u64,
     },
     /// 安装快照（节点落后太多时用）。
     InstallSnapshot {
@@ -332,6 +342,12 @@ pub struct RaftNode {
     /// 已被移出配置、但还没追平日志的节点（leader 继续喂日志，避免其
     /// 停留在旧配置里反复发起无效选举）。
     draining: HashSet<String>,
+    /// ReadIndex：leader 侧单调递增的读序号。
+    read_seq: u64,
+    /// 各对端已确认到的 ReadIndex 序号（`AppendEntriesResp.read_seq` 回显）。
+    read_ack: HashMap<String, u64>,
+    /// 尚未完成的读：`(seq, read_index, 起始时刻)`。
+    pending_reads: Vec<(u64, u64, u64)>,
 }
 
 impl RaftNode {
@@ -389,6 +405,9 @@ impl RaftNode {
             learners,
             joint_old: None,
             draining: HashSet::new(),
+            read_seq: 0,
+            read_ack: HashMap::new(),
+            pending_reads: Vec::new(),
         }
     }
 
@@ -730,6 +749,9 @@ impl RaftNode {
         self.votes.clear();
         self.pre_votes.clear();
         self.pre_vote = false;
+        // 不再是 leader：未完成的强一致读全部作废（等新 leader 再发起）。
+        self.pending_reads.clear();
+        self.read_ack.clear();
     }
 
     /// 候选者日志是否至少同样新。
@@ -795,6 +817,7 @@ impl RaftNode {
                 prev_log_term,
                 entries,
                 leader_commit,
+                read_seq,
             } => {
                 let a = AppendRequest {
                     term,
@@ -802,6 +825,7 @@ impl RaftNode {
                     prev_log_term,
                     entries,
                     leader_commit,
+                    read_seq,
                 };
                 out.extend(self.on_append_entries(leader_id, &a, now));
             }
@@ -812,6 +836,7 @@ impl RaftNode {
                 match_index,
                 conflict_index,
                 commit_index,
+                read_seq,
             } => {
                 let r = AppendResponse {
                     term,
@@ -820,6 +845,7 @@ impl RaftNode {
                     match_index,
                     conflict_index,
                     commit_index,
+                    read_seq,
                 };
                 out.extend(self.on_append_resp(&r, now));
             }
@@ -938,6 +964,73 @@ impl RaftNode {
             "ha: membership change proposed (joint consensus)"
         );
         Ok(index)
+    }
+
+    // ---- ReadIndex（强一致读）--------------------------------------------
+
+    /// 发起一次线性一致读（仅 leader）。返回 `(seq, read_index)`。
+    ///
+    /// 语义：读完 `commit_index >= read_index` 且本轮心跳拿到多数派确认
+    /// （证明「读开始之后仍然只有我是 leader」）之后才可读状态机。
+    pub fn begin_read(&mut self, now: u64) -> Option<(u64, u64)> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        self.read_seq += 1;
+        let seq = self.read_seq;
+        let read_index = self.commit_index;
+        // 顺带清理过期读（调用方超时放弃的），避免无限增长。
+        self.pending_reads
+            .retain(|(_, _, at)| now.saturating_sub(*at) < 10_000);
+        if self.pending_reads.len() >= 64 {
+            self.pending_reads.remove(0);
+        }
+        self.pending_reads.push((seq, read_index, now));
+        // 让心跳立刻发生（不等下一个 tick），缩短确认时延。
+        self.heartbeat_at = now + self.cfg.heartbeat_interval_ms.max(1);
+        Some((seq, read_index))
+    }
+
+    /// 立刻广播一轮心跳（ReadIndex 确认 / 新 leader 快速建立权威）。
+    pub fn broadcast_heartbeat(&mut self, now: u64) -> Vec<(String, RaftMessage)> {
+        if self.role != Role::Leader {
+            return Vec::new();
+        }
+        self.heartbeat_at = now + self.cfg.heartbeat_interval_ms.max(1);
+        self.broadcast_append(now)
+    }
+
+    /// 读是否已经安全：多数派已确认本轮的读序号，且状态机已应用到 read_index。
+    /// 返回 `read_index` 表示可以读了。
+    pub fn read_ready(&self, seq: u64) -> Option<u64> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        let read_index = self
+            .pending_reads
+            .iter()
+            .find(|(s, _, _)| *s == seq)
+            .map(|(_, idx, _)| *idx)?;
+        let mut acked: HashSet<String> = self
+            .read_ack
+            .iter()
+            .filter(|(_, a)| **a >= seq)
+            .map(|(id, _)| id.clone())
+            .collect();
+        // leader 自身算一票（它在本任期当选，且这条读由它发起）。
+        acked.insert(self.id.clone());
+        if !self.quorum_reached(&acked) {
+            return None;
+        }
+        if self.last_applied < read_index {
+            return None;
+        }
+        Some(read_index)
+    }
+
+    /// 读完/超时后释放这条读。
+    pub fn finish_read(&mut self, seq: u64) {
+        self.pending_reads.retain(|(s, _, _)| *s != seq);
     }
 
     // ---- 选举 -------------------------------------------------------------
@@ -1120,6 +1213,9 @@ impl RaftNode {
         self.votes.clear();
         self.pre_votes.clear();
         self.pre_vote = false;
+        // 新任期：旧的读确认全部作废（必须重新确认 leadership）。
+        self.read_ack.clear();
+        self.pending_reads.clear();
         // 从日志重建生效配置：已应用配置 + 未提交的成员变更 -> joint。
         self.rebuild_config_from_log();
         self.sync_trackers();
@@ -1207,6 +1303,7 @@ impl RaftNode {
             prev_log_term: prev_term,
             entries,
             leader_commit: self.commit_index,
+            read_seq: self.read_seq,
         }
     }
 
@@ -1221,6 +1318,7 @@ impl RaftNode {
         let prev_log_term = a.prev_log_term;
         let entries = a.entries.clone();
         let leader_commit = a.leader_commit;
+        let read_seq = a.read_seq;
         let mut out = Vec::new();
         if term < self.current_term {
             out.push((
@@ -1232,6 +1330,7 @@ impl RaftNode {
                     match_index: 0,
                     conflict_index: 0,
                     commit_index: self.commit_index,
+                    read_seq,
                 },
             ));
             return out;
@@ -1268,6 +1367,7 @@ impl RaftNode {
                             match_index: 0,
                             conflict_index: idx,
                             commit_index: self.commit_index,
+                            read_seq,
                         },
                     ));
                     return out;
@@ -1284,6 +1384,7 @@ impl RaftNode {
                             match_index: 0,
                             conflict_index: self.last_log_index() + 1,
                             commit_index: self.commit_index,
+                            read_seq,
                         },
                     ));
                     return out;
@@ -1322,6 +1423,7 @@ impl RaftNode {
                 match_index: (prev_log_index + entries_len).max(base),
                 conflict_index: 0,
                 commit_index: self.commit_index,
+                read_seq,
             },
         ));
         out
@@ -1347,6 +1449,9 @@ impl RaftNode {
         }
         tracing::debug!(from = %from_id, success, match_index, "ha: append resp");
         if success {
+            // ReadIndex：记录该对端最近确认到的读序号（用于判断读是否安全）。
+            let acked = self.read_ack.get(&from_id).copied().unwrap_or(0);
+            self.read_ack.insert(from_id.clone(), acked.max(r.read_seq));
             let m = match_index.max(self.match_index.get(&from_id).copied().unwrap_or(0));
             self.match_index.insert(from_id.clone(), m);
             self.next_index.insert(from_id.clone(), m + 1);
@@ -2083,6 +2188,32 @@ impl HaHandle {
         Ok(idx)
     }
 
+    /// 发起线性一致读；非 leader 返回 `None`。
+    pub fn begin_read(&self, now_ms: u64) -> Option<(u64, u64)> {
+        let mut g = self.inner.lock().unwrap();
+        g.node.begin_read(now_ms)
+    }
+
+    /// 立刻广播一轮心跳（ReadIndex 确认），返回要发出的消息。
+    pub fn read_heartbeat(&self, now_ms: u64) -> Vec<(String, RaftMessage)> {
+        let mut g = self.inner.lock().unwrap();
+        let out = g.node.broadcast_heartbeat(now_ms);
+        g.maintain();
+        out
+    }
+
+    /// 读是否已可安全返回；`Some(read_index)` 表示可以读状态机。
+    pub fn read_ready(&self, seq: u64) -> Option<u64> {
+        let g = self.inner.lock().unwrap();
+        g.node.read_ready(seq)
+    }
+
+    /// 释放读（读完 / 超时）。
+    pub fn finish_read(&self, seq: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.node.finish_read(seq);
+    }
+
     /// 已提交的成员配置（voters, learners）。
     pub fn membership(&self) -> (Vec<String>, Vec<String>) {
         let g = self.inner.lock().unwrap();
@@ -2488,6 +2619,7 @@ mod tests {
                 command: put("task", "k", "leader-value"),
             }],
             leader_commit: 1,
+            read_seq: 0,
         };
         let mut n2 = RaftNode::new("n2", vec!["n1".into()], RaftConfig::default());
         n2.current_term = 1;
@@ -2970,6 +3102,149 @@ mod tests {
                 "{id} 未拿到新增后的写入"
             );
         }
+    }
+
+    #[test]
+    fn read_index_needs_quorum_confirmation() {
+        let mut net = Net::new(&["n1", "n2", "n3"]);
+        let leader = elect(&mut net, 200).expect("选主");
+        let now = net.now;
+        let (seq, read_index) = net
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .begin_read(now)
+            .expect("leader 应能发起读");
+        // 还没拿回心跳 ack：不能读。
+        assert!(
+            net.nodes[&leader].read_ready(seq).is_none(),
+            "未确认 leadership 前不得返回读"
+        );
+        let msgs = net.nodes.get_mut(&leader).unwrap().broadcast_heartbeat(now);
+        assert!(!msgs.is_empty(), "应广播心跳");
+        for (to, m) in msgs {
+            net.queue.push((leader.clone(), to, m));
+        }
+        net.drain();
+        assert_eq!(
+            net.nodes[&leader].read_ready(seq),
+            Some(read_index),
+            "多数派确认后应可读"
+        );
+        net.nodes.get_mut(&leader).unwrap().finish_read(seq);
+        assert!(net.nodes[&leader].read_ready(seq).is_none());
+    }
+
+    #[test]
+    fn read_index_with_one_follower_ack_is_enough_for_three_nodes() {
+        let mut net = Net::new(&["n1", "n2", "n3"]);
+        let leader = elect(&mut net, 200).expect("选主");
+        let followers: Vec<String> = ["n1", "n2", "n3"]
+            .iter()
+            .filter(|id| **id != leader)
+            .map(|id| id.to_string())
+            .collect();
+        // 只剩一个 follower：3 节点多数派 = 2（leader + 它）。
+        net.dropped.insert(followers[0].clone());
+        let now = net.now;
+        let (seq, read_index) = net
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .begin_read(now)
+            .expect("发起读");
+        let msgs = net.nodes.get_mut(&leader).unwrap().broadcast_heartbeat(now);
+        for (to, m) in msgs {
+            net.queue.push((leader.clone(), to, m));
+        }
+        net.drain();
+        assert_eq!(
+            net.nodes[&leader].read_ready(seq),
+            Some(read_index),
+            "leader + 1 个 follower 已达 3 节点多数派"
+        );
+    }
+
+    #[test]
+    fn read_index_blocked_without_quorum() {
+        let mut net = Net::new(&["n1", "n2", "n3"]);
+        let leader = elect(&mut net, 200).expect("选主");
+        // 隔离另外两个节点：leader 拿不到多数派确认。
+        for id in ["n1", "n2", "n3"] {
+            if id != leader {
+                net.dropped.insert(id.to_string());
+            }
+        }
+        let now = net.now;
+        let (seq, _ri) = net
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .begin_read(now)
+            .expect("发起读");
+        let msgs = net.nodes.get_mut(&leader).unwrap().broadcast_heartbeat(now);
+        for (to, m) in msgs {
+            net.queue.push((leader.clone(), to, m));
+        }
+        net.drain();
+        assert!(
+            net.nodes[&leader].read_ready(seq).is_none(),
+            "失去多数派时强一致读必须失败而非返回旧值"
+        );
+    }
+
+    #[test]
+    fn read_index_only_on_leader_and_sees_committed_writes() {
+        let mut net = Net::new(&["n1", "n2", "n3"]);
+        let leader = elect(&mut net, 200).expect("选主");
+        let follower = ["n1", "n2", "n3"]
+            .iter()
+            .find(|id| **id != leader)
+            .unwrap()
+            .to_string();
+        assert!(
+            net.nodes
+                .get_mut(&follower)
+                .unwrap()
+                .begin_read(net.now)
+                .is_none(),
+            "follower 不能发起 ReadIndex"
+        );
+
+        let idx = net
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(put("kv", "strong", "v"))
+            .expect("propose");
+        for _ in 0..8 {
+            net.tick(50);
+        }
+        let now = net.now;
+        let (seq, read_index) = net
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .begin_read(now)
+            .expect("发起读");
+        assert!(
+            read_index >= idx,
+            "read_index 应覆盖已提交的写入（{read_index} < {idx}）"
+        );
+        let msgs = net.nodes.get_mut(&leader).unwrap().broadcast_heartbeat(now);
+        for (to, m) in msgs {
+            net.queue.push((leader.clone(), to, m));
+        }
+        net.drain();
+        assert_eq!(net.nodes[&leader].read_ready(seq), Some(read_index));
+        assert_eq!(
+            net.nodes[&leader]
+                .state()
+                .get("kv", "strong")
+                .map(|v| v.as_slice()),
+            Some(b"v".as_slice()),
+            "强一致读应能看到已提交的写入"
+        );
     }
 
     #[test]

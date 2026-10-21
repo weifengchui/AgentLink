@@ -4963,6 +4963,25 @@ struct HaGetReq {
     ns: Option<String>,
     #[serde(default)]
     key: Option<String>,
+    /// 强一致读（ReadIndex）：必须由 leader 服务，先确认「读开始后仍是 leader」，
+    /// 并等状态机应用到 read_index。缺省 false（向后兼容 M2 的本地读语义）。
+    #[serde(default)]
+    strong: bool,
+}
+
+/// 把 HA 内核产出的复制帧发给对端（对端未连上就丢给下一拍 ticker 重试）。
+async fn ha_dispatch(state: &SharedState, msgs: Vec<(String, crate::ha::RaftMessage)>) {
+    for (to, msg) in msgs {
+        let Some(sink) = state.router.peer_sink(&to) else {
+            continue;
+        };
+        let env = state
+            .router
+            .ha_envelope(&to, serde_json::json!({"msg": msg}));
+        if let Ok(text) = serde_json::to_string(&env) {
+            let _ = sink.tx.send(conn::Frame::Text(text)).await;
+        }
+    }
 }
 
 async fn ha_get(
@@ -4985,10 +5004,62 @@ async fn ha_get(
     };
     let ns = req.ns.unwrap_or_else(|| "kv".to_string());
     let key = req.key.unwrap_or_default();
+    let mut read_index = 0u64;
+    if req.strong {
+        // ReadIndex：① 记下当前 commit_index；② 一轮心跳确认多数派仍认我；
+        // ③ 等状态机应用到 read_index 后再读，保证线性一致。
+        let now = ha.now_ms();
+        let Some((seq, _ri)) = ha.begin_read(now) else {
+            let leader = ha.status().leader_id;
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "not the leader (strong read requires the leader)",
+                    "leader_id": leader,
+                })),
+            )
+                .into_response();
+        };
+        let msgs = ha.read_heartbeat(now);
+        ha_dispatch(&state, msgs).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut confirmed = None;
+        loop {
+            if let Some(ri) = ha.read_ready(seq) {
+                confirmed = Some(ri);
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        ha.finish_read(seq);
+        match confirmed {
+            Some(ri) => read_index = ri,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "linearizable read timed out (no quorum confirmation)",
+                        "leader_id": ha.status().leader_id,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
     let value = ha
         .get(&ns, &key)
         .map(|v| String::from_utf8_lossy(&v).to_string());
-    Json(json!({"ok": true, "key": key, "value": value})).into_response()
+    Json(json!({
+        "ok": true,
+        "key": key,
+        "value": value,
+        "strong": req.strong,
+        "read_index": read_index,
+    }))
+    .into_response()
 }
 
 /// 浏览器登录状态（公开、无敏感信息）：Web UI 据此显示 SSO 按钮。

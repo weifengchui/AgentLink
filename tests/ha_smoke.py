@@ -13,6 +13,7 @@
   A5 /v1/ha/status 暴露角色/term/commit 位点；未启用 HA 的节点行为不变
   A7 leader 压缩日志前缀后，长期离线节点通过 InstallSnapshot 追平
   A8 joint consensus 动态成员变更：3 投票成员 -> 2 -> 3（含缩容后仍能提交）
+  A9 ReadIndex 强一致读：leader 可读、follower 409、无 quorum 503
   A6 进程存活、日志无 panic
 """
 import json
@@ -321,6 +322,71 @@ def main():
                 "write_after_shrink": st_w,
                 "grow": {"status": st_b, "body": body_b, "converged": bool(back),
                          "removed_caught_up": bool(caught)}})
+
+        # A9 ReadIndex 强一致读 -------------------------------------------------
+        cur = wait_for(lambda: leaders()[0] if len(leaders()) == 1 else None, 20)
+        assert cur, "A9 前应存在唯一 leader"
+        fol = [p for p in PORTS if p != cur][0]
+        # ① leader 强一致读：返回 read_index 且读到已提交值
+        st_r1, b_r1 = api(cur, "/v1/ha/get",
+                          {"ns": "kv", "key": "s1099", "strong": True})
+        # ② follower 不服务强一致读（409 + leader 提示）
+        st_r2, b_r2 = api(fol, "/v1/ha/get",
+                          {"ns": "kv", "key": "s1099", "strong": True})
+        # ③ 写入提交后，强一致读必须看到新值
+        st_w9, b_w9 = api(cur, "/v1/ha/propose",
+                          {"ns": "kv", "key": "strong_k", "value": "v9"})
+        idx9 = b_w9.get("index", 0)
+        committed9 = wait_for(
+            lambda: ha_status(cur).get("commit_index", 0) >= idx9 and idx9, 15)
+        st_r3, b_r3 = api(cur, "/v1/ha/get",
+                          {"ns": "kv", "key": "strong_k", "strong": True})
+        # ④ 摘掉一个 follower：2/3 仍有多数派，强一致读继续可用
+        procs[fol].terminate()
+        try:
+            procs[fol].wait(timeout=5)
+        except Exception:
+            procs[fol].kill()
+        time.sleep(0.4)
+        st_r4, b_r4 = api(cur, "/v1/ha/get",
+                          {"ns": "kv", "key": "s1099", "strong": True})
+        procs[fol] = start_node(fol, NODES[PORTS.index(fol)],
+                                f"HA 节点 {PORTS.index(fol)+1}")
+        assert wait_for(lambda: probe(fol), 25), "A9 恢复的 follower 未起来"
+        # ⑤ 失去多数派：强一致读必须 503（宁可失败也不返回可能过期的值）
+        for p in [x for x in PORTS if x != cur]:
+            procs[p].terminate()
+            try:
+                procs[p].wait(timeout=5)
+            except Exception:
+                procs[p].kill()
+        time.sleep(0.4)
+        st_r5, b_r5 = api(cur, "/v1/ha/get",
+                          {"ns": "kv", "key": "s1099", "strong": True}, timeout=10)
+        for p in [x for x in PORTS if x != cur]:
+            procs[p] = start_node(p, NODES[PORTS.index(p)],
+                                  f"HA 节点 {PORTS.index(p)+1}")
+        assert wait_for(lambda: all(probe(p) for p in PORTS), 30), \
+            "A9 恢复的 follower 未全部起来"
+        record("A9 ReadIndex 强一致读（leader 可读 / follower 409 / 无 quorum 503）",
+               st_r1 == 200 and b_r1.get("value") == "1099"
+               and b_r1.get("read_index", 0) > 0
+               and st_r2 == 409
+               and st_w9 == 200 and bool(committed9)
+               and st_r3 == 200 and b_r3.get("value") == "v9"
+               and b_r3.get("read_index", 0) >= idx9
+               and st_r4 == 200 and b_r4.get("value") == "1099"
+               and st_r5 == 503,
+               {"leader_strong": {"status": st_r1,
+                                  "value": b_r1.get("value"),
+                                  "read_index": b_r1.get("read_index")},
+                "follower_strong": {"status": st_r2, "body": b_r2},
+                "write": {"index": idx9, "committed": bool(committed9)},
+                "read_after_write": {"status": st_r3,
+                                     "value": b_r3.get("value"),
+                                     "read_index": b_r3.get("read_index")},
+                "one_follower_down": {"status": st_r4, "value": b_r4.get("value")},
+                "no_quorum": {"status": st_r5, "body": b_r5}})
 
         # A6 进程存活、无 panic -------------------------------------------------
         alive = [p for p in PORTS if probe(p)]
