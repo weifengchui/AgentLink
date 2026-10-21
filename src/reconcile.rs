@@ -1328,6 +1328,7 @@ mod tests {
     /// 建立一个最小的 AppState+MeshRuntime+Engine（内存 table，不落盘），供单测用。
     fn test_mesh() -> (Arc<AppState>, Arc<MeshRuntime>, Engine) {
         let cfg = Config {
+            ha: crate::config::HaConfig::default(),
             v: 1,
             node_id: "n1".into(),
             name: "test".into(),

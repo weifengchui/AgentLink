@@ -119,6 +119,78 @@ pub struct Config {
     /// 中继拓扑（v0.7 spine/relay）。缺省关闭 = 全网格原行为。
     #[serde(default)]
     pub relay: RelayConfig,
+    /// v0.8 高可用（内嵌 Raft）。缺省 `enabled=false` = 行为与 v0.7 逐字相同。
+    /// 设计见 `docs/v0.8-HA-Raft设计-2026-10-21.md`。
+    #[serde(default)]
+    pub ha: HaConfig,
+}
+
+/// v0.8 HA（内嵌 Raft）配置。缺省整段不存在 = 全默认 + `enabled=false`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HaConfig {
+    /// 开启 HA。缺省 false：完全走 v0.7 单机路径，零行为变化。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 初始成员列表，形如 `node_id@host:port`（首次引导用；之后以状态机为准）。
+    #[serde(default)]
+    pub cluster: Vec<String>,
+    /// 参与投票的成员（奇数，≤9）。缺省 = `cluster` 全部。
+    #[serde(default)]
+    pub voting_members: Vec<String>,
+    /// 只复制不投票的成员（learners）。
+    #[serde(default)]
+    pub learners: Vec<String>,
+    /// 选举超时基准（毫秒，300-5000）；实际超时在其 1.0~1.5 倍间随机。
+    #[serde(default = "default_ha_election_timeout_ms")]
+    pub election_timeout_ms: u64,
+    /// 心跳间隔（毫秒，50-1000）。
+    #[serde(default = "default_ha_heartbeat_interval_ms")]
+    pub heartbeat_interval_ms: u64,
+    /// 未复制条目数超过该值时改发快照（1000-10000000）。
+    #[serde(default = "default_ha_snapshot_threshold")]
+    pub snapshot_threshold_entries: u64,
+    /// 读一致性：`leader`（强一致）/ `local`（最终一致，UI 概览用）。
+    #[serde(default = "default_ha_read_consistency")]
+    pub read_consistency: String,
+    /// fsync 策略：`batch`（批量）/ `always`（每条）。
+    #[serde(default = "default_ha_fsync")]
+    pub fsync: String,
+}
+
+fn default_ha_election_timeout_ms() -> u64 {
+    1000
+}
+
+fn default_ha_heartbeat_interval_ms() -> u64 {
+    200
+}
+
+fn default_ha_snapshot_threshold() -> u64 {
+    10_000
+}
+
+fn default_ha_read_consistency() -> String {
+    "leader".to_string()
+}
+
+fn default_ha_fsync() -> String {
+    "batch".to_string()
+}
+
+impl Default for HaConfig {
+    fn default() -> Self {
+        HaConfig {
+            enabled: false,
+            cluster: Vec::new(),
+            voting_members: Vec::new(),
+            learners: Vec::new(),
+            election_timeout_ms: default_ha_election_timeout_ms(),
+            heartbeat_interval_ms: default_ha_heartbeat_interval_ms(),
+            snapshot_threshold_entries: default_ha_snapshot_threshold(),
+            read_consistency: default_ha_read_consistency(),
+            fsync: default_ha_fsync(),
+        }
+    }
 }
 
 /// GitOps 目录驱动参数（v0.6 P1）。缺省 `enabled=false`——完全惰性。
@@ -1122,6 +1194,7 @@ impl Config {
             lease: LeaseConfig::default(),
             gitops: GitopsConfig::default(),
             relay: RelayConfig::default(),
+            ha: HaConfig::default(),
             discovery: DiscoveryConfig {
                 enabled: true,
                 methods: default_discovery_methods(),
@@ -1297,6 +1370,14 @@ impl Config {
         crate::quota::validate(&self.mesh.quota)?;
         crate::oidc::validate(&self.auth.oidc)?;
         crate::chaos::validate(&self.mesh.chaos)?;
+        crate::ha::validate(&self.ha, &self.node_id)?;
+        // v0.8 M1：HA 内核已实现但尚未接入运行时（M2 才接线 peer 传输）。
+        // 这里直接拒绝启用，避免现场误以为已经具备 HA 保护。
+        if self.ha.enabled {
+            anyhow::bail!(
+                "ha.enabled=true is not implemented yet (v0.8 M2 pending); keep ha.enabled=false"
+            );
+        }
         // v0.7 §4.2 多租户：绑定 token 不能是 Admin（Admin 是集群级角色），
         // 也不能是 local_api.token（WS/全局管理入口必须保持全局）。
         for (token, ns) in &self.auth.token_namespaces {
