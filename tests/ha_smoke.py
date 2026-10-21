@@ -11,6 +11,7 @@
   A3 杀掉 leader -> 重新选主；已提交数据仍在；旧 leader 回归后追平
   A4 重启节点 -> 从磁盘恢复（term/日志），仍能继续复制
   A5 /v1/ha/status 暴露角色/term/commit 位点；未启用 HA 的节点行为不变
+  A7 leader 压缩日志前缀后，长期离线节点通过 InstallSnapshot 追平
   A6 进程存活、日志无 panic
 """
 import json
@@ -243,6 +244,45 @@ def main():
                st_s == 200 and s_s.get("role") in ("leader", "follower")
                and s_s.get("term", 0) >= 1,
                {"status": s_s})
+
+        # A7 leader 快照压缩 + 落后节点快照拉齐 --------------------------------
+        cur = wait_for(lambda: leaders()[0] if len(leaders()) == 1 else None, 20)
+        assert cur, "A7 前应存在唯一 leader"
+        lag = [p for p in PORTS if p != cur][0]
+        procs[lag].terminate()
+        try:
+            procs[lag].wait(timeout=5)
+        except Exception:
+            procs[lag].kill()
+        time.sleep(0.4)
+        wrote = 0
+        last_st = 0
+        for i in range(1100):
+            st, _b = api(cur, "/v1/ha/propose",
+                         {"ns": "kv", "key": f"s{i}", "value": str(i)}, timeout=10)
+            last_st = st
+            if st != 200:
+                break
+            wrote += 1
+        snap = wait_for(lambda: (ha_status(cur) if
+                                 ha_status(cur).get("snapshot_index", 0) > 0 else None), 60)
+        procs[lag] = start_node(lag, NODES[PORTS.index(lag)],
+                                f"HA 节点 {PORTS.index(lag)+1}")
+        assert wait_for(lambda: probe(lag), 25), "A7 落后节点未重启"
+        caught = wait_for(lambda: api(lag, "/v1/ha/get",
+                                      {"ns": "kv", "key": "s1099"})[1].get("value")
+                          == "1099", 60)
+        st_lag = ha_status(lag)
+        record("A7 leader 压缩日志后，落后节点通过快照追平",
+               last_st == 200 and wrote == 1100 and bool(snap) and bool(caught)
+               and st_lag.get("snapshot_index", 0) >= (snap or {}).get("snapshot_index", 1)
+               and st_lag.get("log_len", 9999) < 120
+               and st_lag.get("applied_index", 0) >= 1100,
+               {"wrote": wrote, "propose": last_st,
+                "leader": {k: (snap or {}).get(k) for k in
+                           ("snapshot_index", "log_len", "applied_index")},
+                "follower": {k: st_lag.get(k) for k in
+                             ("snapshot_index", "log_len", "applied_index")}})
 
         # A6 进程存活、无 panic -------------------------------------------------
         alive = [p for p in PORTS if probe(p)]

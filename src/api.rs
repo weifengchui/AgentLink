@@ -4804,6 +4804,7 @@ async fn ha_status(State(state): State<SharedState>, headers: HeaderMap) -> Resp
             "has_quorum": false,
             "log_len": 0,
             "state_keys": 0,
+            "snapshot_index": 0,
         }))
         .into_response();
     };

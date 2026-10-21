@@ -69,6 +69,18 @@ impl Role {
 /// 快照载荷：全量 KV（`键` -> `值`）。
 pub type SnapshotData = Vec<(String, Vec<u8>)>;
 
+/// 压缩基点的占位日志条目（永不 apply，只承载 `index/term`）。
+fn sentinel(index: u64, term: u64) -> LogEntry {
+    LogEntry {
+        index,
+        term,
+        command: Command::Delete {
+            ns: String::new(),
+            key: String::new(),
+        },
+    }
+}
+
 /// 拉票请求参数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoteRequest {
@@ -137,6 +149,9 @@ pub enum RaftMessage {
         term: u64,
         from_id: String,
         success: bool,
+        /// 快照点（成功时 leader 据此推进 `match/next_index`）。
+        #[serde(default)]
+        last_included_index: u64,
     },
 }
 
@@ -207,8 +222,12 @@ impl KvState {
 pub struct PersistentState {
     pub current_term: u64,
     pub voted_for: Option<String>,
-    /// 日志（index=1 起；index 0 为占位哨兵）。
+    /// 日志（只含真实条目，不含压缩基点哨兵；`base` 记录基点）。
     pub log: Vec<LogEntry>,
+    /// 已压缩到的基点 `(index, term)`；`(0, 0)` 表示未压缩。
+    pub base: (u64, u64),
+    /// 已应用位点：重启后据此把日志重放进状态机（0 = 从头重放）。
+    pub applied_index: u64,
 }
 
 /// 一个 Raft 节点（内核）。
@@ -220,7 +239,8 @@ pub struct RaftNode {
     role: Role,
     current_term: u64,
     voted_for: Option<String>,
-    /// `log[0]` 是 index=0/term=0 的哨兵；`log[i]` 对应 index=i。
+    /// `log[0]` 是压缩基点哨兵（`index=base/term=base_term`，初始 `0/0`）；
+    /// `log[i]` 对应 `index = log[0].index + i`。压缩只丢弃前缀，不改后缀索引。
     log: Vec<LogEntry>,
     commit_index: u64,
     last_applied: u64,
@@ -241,6 +261,8 @@ pub struct RaftNode {
     pre_vote: bool,
     /// 确定性伪随机（选举超时抖动）。
     rng: u64,
+    /// 日志是否需要整文件重写（压缩 / 冲突截断后为真）。
+    log_rewrite: bool,
 }
 
 impl RaftNode {
@@ -258,14 +280,7 @@ impl RaftNode {
             role: Role::Follower,
             current_term: 0,
             voted_for: None,
-            log: vec![LogEntry {
-                index: 0,
-                term: 0,
-                command: Command::Delete {
-                    ns: String::new(),
-                    key: String::new(),
-                },
-            }],
+            log: vec![sentinel(0, 0)],
             commit_index: 0,
             last_applied: 0,
             state: KvState::default(),
@@ -279,6 +294,7 @@ impl RaftNode {
             heartbeat_at: 0,
             pre_vote: false,
             rng,
+            log_rewrite: false,
         }
     }
 
@@ -321,10 +337,21 @@ impl RaftNode {
         self.voted_for.as_deref()
     }
 
-    /// 取 `index >= from` 的日志条目（持久化增量用）。
+    /// 取 `index >= from` 的日志条目（持久化增量用；不含哨兵之外的过滤）。
     pub fn log_entries_from(&self, from: u64) -> &[LogEntry] {
-        let start = (from.max(1) as usize).min(self.log.len());
+        let start = self.offset(from).unwrap_or(0).min(self.log.len());
         &self.log[start..]
+    }
+
+    /// 取 `index > after` 的真实日志条目（不含哨兵）。
+    pub fn log_entries_after(&self, after: u64) -> Vec<LogEntry> {
+        let from = after.max(self.base_index()) + 1;
+        self.log_entries_from(from).to_vec()
+    }
+
+    /// 日志已压缩到的位点（= 快照点）；0 表示未压缩。
+    pub fn snapshot_index(&self) -> u64 {
+        self.base_index()
     }
 
     /// 集群规模（含自己）。
@@ -347,7 +374,9 @@ impl RaftNode {
         PersistentState {
             current_term: self.current_term,
             voted_for: self.voted_for.clone(),
-            log: self.log.clone(),
+            log: self.log_entries_after(self.base_index()),
+            base: (self.base_index(), self.base_term()),
+            applied_index: self.last_applied,
         }
     }
 
@@ -355,28 +384,27 @@ impl RaftNode {
     pub fn restore(&mut self, p: PersistentState) {
         self.current_term = p.current_term;
         self.voted_for = p.voted_for;
-        if !p.log.is_empty() {
-            let mut log = p.log;
-            if log[0].index != 0 {
-                log.insert(
-                    0,
-                    LogEntry {
-                        index: 0,
-                        term: 0,
-                        command: Command::Delete {
-                            ns: String::new(),
-                            key: String::new(),
-                        },
-                    },
-                );
-            }
-            self.log = log;
-        }
+        let (base_index, base_term) = p.base;
+        self.log = Vec::with_capacity(p.log.len() + 1);
+        self.log.push(sentinel(base_index, base_term));
+        self.log
+            .extend(p.log.into_iter().filter(|e| e.index > base_index));
+        // 已应用位点必为已提交：重启后据此重放，避免「全员重启后状态机为空」。
+        let base = self.base_index();
+        let applied = p.applied_index.max(base).min(self.last_log_index());
+        self.commit_index = applied;
+        self.last_applied = base;
+        self.apply_committed();
     }
 
-    /// 状态机快照内容（`None` 表示还没到阈值）。
-    pub fn snapshot(&self) -> Option<(u64, u64, SnapshotData)> {
-        if self.last_applied == 0 || self.last_applied < self.cfg.snapshot_threshold_entries {
+    /// 直接把快照内容灌入状态机（启动恢复用；restore 负责位点与日志）。
+    pub fn load_snapshot_state(&mut self, data: SnapshotData) {
+        self.state.load(data);
+    }
+
+    /// 状态机快照内容（`None` 表示还没到压缩阈值）。**不压缩**，便于先落盘再压缩。
+    pub fn pending_snapshot(&self) -> Option<(u64, u64, SnapshotData)> {
+        if !self.should_compact() {
             return None;
         }
         Some((
@@ -384,6 +412,49 @@ impl RaftNode {
             self.log_term_at(self.last_applied),
             self.state.dump(),
         ))
+    }
+
+    /// 累计已应用但未压缩的条目是否达到阈值。
+    pub fn should_compact(&self) -> bool {
+        self.last_applied > 0
+            && self.last_applied.saturating_sub(self.base_index())
+                >= self.cfg.snapshot_threshold_entries
+    }
+
+    /// 在 `last_applied` 处压缩日志前缀（调用方负责先把快照落盘）。
+    pub fn compact_now(&mut self) -> Option<(u64, u64)> {
+        if !self.should_compact() {
+            return None;
+        }
+        let idx = self.last_applied;
+        let term = self.log_term_at(idx);
+        self.compact_to(idx, term);
+        self.log_rewrite = true;
+        Some((idx, term))
+    }
+
+    /// 导出快照并立即压缩（内存网络 / 单测用）。
+    pub fn maybe_compact(&mut self) -> Option<(u64, u64, SnapshotData)> {
+        let snap = self.pending_snapshot()?;
+        self.compact_to(snap.0, snap.1);
+        self.log_rewrite = true;
+        Some(snap)
+    }
+
+    /// 状态机快照内容（旧接口保留：等价于 `pending_snapshot`）。
+    pub fn snapshot(&self) -> Option<(u64, u64, SnapshotData)> {
+        self.pending_snapshot()
+    }
+
+    /// 压缩到 `(idx, term)`：只保留 `index > idx` 的条目，`log[0]` 换成新哨兵。
+    fn compact_to(&mut self, idx: u64, term: u64) {
+        if idx <= self.base_index() {
+            return;
+        }
+        let keep: Vec<LogEntry> = self.log.iter().filter(|e| e.index > idx).cloned().collect();
+        self.log = Vec::with_capacity(keep.len() + 1);
+        self.log.push(sentinel(idx, term));
+        self.log.extend(keep);
     }
 
     // ---- 内部小工具 -------------------------------------------------------
@@ -406,15 +477,41 @@ impl RaftNode {
         self.log.last().map(|e| e.term).unwrap_or(0)
     }
 
+    /// 压缩基点（= 快照点）。
+    fn base_index(&self) -> u64 {
+        self.log.first().map(|e| e.index).unwrap_or(0)
+    }
+
+    fn base_term(&self) -> u64 {
+        self.log.first().map(|e| e.term).unwrap_or(0)
+    }
+
+    /// index → log 下标（低于基点 = 已被压缩，返回 None）。
+    fn offset(&self, index: u64) -> Option<usize> {
+        let base = self.base_index();
+        if index < base {
+            None
+        } else {
+            Some((index - base) as usize)
+        }
+    }
+
     fn log_term_at(&self, index: u64) -> u64 {
-        self.log.get(index as usize).map(|e| e.term).unwrap_or(0)
+        self.entry_at(index).map(|e| e.term).unwrap_or(0)
     }
 
     fn entry_at(&self, index: u64) -> Option<&LogEntry> {
-        if index == 0 {
-            return self.log.first();
-        }
-        self.log.get(index as usize)
+        let o = self.offset(index)?;
+        self.log.get(o)
+    }
+
+    /// 日志是否需要整文件重写（压缩/截断后）。
+    pub fn log_rewrite_needed(&self) -> bool {
+        self.log_rewrite
+    }
+
+    pub fn clear_log_rewrite(&mut self) {
+        self.log_rewrite = false;
     }
 
     /// 选举超时抖动（1.0~1.5 倍基准）。
@@ -547,15 +644,23 @@ impl RaftNode {
                 term,
                 from_id,
                 success,
+                last_included_index,
             } => {
                 if term > self.current_term {
                     self.become_follower(term);
                 }
                 if self.role == Role::Leader && success {
-                    self.match_index
-                        .insert(from_id.clone(), self.last_log_index());
-                    self.next_index
-                        .insert(from_id.clone(), self.last_log_index() + 1);
+                    let m = last_included_index
+                        .min(self.last_log_index())
+                        .max(self.match_index.get(&from_id).copied().unwrap_or(0));
+                    self.match_index.insert(from_id.clone(), m);
+                    self.next_index.insert(from_id.clone(), m + 1);
+                    // 快照点已提交；若后端还有条目，继续流水线补发。
+                    if self.next_index.get(&from_id).copied().unwrap_or(1) <= self.last_log_index()
+                    {
+                        let msg = self.append_msg_for(&from_id);
+                        out.push((from_id.clone(), msg));
+                    }
                 }
             }
         }
@@ -752,13 +857,30 @@ impl RaftNode {
     }
 
     fn append_msg_for(&self, peer: &str) -> RaftMessage {
-        let next = self.next_index.get(peer).copied().unwrap_or(1).max(1);
+        let next = self
+            .next_index
+            .get(peer)
+            .copied()
+            .unwrap_or(1)
+            .max(1)
+            .min(self.last_log_index() + 1);
+        // 对端需要的条目已被压缩：改发快照（以 leader 当前已应用点为准）。
+        if next <= self.base_index() {
+            let idx = self.last_applied.max(self.base_index());
+            return RaftMessage::InstallSnapshot {
+                term: self.current_term,
+                leader_id: self.id.clone(),
+                last_included_index: idx,
+                last_included_term: self.log_term_at(idx),
+                data: self.state.dump(),
+            };
+        }
         let prev_index = next - 1;
         let prev_term = self.log_term_at(prev_index);
         let entries: Vec<LogEntry> = self
             .log
             .iter()
-            .skip(next as usize)
+            .skip((next - self.base_index()) as usize)
             .take(64)
             .cloned()
             .collect();
@@ -806,14 +928,18 @@ impl RaftNode {
         self.reset_election_timer(now);
         self.leader_lease_until = now + self.cfg.election_timeout_ms;
 
-        // prev 日志校验
-        if prev_log_index > 0 {
+        // prev 日志校验（prev 已落在本节点压缩基之内时跳过：基点以内必为已提交）。
+        let base = self.base_index();
+        let mut entries = entries;
+        if prev_log_index > 0 && prev_log_index < base {
+            entries.retain(|e| e.index > base);
+        } else if prev_log_index > 0 {
             match self.entry_at(prev_log_index) {
                 Some(e) if e.term == prev_log_term => {}
                 Some(e) => {
                     // 冲突：回退到该 term 的第一个 index
                     let mut idx = prev_log_index;
-                    while idx > 1 && self.log_term_at(idx - 1) == e.term {
+                    while idx > base + 1 && self.log_term_at(idx - 1) == e.term {
                         idx -= 1;
                     }
                     out.push((
@@ -852,8 +978,11 @@ impl RaftNode {
                 if existing == entry.term {
                     continue; // 已有相同条目
                 }
-                // 冲突 → 截断后重写
-                self.log.truncate(entry.index as usize);
+                // 冲突 → 截断后重写（落盘需要整文件重写）
+                if let Some(o) = self.offset(entry.index) {
+                    self.log.truncate(o);
+                    self.log_rewrite = true;
+                }
             }
             self.log.push(entry);
         }
@@ -868,7 +997,8 @@ impl RaftNode {
                 term: self.current_term,
                 from_id: self.id.clone(),
                 success: true,
-                match_index: prev_log_index + entries_len,
+                // prev 落在压缩基以内时按基点确认（基点以内必为已提交）。
+                match_index: (prev_log_index + entries_len).max(base),
                 conflict_index: 0,
             },
         ));
@@ -980,6 +1110,7 @@ impl RaftNode {
                     term: self.current_term,
                     from_id: self.id.clone(),
                     success: false,
+                    last_included_index,
                 },
             ));
             return out;
@@ -993,30 +1124,41 @@ impl RaftNode {
         self.reset_election_timer(now);
         self.leader_lease_until = now + self.cfg.election_timeout_ms;
 
-        // 丢弃已包含在快照里的日志前缀
-        if last_included_index as usize <= self.log.len() {
-            let keep_from = last_included_index as usize + 1;
-            let suffix: Vec<LogEntry> = self.log[keep_from.min(self.log.len())..].to_vec();
-            self.log = vec![LogEntry {
-                index: 0,
-                term: 0,
-                command: Command::Delete {
-                    ns: String::new(),
-                    key: String::new(),
-                },
-            }];
+        // 本节点已有更新的压缩基点：忽略旧快照，直接确认。
+        if last_included_index > self.base_index() {
+            // 快照点必为已提交：状态机整体覆盖，位点前移。
+            self.state.load(data);
+            // 日志：仅当本节点在快照点上的 term 一致才保留后缀，否则整段丢弃。
+            let keep_suffix = self.log_term_at(last_included_index) == last_included_term;
+            let suffix: Vec<LogEntry> = if keep_suffix {
+                self.log
+                    .iter()
+                    .filter(|e| e.index > last_included_index)
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            self.log = Vec::with_capacity(suffix.len() + 1);
+            self.log
+                .push(sentinel(last_included_index, last_included_term));
             self.log.extend(suffix);
+            self.log_rewrite = true;
+            self.commit_index = self
+                .commit_index
+                .max(last_included_index)
+                .min(self.last_log_index());
+            self.last_applied = last_included_index;
+            // 快照已含前缀，后缀若还有已提交条目则补 apply。
+            self.apply_committed();
         }
-        let _ = last_included_term;
-        self.state.load(data);
-        self.commit_index = self.commit_index.max(last_included_index);
-        self.last_applied = self.last_applied.max(last_included_index);
         out.push((
             leader_id.clone(),
             RaftMessage::InstallSnapshotResp {
                 term: self.current_term,
                 from_id: self.id.clone(),
                 success: true,
+                last_included_index,
             },
         ));
         out
@@ -1108,6 +1250,9 @@ struct StateFile {
     current_term: u64,
     #[serde(default)]
     voted_for: Option<String>,
+    /// 已应用位点（重启后据此重放日志，避免全员重启后状态机为空）。
+    #[serde(default)]
+    applied_index: u64,
 }
 
 /// 落盘的快照文件。
@@ -1124,6 +1269,8 @@ struct SnapshotFile {
 pub struct HaPersisted {
     pub current_term: u64,
     pub voted_for: Option<String>,
+    /// 已应用位点（重启后重放用）。
+    pub applied_index: u64,
     pub log: Vec<LogEntry>,
     pub snapshot: Option<(u64, u64, SnapshotData)>,
 }
@@ -1161,6 +1308,7 @@ impl HaStore {
             if let Ok(sf) = serde_json::from_str::<StateFile>(&text) {
                 out.current_term = sf.current_term;
                 out.voted_for = sf.voted_for;
+                out.applied_index = sf.applied_index;
             }
         }
         if let Ok(text) = std::fs::read_to_string(self.log_path()) {
@@ -1184,12 +1332,18 @@ impl HaStore {
         out
     }
 
-    /// 持久化 term / 投票（原子写：temp + rename）。
-    pub fn save_state(&self, current_term: u64, voted_for: Option<&str>) -> std::io::Result<()> {
+    /// 持久化 term / 投票 / 已应用位点（原子写：temp + rename）。
+    pub fn save_state(
+        &self,
+        current_term: u64,
+        voted_for: Option<&str>,
+        applied_index: u64,
+    ) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let sf = StateFile {
             current_term,
             voted_for: voted_for.map(str::to_string),
+            applied_index,
         };
         let text = serde_json::to_string(&sf).map_err(std::io::Error::other)?;
         let tmp = self.state_path().with_extension("json.tmp");
@@ -1200,6 +1354,25 @@ impl HaStore {
             }
         }
         std::fs::rename(&tmp, self.state_path())
+    }
+
+    /// 整文件重写日志（压缩 / 冲突截断后）。原子写，避免半份日志。
+    pub fn rewrite_log(&self, entries: &[LogEntry]) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let mut buf = String::new();
+        for e in entries {
+            let line = serde_json::to_string(e).map_err(std::io::Error::other)?;
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        let tmp = self.log_path().with_extension("jsonl.tmp");
+        std::fs::write(&tmp, buf.as_bytes())?;
+        if self.fsync {
+            if let Ok(f) = std::fs::File::open(&tmp) {
+                let _ = f.sync_all();
+            }
+        }
+        std::fs::rename(&tmp, self.log_path())
     }
 
     /// 追加日志条目（一行一条 JSON）。
@@ -1264,6 +1437,8 @@ pub struct HaStatus {
     pub has_quorum: bool,
     pub log_len: usize,
     pub state_keys: usize,
+    /// 日志已压缩到的位点（= 快照点）。
+    pub snapshot_index: u64,
 }
 
 /// HA 运行时：内核 + 落盘。
@@ -1271,7 +1446,11 @@ pub struct HaRuntime {
     node: RaftNode,
     store: HaStore,
     persisted_term: u64,
-    persisted_log_len: usize,
+    persisted_applied: u64,
+    /// 已落盘的最后一条日志索引（压缩后重写并前移）。
+    persisted_last_index: u64,
+    /// 最近一次落盘的快照位点。
+    persisted_snapshot: u64,
 }
 
 impl HaRuntime {
@@ -1290,50 +1469,97 @@ impl HaRuntime {
         let mut node = RaftNode::new(node_id.to_string(), peers, raft_cfg);
         let store = HaStore::new(dir, cfg.fsync == "always");
         let persisted = store.load();
+        let (base, snap_applied) = match &persisted.snapshot {
+            Some((i, t, data)) => {
+                node.load_snapshot_state(data.clone());
+                ((*i, *t), *i)
+            }
+            None => ((0, 0), 0),
+        };
         node.restore(PersistentState {
             current_term: persisted.current_term,
             voted_for: persisted.voted_for.clone(),
             log: persisted.log.clone(),
+            base,
+            applied_index: persisted.applied_index.max(snap_applied),
         });
-        let persisted_log_len = persisted.log.len();
-        let persisted_term = persisted.current_term;
+        let persisted_log_len = node.last_log_index();
+        let persisted_term = node.term();
+        let persisted_applied = node.last_applied();
         Ok(HaRuntime {
             node,
             store,
             persisted_term,
-            persisted_log_len,
+            persisted_applied,
+            persisted_last_index: persisted_log_len,
+            persisted_snapshot: base.0,
         })
     }
 
-    /// 把未落盘的状态补齐（term 变化 / 新增日志条目）。
+    /// 把未落盘的状态补齐（term / 投票 / 已应用位点 / 新增日志条目）。
     fn persist(&mut self) {
         let term = self.node.term();
-        if term != self.persisted_term {
-            if let Err(e) = self.store.save_state(term, self.node.voted_for()) {
-                tracing::warn!(error = %e, "ha: failed to persist term/vote");
+        let applied = self.node.last_applied();
+        if term != self.persisted_term || applied != self.persisted_applied {
+            if let Err(e) = self.store.save_state(term, self.node.voted_for(), applied) {
+                tracing::warn!(error = %e, "ha: failed to persist term/vote/applied");
+            } else {
+                self.persisted_term = term;
+                self.persisted_applied = applied;
             }
-            self.persisted_term = term;
         }
-        let log_len = self.node.log_len();
-        if log_len > self.persisted_log_len {
-            let new_entries: Vec<LogEntry> = self
-                .node
-                .log_entries_from(self.persisted_log_len as u64 + 1)
-                .to_vec();
+        let last = self.node.last_log_index();
+        if self.node.log_rewrite_needed() {
+            // 压缩 / 冲突截断：整文件重写（前缀已压缩掉，不能靠增量 append）。
+            let entries = self.node.log_entries_after(self.node.snapshot_index());
+            match self.store.rewrite_log(&entries) {
+                Ok(()) => {
+                    self.node.clear_log_rewrite();
+                    self.persisted_last_index = last;
+                }
+                Err(e) => tracing::warn!(error = %e, "ha: failed to rewrite log"),
+            }
+        } else if last > self.persisted_last_index {
+            let new_entries = self.node.log_entries_after(self.persisted_last_index);
             if let Err(e) = self.store.append_log(&new_entries) {
                 tracing::warn!(error = %e, "ha: failed to persist log entries");
             } else {
-                self.persisted_log_len = log_len;
+                self.persisted_last_index = last;
             }
         }
     }
 
-    /// 达到阈值时导出快照（调用方负责发送）。
+    /// 每次推进后调用：先落盘快照，再压缩日志，最后补持久化。
+    fn maintain(&mut self) {
+        if let Some((idx, term, data)) = self.node.pending_snapshot() {
+            match self.store.save_snapshot(idx, term, &data) {
+                Ok(()) => {
+                    self.persisted_snapshot = idx;
+                    self.node.compact_now();
+                    tracing::info!(
+                        index = idx,
+                        term,
+                        retain = self.node.log_len(),
+                        "ha: snapshot saved, log prefix compacted"
+                    );
+                }
+                // 落盘失败：先不压缩（下个 tick 重试），避免快照与日志不一致。
+                Err(e) => tracing::warn!(error = %e, "ha: failed to persist snapshot"),
+            }
+        }
+        self.persist();
+    }
+
+    /// 达到阈值时导出快照并压缩日志（调用方无需再做别的）。
     pub fn maybe_snapshot(&mut self) -> Option<(u64, u64, SnapshotData)> {
-        let snap = self.node.snapshot()?;
+        let snap = self.node.pending_snapshot()?;
         if let Err(e) = self.store.save_snapshot(snap.0, snap.1, &snap.2) {
             tracing::warn!(error = %e, "ha: failed to persist snapshot");
+            return None;
         }
+        self.persisted_snapshot = snap.0;
+        self.node.compact_now();
+        self.persist();
         Some(snap)
     }
 }
@@ -1369,7 +1595,7 @@ impl HaHandle {
     pub fn tick(&self, now_ms: u64) -> Vec<(String, RaftMessage)> {
         let mut g = self.inner.lock().unwrap();
         let out = g.node.tick(now_ms);
-        g.persist();
+        g.maintain();
         out
     }
 
@@ -1382,7 +1608,7 @@ impl HaHandle {
     ) -> Vec<(String, RaftMessage)> {
         let mut g = self.inner.lock().unwrap();
         let out = g.node.handle(from, msg, now_ms);
-        g.persist();
+        g.maintain();
         out
     }
 
@@ -1390,7 +1616,7 @@ impl HaHandle {
     pub fn propose(&self, cmd: Command) -> Option<u64> {
         let mut g = self.inner.lock().unwrap();
         let idx = g.node.propose(cmd);
-        g.persist();
+        g.maintain();
         idx
     }
 
@@ -1415,6 +1641,7 @@ impl HaHandle {
             has_quorum: g.node.has_quorum(),
             log_len: g.node.log_len(),
             state_keys: g.node.state().len(),
+            snapshot_index: g.node.snapshot_index(),
         }
     }
 
@@ -1444,6 +1671,10 @@ mod tests {
 
     impl Net {
         fn new(ids: &[&str]) -> Self {
+            Self::with_cfg(ids, RaftConfig::default())
+        }
+
+        fn with_cfg(ids: &[&str], cfg: RaftConfig) -> Self {
             let mut nodes = HashMap::new();
             for (i, id) in ids.iter().enumerate() {
                 let peers: Vec<String> = ids
@@ -1454,7 +1685,7 @@ mod tests {
                     .collect();
                 nodes.insert(
                     id.to_string(),
-                    RaftNode::new(id.to_string(), peers, RaftConfig::default()),
+                    RaftNode::new(id.to_string(), peers, cfg.clone()),
                 );
             }
             Net {
@@ -1830,6 +2061,142 @@ mod tests {
     }
 
     #[test]
+    fn compaction_trims_prefix_and_lagging_node_gets_snapshot() {
+        let cfg = RaftConfig {
+            snapshot_threshold_entries: 3,
+            ..RaftConfig::default()
+        };
+        let mut net = Net::with_cfg(&["n1", "n2", "n3"], cfg);
+        let leader = elect(&mut net, 200).expect("选主");
+        let lagging = ["n1", "n2", "n3"]
+            .iter()
+            .find(|id| **id != leader)
+            .unwrap()
+            .to_string();
+        net.dropped.insert(lagging.clone());
+
+        for i in 0..10 {
+            let cmd = put("kv", &format!("k{i}"), &format!("v{i}"));
+            net.nodes.get_mut(&leader).unwrap().propose(cmd);
+        }
+        // 两节点仍有多数派：提交并 apply，然后压缩 leader 日志前缀。
+        for _ in 0..12 {
+            net.tick(50);
+        }
+        let (idx, term, _) = net
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .maybe_compact()
+            .expect("达到阈值应触发压缩");
+        assert!(idx > 0 && term > 0);
+        let leader_node = &net.nodes[&leader];
+        assert_eq!(leader_node.snapshot_index(), idx, "压缩基点应前移");
+        assert_eq!(leader_node.log_len(), 0, "全部已应用条目应被压缩");
+
+        // 落后节点恢复：leader 的 next_index 已落在压缩基之前 -> 改发 InstallSnapshot。
+        net.dropped.remove(&lagging);
+        for _ in 0..20 {
+            net.tick(50);
+        }
+        let caught = &net.nodes[&lagging];
+        assert_eq!(
+            caught.state().get("kv", "k9").map(|v| v.as_slice()),
+            Some(b"v9".as_slice()),
+            "落后节点应通过快照追平状态机"
+        );
+        assert!(
+            caught.snapshot_index() >= idx,
+            "落后节点应装上快照（base={}, idx={idx}）",
+            caught.snapshot_index()
+        );
+
+        // 迟到的旧快照不得回退状态机。
+        let stale = RaftMessage::InstallSnapshot {
+            term: net.nodes[&leader].term(),
+            leader_id: leader.clone(),
+            last_included_index: idx / 2,
+            last_included_term: 1,
+            data: vec![("kv/stale".to_string(), b"x".to_vec())],
+        };
+        net.nodes
+            .get_mut(&lagging)
+            .unwrap()
+            .handle(&leader, stale, net.now);
+        assert_eq!(
+            net.nodes[&lagging]
+                .state()
+                .get("kv", "k9")
+                .map(|v| v.as_slice()),
+            Some(b"v9".as_slice()),
+            "旧快照不应覆盖更新的状态机"
+        );
+    }
+
+    #[test]
+    fn restart_from_snapshot_restores_state_and_continues_log() {
+        let cfg = RaftConfig {
+            snapshot_threshold_entries: 2,
+            ..RaftConfig::default()
+        };
+        let mut net = Net::with_cfg(&["n1", "n2", "n3"], cfg.clone());
+        let leader = elect(&mut net, 200).expect("选主");
+        for i in 0..5 {
+            let cmd = put("kv", &format!("r{i}"), &format!("w{i}"));
+            net.nodes.get_mut(&leader).unwrap().propose(cmd);
+        }
+        for _ in 0..10 {
+            net.tick(50);
+        }
+        let node = net.nodes.get_mut(&leader).unwrap();
+        let (idx, _term, data) = node.maybe_compact().expect("压缩");
+        // 压缩后再写几条：重启时需要「快照 + 后缀日志重放」两者都用。
+        for i in 5..8 {
+            let cmd = put("kv", &format!("r{i}"), &format!("w{i}"));
+            net.nodes.get_mut(&leader).unwrap().propose(cmd);
+        }
+        for _ in 0..8 {
+            net.tick(50);
+        }
+        let node = net.nodes.get_mut(&leader).unwrap();
+        let saved = node.persistent();
+        let applied_before = saved.applied_index;
+        assert_eq!(saved.base.0, idx);
+        assert!(saved.base.1 > 0, "压缩基点应带 term");
+        assert_eq!(saved.applied_index, node.last_applied());
+        assert!(saved.applied_index > idx, "后缀日志应多于压缩基点");
+
+        let peers: Vec<String> = ["n1", "n2", "n3"]
+            .iter()
+            .filter(|id| **id != leader)
+            .map(|id| id.to_string())
+            .collect();
+        let mut restarted = RaftNode::new(leader.clone(), peers, cfg);
+        restarted.load_snapshot_state(data);
+        restarted.restore(saved);
+        assert_eq!(restarted.last_applied(), applied_before);
+        assert_eq!(restarted.commit_index(), applied_before);
+        assert_eq!(restarted.snapshot_index(), idx);
+        assert_eq!(
+            restarted.state().get("kv", "r4").map(|v| v.as_slice()),
+            Some(b"w4".as_slice()),
+            "重启后状态机应从快照恢复"
+        );
+        assert_eq!(
+            restarted.state().get("kv", "r7").map(|v| v.as_slice()),
+            Some(b"w7".as_slice()),
+            "快照之后的后缀日志应被重放"
+        );
+        // 新条目追加后仍保持偏移式索引不变式。
+        assert_eq!(restarted.last_log_index(), applied_before);
+        assert_eq!(
+            restarted.log_len(),
+            (applied_before - idx) as usize,
+            "后缀条目数 = applied - base"
+        );
+    }
+
+    #[test]
     fn persistent_state_survives_restart() {
         let mut net = Net::new(&["n1", "n2", "n3"]);
         let leader = elect(&mut net, 200).expect("选主");
@@ -1849,6 +2216,13 @@ mod tests {
         restarted.restore(saved);
         assert_eq!(restarted.term(), net.nodes[&leader].term());
         assert_eq!(restarted.log_len(), net.nodes[&leader].log_len());
+        // 重启后必须从日志重放状态机（否则「全员重启 = 数据清空」）。
+        assert_eq!(
+            restarted.state().get("task", "t").map(|v| v.as_slice()),
+            Some(b"v".as_slice()),
+            "重启后应从日志重放出已应用状态"
+        );
+        assert_eq!(restarted.last_applied(), restarted.commit_index());
     }
 
     #[test]
