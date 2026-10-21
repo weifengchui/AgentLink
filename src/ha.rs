@@ -37,6 +37,44 @@ pub enum Command {
     },
     /// 删一个键。
     Delete { ns: String, key: String },
+    /// 成员变更（joint consensus）：提交后 `voters` 成为生效配置。
+    SetMembership {
+        voters: Vec<String>,
+        #[serde(default)]
+        learners: Vec<String>,
+    },
+}
+
+/// 规范化成员列表（去空白、去重、排序）。
+pub fn normalize_members(list: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut v: Vec<String> = list
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// 校验成员配置（动态变更用；静态配置校验见 [`validate`]）。
+pub fn validate_membership(voters: &[String], learners: &[String]) -> Result<(), String> {
+    if voters.is_empty() {
+        return Err("voters must not be empty".into());
+    }
+    if voters.len() > MAX_VOTING_MEMBERS {
+        return Err(format!("voters must be <= {MAX_VOTING_MEMBERS}"));
+    }
+    if voters.len() != normalize_members(voters.iter().cloned()).len() {
+        return Err("voters must not contain duplicates or blanks".into());
+    }
+    if learners.len() != normalize_members(learners.iter().cloned()).len() {
+        return Err("learners must not contain duplicates or blanks".into());
+    }
+    if let Some(dup) = learners.iter().find(|l| voters.contains(l)) {
+        return Err(format!("{dup:?} cannot be both voter and learner"));
+    }
+    Ok(())
 }
 
 /// 复制日志条目。
@@ -91,6 +129,18 @@ pub struct VoteRequest {
     pub pre_vote: bool,
 }
 
+/// 追加结果参数（内核内部传递，避免参数过多）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendResponse {
+    pub term: u64,
+    pub from_id: String,
+    pub success: bool,
+    pub match_index: u64,
+    pub conflict_index: u64,
+    /// 对端处理完本次追加后的 commit_index。
+    pub commit_index: u64,
+}
+
 /// 追加日志请求参数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendRequest {
@@ -135,6 +185,9 @@ pub enum RaftMessage {
         success: bool,
         match_index: u64,
         conflict_index: u64,
+        /// 对端处理完本次追加后的 commit_index（leader 判断 drain 是否完成）。
+        #[serde(default)]
+        commit_index: u64,
     },
     /// 安装快照（节点落后太多时用）。
     InstallSnapshot {
@@ -228,6 +281,10 @@ pub struct PersistentState {
     pub base: (u64, u64),
     /// 已应用位点：重启后据此把日志重放进状态机（0 = 从头重放）。
     pub applied_index: u64,
+    /// 已提交的投票成员（缺省空 = 由调用方配置决定）。
+    pub voters: Vec<String>,
+    /// 已提交的 learners。
+    pub learners: Vec<String>,
 }
 
 /// 一个 Raft 节点（内核）。
@@ -263,16 +320,47 @@ pub struct RaftNode {
     rng: u64,
     /// 日志是否需要整文件重写（压缩 / 冲突截断后为真）。
     log_rewrite: bool,
+    /// 生效投票成员（joint 阶段 = 目标新配置）。
+    voters: Vec<String>,
+    /// 已提交（已应用）的投票成员：joint 结束后 = `voters`。
+    applied_voters: Vec<String>,
+    /// 生效 learners（只复制、不投票）。
+    learners: Vec<String>,
+    applied_learners: Vec<String>,
+    /// joint 阶段仍需同时满足多数派的旧配置。
+    joint_old: Option<Vec<String>>,
+    /// 已被移出配置、但还没追平日志的节点（leader 继续喂日志，避免其
+    /// 停留在旧配置里反复发起无效选举）。
+    draining: HashSet<String>,
 }
 
 impl RaftNode {
-    /// 新建节点。`peers` 不含自己。
+    /// 新建节点。`peers` 不含自己；投票成员缺省 = `peers + 自己`（与 M1/M2 一致）。
     pub fn new(id: impl Into<String>, peers: Vec<String>, cfg: RaftConfig) -> Self {
+        let id = id.into();
+        let mut voters = peers.clone();
+        voters.push(id.clone());
+        Self::with_membership(id, peers, voters, Vec::new(), cfg)
+    }
+
+    /// 按显式成员配置新建节点（`voters` 必须含自己，否则只能当 learner）。
+    pub fn with_membership(
+        id: impl Into<String>,
+        peers: Vec<String>,
+        voters: Vec<String>,
+        learners: Vec<String>,
+        cfg: RaftConfig,
+    ) -> Self {
         let id = id.into();
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;
         for b in id.as_bytes() {
             rng = rng.rotate_left(5) ^ (*b as u64).wrapping_mul(0x100_0000_01B3);
         }
+        let mut voters = normalize_members(voters);
+        if voters.is_empty() {
+            voters.push(id.clone());
+        }
+        let learners = normalize_members(learners);
         RaftNode {
             id,
             peers,
@@ -295,6 +383,12 @@ impl RaftNode {
             pre_vote: false,
             rng,
             log_rewrite: false,
+            applied_voters: voters.clone(),
+            voters,
+            applied_learners: learners.clone(),
+            learners,
+            joint_old: None,
+            draining: HashSet::new(),
         }
     }
 
@@ -354,12 +448,12 @@ impl RaftNode {
         self.base_index()
     }
 
-    /// 集群规模（含自己）。
+    /// 集群规模（投票成员数）。
     pub fn cluster_size(&self) -> usize {
-        self.peers.len() + 1
+        self.voters.len()
     }
 
-    /// 多数派票数。
+    /// 多数派票数（joint 阶段仍需同时满足旧配置多数派）。
     pub fn quorum(&self) -> usize {
         self.cluster_size() / 2 + 1
     }
@@ -367,6 +461,98 @@ impl RaftNode {
     /// 是否已连上多数派（有 leader 或已提交过日志）。
     pub fn has_quorum(&self) -> bool {
         self.role == Role::Leader || self.commit_index > 0
+    }
+
+    /// 生效投票成员。
+    pub fn voters(&self) -> &[String] {
+        &self.voters
+    }
+
+    /// 只复制不投票的成员。
+    pub fn learners(&self) -> &[String] {
+        &self.learners
+    }
+
+    /// joint 阶段仍在生效的旧配置（`None` = 非 joint）。
+    pub fn joint(&self) -> Option<&[String]> {
+        self.joint_old.as_deref()
+    }
+
+    /// 已提交的投票成员（对外展示「稳定配置」）。
+    pub fn committed_voters(&self) -> &[String] {
+        &self.applied_voters
+    }
+
+    pub fn committed_learners(&self) -> &[String] {
+        &self.applied_learners
+    }
+
+    /// 本节点是否拥有投票权（joint 阶段旧配置成员也算）。
+    fn self_is_voter(&self) -> bool {
+        self.voters.contains(&self.id)
+            || self
+                .joint_old
+                .as_ref()
+                .is_some_and(|old| old.contains(&self.id))
+    }
+
+    /// 某个集合是否达到多数派。
+    fn majority_of(set: &[String], acked: &HashSet<String>) -> bool {
+        if set.is_empty() {
+            return false;
+        }
+        let have = set.iter().filter(|v| acked.contains(*v)).count();
+        have > set.len() / 2
+    }
+
+    /// 是否达到多数派（joint 阶段需新旧双多数派）。
+    fn quorum_reached(&self, acked: &HashSet<String>) -> bool {
+        if !Self::majority_of(&self.voters, acked) {
+            return false;
+        }
+        match &self.joint_old {
+            Some(old) => Self::majority_of(old, acked),
+            None => true,
+        }
+    }
+
+    /// 需要收拉票的对端（投票成员 + joint 旧配置，排除自己）。
+    fn vote_targets(&self) -> Vec<String> {
+        let mut t: Vec<String> = self.voters.clone();
+        if let Some(old) = &self.joint_old {
+            t.extend(old.iter().cloned());
+        }
+        t.sort();
+        t.dedup();
+        t.retain(|id| id != &self.id);
+        t
+    }
+
+    /// 需要复制日志的对端（投票成员 + joint 旧配置 + learners，排除自己）。
+    fn replication_targets(&self) -> Vec<String> {
+        let mut t: Vec<String> = self.voters.clone();
+        if let Some(old) = &self.joint_old {
+            t.extend(old.iter().cloned());
+        }
+        t.extend(self.learners.iter().cloned());
+        t.extend(self.draining.iter().cloned());
+        t.sort();
+        t.dedup();
+        t.retain(|id| id != &self.id);
+        t
+    }
+
+    /// 维护 `next_index/match_index`：补齐新成员、清掉已移出的成员。
+    fn sync_trackers(&mut self) {
+        let targets = self.replication_targets();
+        self.next_index.retain(|k, _| targets.contains(k));
+        self.match_index
+            .retain(|k, _| targets.contains(k) || k == &self.id);
+        let last = self.last_log_index();
+        for t in targets {
+            self.next_index.entry(t.clone()).or_insert(last + 1);
+            self.match_index.entry(t).or_insert(0);
+        }
     }
 
     /// 需要持久化的状态。
@@ -377,6 +563,8 @@ impl RaftNode {
             log: self.log_entries_after(self.base_index()),
             base: (self.base_index(), self.base_term()),
             applied_index: self.last_applied,
+            voters: self.applied_voters.clone(),
+            learners: self.applied_learners.clone(),
         }
     }
 
@@ -384,6 +572,15 @@ impl RaftNode {
     pub fn restore(&mut self, p: PersistentState) {
         self.current_term = p.current_term;
         self.voted_for = p.voted_for;
+        // 成员配置：持久化过（= 状态机里已提交）就以它为准。
+        if !p.voters.is_empty() {
+            self.voters = normalize_members(p.voters.iter().cloned());
+            self.applied_voters = self.voters.clone();
+            self.learners = normalize_members(p.learners.iter().cloned());
+            self.applied_learners = self.learners.clone();
+            self.joint_old = None;
+            self.sync_trackers();
+        }
         let (base_index, base_term) = p.base;
         self.log = Vec::with_capacity(p.log.len() + 1);
         self.log.push(sentinel(base_index, base_term));
@@ -614,15 +811,17 @@ impl RaftNode {
                 success,
                 match_index,
                 conflict_index,
+                commit_index,
             } => {
-                out.extend(self.on_append_resp(
-                    from_id,
+                let r = AppendResponse {
                     term,
+                    from_id,
                     success,
                     match_index,
                     conflict_index,
-                    now,
-                ));
+                    commit_index,
+                };
+                out.extend(self.on_append_resp(&r, now));
             }
             RaftMessage::InstallSnapshot {
                 term,
@@ -683,10 +882,75 @@ impl RaftNode {
         Some(index)
     }
 
+    /// leader 发起成员变更（joint consensus）。成功返回日志 index。
+    ///
+    /// 语义：追加 `SetMembership` 后**立即**切到 joint（新旧配置双多数派），
+    /// 该条提交后 `apply_committed` 撤销 joint、新配置正式生效。
+    pub fn propose_membership(
+        &mut self,
+        voters: Vec<String>,
+        learners: Vec<String>,
+    ) -> Result<u64, String> {
+        if self.role != Role::Leader {
+            return Err("not the leader".into());
+        }
+        if self.joint_old.is_some() {
+            return Err("membership change already in progress".into());
+        }
+        let voters = normalize_members(voters);
+        let learners = normalize_members(learners);
+        validate_membership(&voters, &learners)?;
+        if voters == self.voters && learners == self.learners {
+            return Err("membership unchanged".into());
+        }
+        // Raft §6：一次只增删一个投票成员（多成员变更会破坏 joint 的重叠多数派）。
+        let changed = voters
+            .iter()
+            .filter(|v| !self.applied_voters.contains(v))
+            .count()
+            + self
+                .applied_voters
+                .iter()
+                .filter(|v| !voters.contains(v))
+                .count();
+        if changed > 1 {
+            return Err("only one voting member may be added or removed per change".into());
+        }
+        let index = self.last_log_index() + 1;
+        self.log.push(LogEntry {
+            index,
+            term: self.current_term,
+            command: Command::SetMembership {
+                voters: voters.clone(),
+                learners: learners.clone(),
+            },
+        });
+        self.match_index.insert(self.id.clone(), index);
+        // 立即进入 joint：旧配置 = 当前已提交配置。
+        self.joint_old = Some(self.applied_voters.clone());
+        self.voters = voters;
+        self.learners = learners;
+        self.sync_trackers();
+        tracing::info!(
+            index,
+            voters = ?self.voters,
+            joint = ?self.joint_old,
+            "ha: membership change proposed (joint consensus)"
+        );
+        Ok(index)
+    }
+
     // ---- 选举 -------------------------------------------------------------
 
     fn start_election(&mut self, now: u64) -> Vec<(String, RaftMessage)> {
         let mut out = Vec::new();
+        // learner / 已被移出配置：不参选（重置计时器避免空转）。
+        if !self.self_is_voter() {
+            self.pre_vote = false;
+            self.pre_votes.clear();
+            self.reset_election_timer(now);
+            return out;
+        }
         if self.pre_vote {
             // 预选票拿到多数 -> 正式竞选（term+1，投自己）
             self.pre_vote = false;
@@ -717,7 +981,7 @@ impl RaftNode {
             last_log_term: self.last_log_term(),
             pre_vote: self.pre_vote,
         };
-        for p in self.peers.clone() {
+        for p in self.vote_targets() {
             out.push((p, req.clone()));
         }
         out
@@ -735,6 +999,25 @@ impl RaftNode {
         let last_log_term = req.last_log_term;
         let pre_vote = req.pre_vote;
         let mut out = Vec::new();
+        // learner / 已移出的节点不投票（只复制日志）；非成员候选者也不投票
+        // （防「已移除节点靠旧配置重新当选」把已提交的成员变更顶掉）。
+        let candidate_is_member = self.voters.contains(&candidate_id)
+            || self
+                .joint_old
+                .as_ref()
+                .is_some_and(|old| old.contains(&candidate_id));
+        if !self.self_is_voter() || !candidate_is_member {
+            out.push((
+                from.to_string(),
+                RaftMessage::RequestVoteResp {
+                    term: self.current_term,
+                    voter_id: self.id.clone(),
+                    granted: false,
+                    pre_vote,
+                },
+            ));
+            return out;
+        }
         if pre_vote {
             // 预选票：不改 term、不落票；leader 租约有效期内一律拒绝
             let granted = term >= self.current_term
@@ -807,7 +1090,7 @@ impl RaftNode {
             }
             if granted {
                 self.pre_votes.insert(voter_id);
-                if self.pre_votes.len() >= self.quorum() {
+                if self.quorum_reached(&self.pre_votes) {
                     // 预选票通过 -> 转正式竞选
                     out.extend(self.start_election(now));
                 }
@@ -823,7 +1106,7 @@ impl RaftNode {
         }
         if granted {
             self.votes.insert(voter_id);
-            if self.votes.len() >= self.quorum() {
+            if self.quorum_reached(&self.votes) {
                 self.become_leader(now);
                 out.extend(self.broadcast_append(now));
             }
@@ -834,14 +1117,47 @@ impl RaftNode {
     fn become_leader(&mut self, now: u64) {
         self.role = Role::Leader;
         self.leader_id = Some(self.id.clone());
+        self.votes.clear();
+        self.pre_votes.clear();
+        self.pre_vote = false;
+        // 从日志重建生效配置：已应用配置 + 未提交的成员变更 -> joint。
+        self.rebuild_config_from_log();
+        self.sync_trackers();
         let last = self.last_log_index();
-        for p in &self.peers {
+        for p in self.replication_targets() {
             self.next_index.insert(p.clone(), last + 1);
-            self.match_index.insert(p.clone(), 0);
+            self.match_index.insert(p, 0);
         }
         self.heartbeat_at = now + self.cfg.heartbeat_interval_ms.max(1);
         // leader 自己的条目立刻算已复制
         self.match_index.insert(self.id.clone(), last);
+    }
+
+    /// 以已提交配置为基线，重放日志里未提交的成员变更（决定是否处于 joint）。
+    fn rebuild_config_from_log(&mut self) {
+        let mut cur_voters = self.applied_voters.clone();
+        let mut cur_learners = self.applied_learners.clone();
+        let mut joint: Option<Vec<String>> = None;
+        for e in self.log.iter().filter(|e| e.index > self.last_applied) {
+            if let Command::SetMembership { voters, learners } = &e.command {
+                let voters = normalize_members(voters.iter().cloned());
+                if voters != cur_voters && joint.is_none() {
+                    joint = Some(cur_voters.clone());
+                }
+                cur_voters = voters;
+                cur_learners = normalize_members(learners.iter().cloned());
+            }
+        }
+        if self.role == Role::Leader {
+            tracing::info!(
+                voters = ?cur_voters,
+                joint = ?joint,
+                "ha: leader rebuilt membership from log"
+            );
+        }
+        self.voters = cur_voters;
+        self.learners = cur_learners;
+        self.joint_old = joint;
     }
 
     // ---- 日志 -------------------------------------------------------------
@@ -849,7 +1165,7 @@ impl RaftNode {
     fn broadcast_append(&mut self, now: u64) -> Vec<(String, RaftMessage)> {
         let _ = now;
         let mut out = Vec::new();
-        for p in self.peers.clone() {
+        for p in self.replication_targets() {
             let msg = self.append_msg_for(&p);
             out.push((p, msg));
         }
@@ -915,6 +1231,7 @@ impl RaftNode {
                     success: false,
                     match_index: 0,
                     conflict_index: 0,
+                    commit_index: self.commit_index,
                 },
             ));
             return out;
@@ -950,11 +1267,14 @@ impl RaftNode {
                             success: false,
                             match_index: 0,
                             conflict_index: idx,
+                            commit_index: self.commit_index,
                         },
                     ));
                     return out;
                 }
                 None => {
+                    // 对端日志比 leader 短：提示「我有到哪」，让 leader 直接跳到下一条
+                    // （不能回 prev_log_index，否则 next 原地打转、永远追不上）。
                     out.push((
                         leader_id.clone(),
                         RaftMessage::AppendEntriesResp {
@@ -962,7 +1282,8 @@ impl RaftNode {
                             from_id: self.id.clone(),
                             success: false,
                             match_index: 0,
-                            conflict_index: prev_log_index,
+                            conflict_index: self.last_log_index() + 1,
+                            commit_index: self.commit_index,
                         },
                     ));
                     return out;
@@ -1000,21 +1321,22 @@ impl RaftNode {
                 // prev 落在压缩基以内时按基点确认（基点以内必为已提交）。
                 match_index: (prev_log_index + entries_len).max(base),
                 conflict_index: 0,
+                commit_index: self.commit_index,
             },
         ));
         out
     }
 
-    fn on_append_resp(
-        &mut self,
-        from_id: String,
-        term: u64,
-        success: bool,
-        match_index: u64,
-        conflict_index: u64,
-        now: u64,
-    ) -> Vec<(String, RaftMessage)> {
+    fn on_append_resp(&mut self, r: &AppendResponse, now: u64) -> Vec<(String, RaftMessage)> {
         let mut out = Vec::new();
+        let (from_id, term, success, match_index, conflict_index) = (
+            r.from_id.clone(),
+            r.term,
+            r.success,
+            r.match_index,
+            r.conflict_index,
+        );
+        let peer_commit = r.commit_index;
         if term > self.current_term {
             self.become_follower(term);
             self.reset_election_timer(now);
@@ -1029,6 +1351,14 @@ impl RaftNode {
             self.match_index.insert(from_id.clone(), m);
             self.next_index.insert(from_id.clone(), m + 1);
             self.try_advance_commit();
+            // 已移除节点**已应用**到当前提交位点后才停止喂日志。
+            // 只看 match_index 不够：commit 可能在该次追加之后才前移，
+            // 对端此时还没学到新的 leader_commit（曾导致被移出节点停在旧配置）。
+            if self.draining.contains(&from_id) && peer_commit >= self.commit_index {
+                self.draining.remove(&from_id);
+                self.next_index.remove(&from_id);
+                self.match_index.remove(&from_id);
+            }
             // 流水线：**仅当对端还没追平**（还有条目要发）才立刻补发下一批。
             // 没有新条目时**不**回发——follower 对每条 AppendEntries 都会回一条
             // resp，若 leader 无条件回发就会形成无限 ping-pong（打满 peer 通道、
@@ -1052,24 +1382,42 @@ impl RaftNode {
         out
     }
 
-    /// 推进 commit_index（多数派 + 当前 term 限制）。
+    /// 推进 commit_index（多数派 + 当前 term 限制；joint 阶段需新旧双多数派）。
     fn try_advance_commit(&mut self) {
-        let mut indexes: Vec<u64> = self
-            .peers
-            .iter()
-            .map(|p| self.match_index.get(p).copied().unwrap_or(0))
-            .collect();
-        indexes.push(self.last_log_index());
-        indexes.sort_unstable_by(|a, b| b.cmp(a));
-        let quorum = self.quorum();
-        if indexes.len() < quorum {
+        let Some(candidate) = self.quorum_commit_candidate(&self.voters) else {
             return;
-        }
-        let candidate = indexes[quorum - 1];
+        };
+        let candidate = match &self.joint_old {
+            Some(old) => match self.quorum_commit_candidate(old) {
+                Some(old_idx) => candidate.min(old_idx),
+                None => return,
+            },
+            None => candidate,
+        };
         if candidate > self.commit_index && self.log_term_at(candidate) == self.current_term {
             self.commit_index = candidate;
             self.apply_committed();
         }
+    }
+
+    /// 给定成员集合：已被多数派复制的最大 index。
+    fn quorum_commit_candidate(&self, set: &[String]) -> Option<u64> {
+        if set.is_empty() {
+            return None;
+        }
+        let mut indexes: Vec<u64> = set
+            .iter()
+            .map(|id| {
+                if id == &self.id {
+                    self.last_log_index()
+                } else {
+                    self.match_index.get(id).copied().unwrap_or(0)
+                }
+            })
+            .collect();
+        indexes.sort_unstable_by(|a, b| b.cmp(a));
+        let quorum = set.len() / 2 + 1;
+        indexes.get(quorum - 1).copied()
     }
 
     /// 按序 apply 已提交的日志到状态机。
@@ -1085,6 +1433,46 @@ impl RaftNode {
                 }
                 Command::Delete { ns, key } => {
                     self.state.delete(ns, key);
+                }
+                Command::SetMembership { voters, learners } => {
+                    // 成员变更已提交：joint 结束，新配置正式生效。
+                    let voters = normalize_members(voters.iter().cloned());
+                    let learners = normalize_members(learners.iter().cloned());
+                    let self_removed = self.role == Role::Leader && !voters.contains(&self.id);
+                    if self.role == Role::Leader {
+                        // 被移出的成员继续喂日志，直到它确认到当前提交位点；
+                        // 否则它会一直停在旧配置里（Raft §6 的「已移除节点」问题）。
+                        let old: HashSet<String> = self
+                            .applied_voters
+                            .iter()
+                            .chain(self.applied_learners.iter())
+                            .cloned()
+                            .collect();
+                        for id in old {
+                            if !voters.contains(&id) && !learners.contains(&id) {
+                                self.draining.insert(id);
+                            }
+                        }
+                    }
+                    self.applied_voters = voters.clone();
+                    self.applied_learners = learners.clone();
+                    self.voters = voters;
+                    self.learners = learners;
+                    self.joint_old = None;
+                    self.sync_trackers();
+                    tracing::info!(
+                        voters = ?self.voters,
+                        learners = ?self.learners,
+                        "ha: membership committed"
+                    );
+                    if self_removed {
+                        // 自己被移出投票成员：立刻让位，等新 leader 接管。
+                        tracing::warn!(
+                            node_id = %self.id,
+                            "ha: leader removed from voters, stepping down"
+                        );
+                        self.become_follower(self.current_term);
+                    }
                 }
             }
             self.last_applied = next;
@@ -1253,6 +1641,12 @@ struct StateFile {
     /// 已应用位点（重启后据此重放日志，避免全员重启后状态机为空）。
     #[serde(default)]
     applied_index: u64,
+    /// 已提交的投票成员（动态成员变更后以它为准；缺省空 = 用配置文件）。
+    #[serde(default)]
+    voters: Vec<String>,
+    /// 已提交的 learners。
+    #[serde(default)]
+    learners: Vec<String>,
 }
 
 /// 落盘的快照文件。
@@ -1271,6 +1665,10 @@ pub struct HaPersisted {
     pub voted_for: Option<String>,
     /// 已应用位点（重启后重放用）。
     pub applied_index: u64,
+    /// 已提交的投票成员（空 = 配置文件为准）。
+    pub voters: Vec<String>,
+    /// 已提交的 learners。
+    pub learners: Vec<String>,
     pub log: Vec<LogEntry>,
     pub snapshot: Option<(u64, u64, SnapshotData)>,
 }
@@ -1309,6 +1707,8 @@ impl HaStore {
                 out.current_term = sf.current_term;
                 out.voted_for = sf.voted_for;
                 out.applied_index = sf.applied_index;
+                out.voters = sf.voters;
+                out.learners = sf.learners;
             }
         }
         if let Ok(text) = std::fs::read_to_string(self.log_path()) {
@@ -1338,12 +1738,16 @@ impl HaStore {
         current_term: u64,
         voted_for: Option<&str>,
         applied_index: u64,
+        voters: &[String],
+        learners: &[String],
     ) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let sf = StateFile {
             current_term,
             voted_for: voted_for.map(str::to_string),
             applied_index,
+            voters: voters.to_vec(),
+            learners: learners.to_vec(),
         };
         let text = serde_json::to_string(&sf).map_err(std::io::Error::other)?;
         let tmp = self.state_path().with_extension("json.tmp");
@@ -1439,6 +1843,14 @@ pub struct HaStatus {
     pub state_keys: usize,
     /// 日志已压缩到的位点（= 快照点）。
     pub snapshot_index: u64,
+    /// 已提交的投票成员（稳定配置）。
+    pub voters: Vec<String>,
+    /// 已提交的 learners。
+    pub learners: Vec<String>,
+    /// joint 阶段的目标配置（= 生效中的新配置）。
+    pub pending_voters: Vec<String>,
+    /// joint 阶段仍在生效的旧配置；`null` = 非 joint。
+    pub joint: Option<Vec<String>>,
 }
 
 /// HA 运行时：内核 + 落盘。
@@ -1451,6 +1863,8 @@ pub struct HaRuntime {
     persisted_last_index: u64,
     /// 最近一次落盘的快照位点。
     persisted_snapshot: u64,
+    /// 最近一次落盘的成员配置。
+    persisted_membership: (Vec<String>, Vec<String>),
 }
 
 impl HaRuntime {
@@ -1459,6 +1873,8 @@ impl HaRuntime {
         cfg: &crate::config::HaConfig,
         node_id: &str,
         peers: Vec<String>,
+        voters: Vec<String>,
+        learners: Vec<String>,
         dir: impl Into<std::path::PathBuf>,
     ) -> anyhow::Result<HaRuntime> {
         let raft_cfg = RaftConfig {
@@ -1466,9 +1882,21 @@ impl HaRuntime {
             heartbeat_interval_ms: cfg.heartbeat_interval_ms,
             snapshot_threshold_entries: cfg.snapshot_threshold_entries,
         };
-        let mut node = RaftNode::new(node_id.to_string(), peers, raft_cfg);
+        let mut node =
+            RaftNode::with_membership(node_id.to_string(), peers, voters, learners, raft_cfg);
         let store = HaStore::new(dir, cfg.fsync == "always");
         let persisted = store.load();
+        // 状态机里的成员配置（动态变更）优先于配置文件。
+        let voters = if persisted.voters.is_empty() {
+            node.voters().to_vec()
+        } else {
+            persisted.voters.clone()
+        };
+        let learners = if persisted.voters.is_empty() {
+            node.learners().to_vec()
+        } else {
+            persisted.learners.clone()
+        };
         let (base, snap_applied) = match &persisted.snapshot {
             Some((i, t, data)) => {
                 node.load_snapshot_state(data.clone());
@@ -1482,10 +1910,16 @@ impl HaRuntime {
             log: persisted.log.clone(),
             base,
             applied_index: persisted.applied_index.max(snap_applied),
+            voters,
+            learners,
         });
         let persisted_log_len = node.last_log_index();
         let persisted_term = node.term();
         let persisted_applied = node.last_applied();
+        let persisted_membership = (
+            node.committed_voters().to_vec(),
+            node.committed_learners().to_vec(),
+        );
         Ok(HaRuntime {
             node,
             store,
@@ -1493,6 +1927,7 @@ impl HaRuntime {
             persisted_applied,
             persisted_last_index: persisted_log_len,
             persisted_snapshot: base.0,
+            persisted_membership,
         })
     }
 
@@ -1500,12 +1935,26 @@ impl HaRuntime {
     fn persist(&mut self) {
         let term = self.node.term();
         let applied = self.node.last_applied();
-        if term != self.persisted_term || applied != self.persisted_applied {
-            if let Err(e) = self.store.save_state(term, self.node.voted_for(), applied) {
+        let membership = (
+            self.node.committed_voters().to_vec(),
+            self.node.committed_learners().to_vec(),
+        );
+        if term != self.persisted_term
+            || applied != self.persisted_applied
+            || membership != self.persisted_membership
+        {
+            if let Err(e) = self.store.save_state(
+                term,
+                self.node.voted_for(),
+                applied,
+                &membership.0,
+                &membership.1,
+            ) {
                 tracing::warn!(error = %e, "ha: failed to persist term/vote/applied");
             } else {
                 self.persisted_term = term;
                 self.persisted_applied = applied;
+                self.persisted_membership = membership;
             }
         }
         let last = self.node.last_log_index();
@@ -1576,11 +2025,13 @@ impl HaHandle {
         cfg: &crate::config::HaConfig,
         node_id: &str,
         peers: Vec<String>,
+        voters: Vec<String>,
+        learners: Vec<String>,
         dir: impl Into<std::path::PathBuf>,
     ) -> anyhow::Result<HaHandle> {
         Ok(HaHandle {
             inner: std::sync::Arc::new(std::sync::Mutex::new(HaRuntime::new(
-                cfg, node_id, peers, dir,
+                cfg, node_id, peers, voters, learners, dir,
             )?)),
             started_at: std::time::Instant::now(),
         })
@@ -1620,6 +2071,27 @@ impl HaHandle {
         idx
     }
 
+    /// leader 发起成员变更（joint consensus）。返回新条目 index。
+    pub fn propose_membership(
+        &self,
+        voters: Vec<String>,
+        learners: Vec<String>,
+    ) -> Result<u64, String> {
+        let mut g = self.inner.lock().unwrap();
+        let idx = g.node.propose_membership(voters, learners)?;
+        g.maintain();
+        Ok(idx)
+    }
+
+    /// 已提交的成员配置（voters, learners）。
+    pub fn membership(&self) -> (Vec<String>, Vec<String>) {
+        let g = self.inner.lock().unwrap();
+        (
+            g.node.committed_voters().to_vec(),
+            g.node.committed_learners().to_vec(),
+        )
+    }
+
     /// 读状态机（本地视图；leader 强一致，follower 可能滞后）。
     pub fn get(&self, ns: &str, key: &str) -> Option<Vec<u8>> {
         let g = self.inner.lock().unwrap();
@@ -1642,6 +2114,10 @@ impl HaHandle {
             log_len: g.node.log_len(),
             state_keys: g.node.state().len(),
             snapshot_index: g.node.snapshot_index(),
+            voters: g.node.committed_voters().to_vec(),
+            learners: g.node.committed_learners().to_vec(),
+            pending_voters: g.node.voters().to_vec(),
+            joint: g.node.joint().map(|v| v.to_vec()),
         }
     }
 
@@ -1672,6 +2148,37 @@ mod tests {
     impl Net {
         fn new(ids: &[&str]) -> Self {
             Self::with_cfg(ids, RaftConfig::default())
+        }
+
+        /// 全员用同一份显式成员配置（可含 learners）。
+        fn with_roles(ids: &[&str], voters: &[&str], learners: &[&str], cfg: RaftConfig) -> Self {
+            let voters: Vec<String> = voters.iter().map(|s| s.to_string()).collect();
+            let learners: Vec<String> = learners.iter().map(|s| s.to_string()).collect();
+            let mut nodes = HashMap::new();
+            for (i, id) in ids.iter().enumerate() {
+                let peers: Vec<String> = ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| j != &i)
+                    .map(|(_, o)| o.to_string())
+                    .collect();
+                nodes.insert(
+                    id.to_string(),
+                    RaftNode::with_membership(
+                        id.to_string(),
+                        peers,
+                        voters.clone(),
+                        learners.clone(),
+                        cfg.clone(),
+                    ),
+                );
+            }
+            Net {
+                nodes,
+                queue: Vec::new(),
+                now: 0,
+                dropped: HashSet::new(),
+            }
         }
 
         fn with_cfg(ids: &[&str], cfg: RaftConfig) -> Self {
@@ -2223,6 +2730,246 @@ mod tests {
             "重启后应从日志重放出已应用状态"
         );
         assert_eq!(restarted.last_applied(), restarted.commit_index());
+    }
+
+    #[test]
+    fn joint_consensus_removes_a_member() {
+        let mut net = Net::new(&["n1", "n2", "n3"]);
+        let leader = elect(&mut net, 200).expect("选主");
+        let target = vec!["n1".to_string(), "n2".to_string()];
+        let idx = net
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose_membership(target.clone(), vec![])
+            .expect("leader 应能发起成员变更");
+        assert!(idx > 0);
+        // 追加后立刻进入 joint：旧配置仍然要多数派。
+        assert_eq!(
+            net.nodes[&leader].joint(),
+            Some(["n1".to_string(), "n2".to_string(), "n3".to_string()].as_slice())
+        );
+        for _ in 0..30 {
+            net.tick(50);
+        }
+        for id in ["n1", "n2", "n3"] {
+            assert_eq!(
+                net.nodes[id].committed_voters(),
+                target.as_slice(),
+                "{id} 未切到新配置"
+            );
+            assert!(net.nodes[id].joint().is_none(), "{id} joint 未结束");
+            assert_eq!(net.nodes[id].cluster_size(), 2);
+            assert_eq!(net.nodes[id].quorum(), 2);
+        }
+        // 被移出的 n3 不再收到新写入。
+        net.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(put("kv", "after", "1"));
+        for _ in 0..12 {
+            net.tick(50);
+        }
+        assert!(
+            net.nodes["n3"].state().get("kv", "after").is_none(),
+            "已移出成员不应再复制新日志"
+        );
+        // 剩余两名投票成员都拿到。
+        for id in ["n1", "n2"] {
+            assert_eq!(
+                net.nodes[id]
+                    .state()
+                    .get("kv", "after")
+                    .map(|v| v.as_slice()),
+                Some(b"1".as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn leader_steps_down_when_removed_from_voters() {
+        let mut net = Net::new(&["n1", "n2", "n3"]);
+        let leader = elect(&mut net, 200).expect("选主");
+        let others: Vec<String> = ["n1", "n2", "n3"]
+            .iter()
+            .filter(|id| **id != leader)
+            .map(|id| id.to_string())
+            .collect();
+        net.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose_membership(others.clone(), vec![])
+            .expect("发起成员变更");
+        for _ in 0..40 {
+            net.tick(50);
+        }
+        assert_ne!(
+            net.nodes[&leader].role(),
+            Role::Leader,
+            "被移出投票成员的 leader 应立即让位"
+        );
+        let ls = net.leaders();
+        assert_eq!(ls.len(), 1, "剩余成员应选出唯一新 leader：{ls:?}");
+        assert!(others.contains(&ls[0]));
+        // 新配置仍能提交写入（2 投票成员 = 2 票多数派）。
+        net.nodes
+            .get_mut(&ls[0])
+            .unwrap()
+            .propose(put("kv", "k", "v"));
+        for _ in 0..12 {
+            net.tick(50);
+        }
+        assert_eq!(
+            net.nodes[&ls[0]]
+                .state()
+                .get("kv", "k")
+                .map(|v| v.as_slice()),
+            Some(b"v".as_slice()),
+            "成员变更后仍应能提交"
+        );
+    }
+
+    #[test]
+    fn learners_replicate_but_never_vote() {
+        let mut net = Net::with_roles(
+            &["n1", "n2", "n3", "n4"],
+            &["n1", "n2", "n3"],
+            &["n4"],
+            RaftConfig::default(),
+        );
+        let leader = elect(&mut net, 200).expect("选主");
+        net.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(put("kv", "a", "1"));
+        for _ in 0..10 {
+            net.tick(50);
+        }
+        assert_eq!(
+            net.nodes["n4"].state().get("kv", "a").map(|v| v.as_slice()),
+            Some(b"1".as_slice()),
+            "learner 应复制并应用日志"
+        );
+        assert_eq!(net.nodes["n4"].role(), Role::Follower);
+        // 只剩 learner：它不参选、不投票。
+        for id in ["n1", "n2", "n3"] {
+            net.dropped.insert(id.to_string());
+        }
+        for _ in 0..60 {
+            net.tick(50);
+        }
+        assert_ne!(net.nodes["n4"].role(), Role::Candidate);
+        assert_ne!(net.nodes["n4"].role(), Role::Leader);
+        let req = RaftMessage::RequestVote {
+            term: 99,
+            candidate_id: "n9".into(),
+            last_log_index: 99,
+            last_log_term: 99,
+            pre_vote: false,
+        };
+        let out = net.nodes.get_mut("n4").unwrap().handle("n9", req, net.now);
+        assert!(
+            matches!(
+                out.first().map(|(_, m)| m),
+                Some(RaftMessage::RequestVoteResp { granted: false, .. })
+            ),
+            "learner 不得投票"
+        );
+    }
+
+    #[test]
+    fn membership_survives_restart() {
+        let mut net = Net::new(&["n1", "n2", "n3"]);
+        let leader = elect(&mut net, 200).expect("选主");
+        net.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose_membership(vec!["n1".into(), "n2".into()], vec!["n3".into()])
+            .expect("发起成员变更");
+        for _ in 0..30 {
+            net.tick(50);
+        }
+        let saved = net.nodes[&leader].persistent();
+        assert_eq!(
+            saved.voters,
+            vec!["n1".to_string(), "n2".to_string()],
+            "持久化应带已提交配置"
+        );
+        assert_eq!(saved.learners, vec!["n3".to_string()]);
+        // 重启：配置文件仍是 3 投票成员，但状态机里的配置优先。
+        let mut restarted = RaftNode::new(
+            leader.clone(),
+            vec!["n1".into(), "n2".into(), "n3".into()],
+            RaftConfig::default(),
+        );
+        restarted.restore(saved);
+        assert_eq!(restarted.voters(), ["n1", "n2"]);
+        assert_eq!(restarted.learners(), ["n3"]);
+        assert_eq!(restarted.cluster_size(), 2);
+    }
+
+    #[test]
+    fn new_member_catches_up_and_votes() {
+        let mut net = Net::with_roles(
+            &["n1", "n2", "n3", "n4"],
+            &["n1", "n2", "n3"],
+            &[],
+            RaftConfig::default(),
+        );
+        let leader = elect(&mut net, 200).expect("选主");
+        net.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(put("kv", "before", "1"));
+        for _ in 0..8 {
+            net.tick(50);
+        }
+        // n4 之前不是成员：加进来后必须从日志起点追平。
+        net.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose_membership(
+                vec!["n1".into(), "n2".into(), "n3".into(), "n4".into()],
+                vec![],
+            )
+            .expect("扩容");
+        for _ in 0..40 {
+            net.tick(50);
+        }
+        let want = ["n1", "n2", "n3", "n4"];
+        for id in want {
+            assert_eq!(
+                net.nodes[id].committed_voters().len(),
+                4,
+                "{id} 未切到 4 成员配置"
+            );
+        }
+        assert_eq!(
+            net.nodes["n4"]
+                .state()
+                .get("kv", "before")
+                .map(|v| v.as_slice()),
+            Some(b"1".as_slice()),
+            "新成员应从日志起点追平历史数据"
+        );
+        // 4 成员多数派 = 3：继续提交并复制到新成员。
+        net.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(put("kv", "after", "2"));
+        for _ in 0..12 {
+            net.tick(50);
+        }
+        for id in want {
+            assert_eq!(
+                net.nodes[id]
+                    .state()
+                    .get("kv", "after")
+                    .map(|v| v.as_slice()),
+                Some(b"2".as_slice()),
+                "{id} 未拿到新增后的写入"
+            );
+        }
     }
 
     #[test]

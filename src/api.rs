@@ -369,6 +369,7 @@ pub fn router(state: SharedState) -> AxRouter {
         .route("/v1/ha/status", get(ha_status))
         .route("/v1/ha/propose", post(ha_propose))
         .route("/v1/ha/get", post(ha_get))
+        .route("/v1/ha/members", post(ha_members))
         .route("/v1/auth/oidc/login", get(oidc_login))
         .route(
             "/v1/auth/oidc/callback",
@@ -4805,6 +4806,10 @@ async fn ha_status(State(state): State<SharedState>, headers: HeaderMap) -> Resp
             "log_len": 0,
             "state_keys": 0,
             "snapshot_index": 0,
+            "voters": [],
+            "learners": [],
+            "pending_voters": [],
+            "joint": serde_json::Value::Null,
         }))
         .into_response();
     };
@@ -4871,6 +4876,84 @@ async fn ha_propose(
         )
             .into_response(),
     }
+}
+
+/// v0.8 HA 成员变更（Admin）：joint consensus 动态扩缩容。
+///
+/// 请求体 `{"voters": ["n1","n2","n3"], "learners": ["n4"]}`。leader 追加
+/// `SetMembership` 后立刻进入 joint（新旧双多数派），该条提交后新配置生效；
+/// 本接口最多等 3s 等它落地，返回 `committed` 或 `pending`。
+#[derive(Debug, Deserialize)]
+struct HaMembersReq {
+    voters: Vec<String>,
+    #[serde(default)]
+    learners: Vec<String>,
+}
+
+async fn ha_members(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<HaMembersReq>,
+) -> Response {
+    let Some(role) = authorized_role(&state, &headers) else {
+        return unauthorized().into_response();
+    };
+    if !role.allows("/v1/ha/members") {
+        return forbidden().into_response();
+    }
+    let Some(ha) = state.ha.as_ref() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "ha is not enabled"})),
+        )
+            .into_response();
+    };
+    let want_voters = crate::ha::normalize_members(req.voters);
+    let want_learners = crate::ha::normalize_members(req.learners);
+    if let Err(e) = crate::ha::validate_membership(&want_voters, &want_learners) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
+    let index = match ha.propose_membership(want_voters.clone(), want_learners.clone()) {
+        Ok(i) => i,
+        Err(e) if e == "not the leader" => {
+            let leader = ha.status().leader_id;
+            return (
+                StatusCode::CONFLICT,
+                Json(
+                    json!({"error": "not the leader (membership change requires a leader)",
+                            "leader_id": leader}),
+                ),
+            )
+                .into_response();
+        }
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+    };
+    // 最多等 3s 让它提交并应用（joint -> 新配置）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut committed = false;
+    loop {
+        let (v, l) = ha.membership();
+        if v == want_voters && l == want_learners {
+            committed = true;
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let st = ha.status();
+    Json(json!({
+        "ok": true,
+        "index": index,
+        "state": if committed { "committed" } else { "pending" },
+        "voters": st.voters,
+        "learners": st.learners,
+        "pending_voters": st.pending_voters,
+        "joint": st.joint,
+        "quorum": st.quorum,
+    }))
+    .into_response()
 }
 
 /// v0.8 HA 读入口：读本节点状态机视图（leader 强一致；follower 可能滞后）。

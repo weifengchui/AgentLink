@@ -12,6 +12,7 @@
   A4 重启节点 -> 从磁盘恢复（term/日志），仍能继续复制
   A5 /v1/ha/status 暴露角色/term/commit 位点；未启用 HA 的节点行为不变
   A7 leader 压缩日志前缀后，长期离线节点通过 InstallSnapshot 追平
+  A8 joint consensus 动态成员变更：3 投票成员 -> 2 -> 3（含缩容后仍能提交）
   A6 进程存活、日志无 panic
 """
 import json
@@ -283,6 +284,43 @@ def main():
                            ("snapshot_index", "log_len", "applied_index")},
                 "follower": {k: st_lag.get(k) for k in
                              ("snapshot_index", "log_len", "applied_index")}})
+
+        # A8 动态成员变更（joint consensus）：3 -> 2 -> 3 ---------------------
+        cur = wait_for(lambda: leaders()[0] if len(leaders()) == 1 else None, 20)
+        assert cur, "A8 前应存在唯一 leader"
+        ids = dict(zip(PORTS, NODES))
+        removed = [p for p in PORTS if p != cur][-1]
+        keep = sorted(ids[p] for p in PORTS if p != removed)
+        all_ids = sorted(ids.values())
+        st_m, body_m = api(cur, "/v1/ha/members", {"voters": keep, "learners": []})
+        converged = wait_for(
+            lambda: all(ha_status(p).get("voters") == keep for p in PORTS), 30)
+        st_w, _ = api(cur, "/v1/ha/propose",
+                      {"ns": "kv", "key": "after_change", "value": "ok"})
+        kept_val = wait_for(
+            lambda: all(api(p, "/v1/ha/get", {"ns": "kv", "key": "after_change"})[1]
+                        .get("value") == "ok" for p in PORTS if p != removed), 20)
+        st_c = ha_status(cur)
+        # 再扩回 3 成员：被移出的节点必须追平（AppendEntries / 快照）。
+        st_b, body_b = api(cur, "/v1/ha/members", {"voters": all_ids, "learners": []})
+        back = wait_for(
+            lambda: all(ha_status(p).get("voters") == all_ids for p in PORTS), 30)
+        caught = wait_for(
+            lambda: api(removed, "/v1/ha/get", {"ns": "kv", "key": "s1099"})[1]
+            .get("value") == "1099", 40)
+        record("A8 joint consensus 动态缩容/扩容（3->2->3）",
+               st_m == 200 and body_m.get("state") == "committed" and bool(converged)
+               and st_c.get("cluster_size") == 2 and st_c.get("quorum") == 2
+               and st_w == 200 and bool(kept_val)
+               and st_b == 200 and body_b.get("state") == "committed"
+               and bool(back) and bool(caught),
+               {"shrink": {"status": st_m, "body": body_m, "converged": bool(converged)},
+                "removed": removed,
+                "after_shrink": {k: st_c.get(k) for k in
+                                 ("cluster_size", "quorum", "voters")},
+                "write_after_shrink": st_w,
+                "grow": {"status": st_b, "body": body_b, "converged": bool(back),
+                         "removed_caught_up": bool(caught)}})
 
         # A6 进程存活、无 panic -------------------------------------------------
         alive = [p for p in PORTS if probe(p)]

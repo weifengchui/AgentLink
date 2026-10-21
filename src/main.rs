@@ -1351,19 +1351,39 @@ async fn run(mut cfg: Config, config_file: PathBuf, no_open: bool) -> Result<()>
     // 成员来自 ha.cluster（`node_id@host:port`），自身 node_id 已在配置校验
     // 里要求必须出现在 cluster 中；这里只取对端 node_id 列表。
     if cfg.ha.enabled {
-        let peers: Vec<String> = cfg
+        let all_ids: Vec<String> = cfg
             .ha
             .cluster
             .iter()
             .filter_map(|e| e.split('@').next().map(str::to_string))
-            .filter(|id| id != &cfg.node_id)
             .collect();
+        let peers: Vec<String> = all_ids
+            .iter()
+            .filter(|id| *id != &cfg.node_id)
+            .cloned()
+            .collect();
+        // 投票成员缺省 = cluster 全部（与 M1/M2 一致）；learners 只复制不投票。
+        let voters = if cfg.ha.voting_members.is_empty() {
+            all_ids.clone()
+        } else {
+            cfg.ha.voting_members.clone()
+        };
+        let learners = cfg.ha.learners.clone();
         let ha_dir = cfg.data_dir.join("ha");
-        match ha::HaHandle::new(&cfg.ha, &cfg.node_id, peers.clone(), &ha_dir) {
+        match ha::HaHandle::new(
+            &cfg.ha,
+            &cfg.node_id,
+            peers.clone(),
+            voters.clone(),
+            learners.clone(),
+            &ha_dir,
+        ) {
             Ok(h) => {
                 tracing::info!(
                     node_id = %cfg.node_id,
                     peers = peers.len(),
+                    voters = voters.len(),
+                    learners = learners.len(),
                     "ha: raft runtime started (M2 transport wiring)"
                 );
                 state_inner.ha = Some(h);

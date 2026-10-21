@@ -643,6 +643,7 @@ impl Role {
                     | "/v1/admission"
                     | "/v1/audit/verify"
                     | "/v1/audit/export"
+                    | "/v1/ha/members"
             ),
             Role::Viewer => matches!(
                 endpoint,
