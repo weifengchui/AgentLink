@@ -6,6 +6,10 @@
 
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey) ![Version](https://img.shields.io/badge/version-0.6.1-green)
 
+<p align="center">
+  <img src="assets/starmap.png" alt="AgentLink live message starmap: 3 nodes, 6 agents, cross-machine message flows" width="100%">
+</p>
+
 Each machine runs one small daemon (**node**). Agents on that machine talk to it over a local HTTP/WebSocket API; nodes auto-discover each other on the LAN and relay messages over a WebSocket mesh. One binary, zero runtime dependencies — pure Rust, no C toolchain, no external processes.
 
 ## Why

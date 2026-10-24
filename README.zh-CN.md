@@ -6,6 +6,10 @@
 
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey) ![Version](https://img.shields.io/badge/version-0.6.1-green)
 
+<p align="center">
+  <img src="assets/starmap.png" alt="AgentLink 实时消息星图：3 节点、6 Agent、跨机消息流" width="100%">
+</p>
+
 每台机器跑一个常驻小进程（**节点**）。本机 Agent 通过 `127.0.0.1` 的 HTTP/WS 接口收发消息与文件；各机器的节点在局域网内自动互相发现，用 WebSocket 网状连接把消息可靠送到对端或广播给全网。单二进制、零运行时依赖——纯 Rust，无 C 依赖、无外部进程。
 
 ## 解决什么问题
