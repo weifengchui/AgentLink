@@ -1,12 +1,13 @@
 [package]
 name = "agentlink"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 description = "AgentLink core - LAN message bus transport (open source)"
 repository = "https://github.com/weifengchui/AgentLink"
 homepage = "https://github.com/weifengchui/AgentLink"
 documentation = "https://docs.rs/agentlink"
 license = "Apache-2.0"
+readme = "README.md"
 
 [features]
 default = []

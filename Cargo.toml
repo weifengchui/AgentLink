@@ -3,7 +3,7 @@ members = ["crates/agentlink-core"]
 
 [package]
 name = "agentlink-node"
-version = "0.6.2"
+version = "0.6.3"
 publish = false
 edition = "2021"
 description = "AgentLink - LAN message bus for AI agents"
