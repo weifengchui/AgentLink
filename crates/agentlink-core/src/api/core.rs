@@ -1920,7 +1920,7 @@ pub(super) async fn starmap_page() -> Response {
     (
         StatusCode::OK,
         headers,
-        Html(include_str!("../../../../web/starmap.html")),
+        Html(include_str!("../../web/starmap.html")),
     )
         .into_response()
 }
