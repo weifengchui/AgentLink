@@ -1,0 +1,6 @@
+/target
+/data
+/dist
+*.log
+agentlink.json
+__pycache__/

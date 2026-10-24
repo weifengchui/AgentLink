@@ -1,0 +1,1138 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>AgentLink · 消息星图 v5</title>
+<style>
+:root{--ink:#04070d;--panel:rgba(11,17,27,.88);--edge:rgba(108,168,255,.16);--txt:#d7e2ee;--mut:#6b7d94;
+--fs:1;--cyan:#38d6e6;--blue:#7fb0ff;--green:#43d97b;--amber:#ffb347;--violet:#c77dff;--red:#ff5c7a}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;background:var(--ink);color:var(--txt);
+font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;user-select:none}
+#viewport{position:fixed;inset:0;background:
+ radial-gradient(1200px 800px at 70% 20%,rgba(56,120,255,.07),transparent 60%),
+ radial-gradient(1400px 900px at 55% 42%,#0a1322 0%,#05080f 55%,#03060b 100%),
+ linear-gradient(rgba(108,168,255,.045) 1px,transparent 1px) 0 0/44px 44px,
+ linear-gradient(90deg,rgba(108,168,255,.045) 1px,transparent 1px) 0 0/44px 44px,
+ radial-gradient(46% 40% at 21% 50%,rgba(56,214,230,.05),transparent 70%),
+ radial-gradient(42% 36% at 73% 22%,rgba(127,176,255,.05),transparent 70%),
+ radial-gradient(40% 36% at 66% 78%,rgba(199,125,255,.07),transparent 70%),var(--ink)}
+#starfield{position:absolute;inset:0;pointer-events:none}
+#starfield i{position:absolute;border-radius:50%;background:#cfe3ff;animation:twk var(--d) ease-in-out infinite alternate}
+@keyframes twk{from{opacity:.03}to{opacity:.16}}
+#scan{position:fixed;inset:0;pointer-events:none;background:linear-gradient(180deg,transparent 0%,rgba(56,214,230,.022) 50%,transparent 100%);background-size:100% 240px;animation:scan 9s linear infinite;z-index:40}
+@keyframes scan{from{background-position:0 -240px}to{background-position:0 100vh}}
+#world{position:absolute;inset:0}
+#stage{position:absolute;inset:0}
+svg#map{position:absolute;inset:0;width:100%;height:100%}
+/* ---------- top bar ---------- */
+#topbar{position:fixed;top:0;left:0;right:0;height:64px;display:flex;align-items:center;
+justify-content:space-between;padding:0 26px;z-index:30;pointer-events:none;
+background:linear-gradient(180deg,rgba(4,7,13,.82),transparent)}
+#brand{display:flex;align-items:center;gap:14px}
+#brand h1{font-size:calc(20px*var(--fs));font-weight:600;letter-spacing:3px;color:#cfe4ff;margin:0}
+#brand h1 em{font-style:normal;color:var(--cyan)}
+#brand .sub{font-size:calc(11px*var(--fs));color:var(--mut);letter-spacing:.6em;border-left:1px solid var(--edge);padding-left:14px;margin-top:4px}
+#hud{display:flex;gap:22px;font-size:calc(12px*var(--fs));color:var(--mut)}
+#hud b{color:var(--txt);font-size:calc(15px*var(--fs));font-family:ui-monospace,Consolas,monospace}
+/* ---------- stations (v1 minimal) ---------- */
+/* R5（10-16 第五轮）：节点圆整体再缩一档——orb 直径 46→38；感应盒 150→76（比 orb 大一圈即可，
+   配合 R3：鼠标从胶囊走向卡片时不再横穿节点感应区，误收卡组的机会随之大减） */
+.station{position:absolute;width:76px;height:76px;transform:translate(-50%,-50%);cursor:grab;z-index:3}
+.station.drag{cursor:grabbing}
+.station:hover{z-index:4}
+.station .orb{position:absolute;inset:19px;border-radius:50%;pointer-events:none;
+background:radial-gradient(circle at 35% 28%,rgba(255,255,255,.30),transparent 60%),
+radial-gradient(circle at 50% 60%,rgba(12,24,40,.55),rgba(7,13,24,.94) 74%);
+border:1.5px solid var(--sc,#7fb0ff);
+box-shadow:0 0 24px var(--scg,rgba(127,176,255,.35)),inset 0 0 18px rgba(127,176,255,.12)}
+.station .ring{position:absolute;inset:12px;border:1px solid var(--sc,#7fb0ff);border-radius:50%;opacity:.22;pointer-events:none}
+.station .pulse{position:absolute;inset:12px;border-radius:50%;border:1px solid var(--sc,#7fb0ff);
+opacity:0;animation:stpulse 3.6s ease-in-out infinite;pointer-events:none}
+@keyframes stpulse{0%,100%{transform:scale(.8);opacity:0}50%{transform:scale(1.14);opacity:.4}}
+.station .glyph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
+.station .glyph span{font-size:calc(10px*var(--fs));font-family:ui-monospace,Consolas,monospace;letter-spacing:.04em;color:#eaf4ff;opacity:.92;text-shadow:0 0 10px var(--scg,rgba(120,190,255,.9))}
+.station .lab{position:absolute;top:100%;left:-60px;right:-60px;margin-top:-14px;text-align:center;pointer-events:none}
+.station .lab b{font-size:calc(13px*var(--fs));letter-spacing:.12em;color:#d8e6f4;font-weight:600;text-shadow:0 1px 4px #000}
+.station .lab i{display:block;font-style:normal;font-size:calc(10.5px*var(--fs));color:#8ea6bd;
+font-family:ui-monospace,Consolas,monospace;letter-spacing:.05em}
+.agt{position:absolute;transform:translate(-50%,-50%);cursor:grab;z-index:6}
+.agt.drag{cursor:grabbing}
+/* R6（10-17 第十轮）：胶囊按图扁平化——去白描边（transparent 占位保几何）、圆角对齐弹窗 13px、
+   内芯纯色平面（无径向高光无 box-shadow 发光）、hover 微动效与对话记录统一为 cap-nudge */
+.agt .dot{position:relative;border-radius:13px;display:flex;align-items:center;justify-content:flex-end;height:27px;padding:2px 2px 2px 10px;
+ background:var(--acn,#1c3a5e);border:1px solid transparent;transition:border-color .18s,filter .18s;animation:apulse 3s ease-in-out infinite alternate}
+.agt .dot .in{border-radius:999px;padding:0 9px;height:21px;line-height:21px;display:inline-block;
+ background:var(--ac,#38d6e6);color:#0b1420;font-weight:600;font-size:calc(10.5px*var(--fs));letter-spacing:.03em;white-space:nowrap}
+/* 悬停内胶囊左右缓晃一次复位（与 api.rs cap-nudge 逐字同源） */
+@keyframes cap-nudge{0%,100%{transform:translateX(0)}18%{transform:translateX(-5px)}42%{transform:translateX(4px)}64%{transform:translateX(-2.5px)}82%{transform:translateX(1.5px)}}
+.agt:hover .dot .in{animation:cap-nudge .7s cubic-bezier(.34,1.2,.64,1) 1}
+@media (prefers-reduced-motion:reduce){.agt:hover .dot .in{animation:none}}
+/* R3（10-16 第四轮）：悬停/钉选节点时，该节点全部 agent 胶囊提亮（归属感反馈） */
+.agt.lit .dot{filter:brightness(1.22) saturate(1.12);opacity:1;animation:none}
+.agt.lit .badge{box-shadow:0 0 12px color-mix(in srgb,var(--ac,#38d6e6) 60%,transparent)}
+@keyframes apulse{from{opacity:.82}to{opacity:1}}
+
+.agt .badge{position:absolute;top:-7px;right:-9px;min-width:19px;height:19px;padding:0 5px;border-radius:10px;
+background:#0b1220;border:1px solid var(--ac,#38d6e6);color:#fff;font-size:calc(10.5px*var(--fs));line-height:17px;text-align:center;
+box-shadow:0 0 8px color-mix(in srgb,var(--ac) 45%,transparent);
+font-family:ui-monospace,Consolas,monospace;z-index:2}
+.agt .badge.zero{opacity:.28}
+@keyframes ping{0%{transform:scale(1)}40%{transform:scale(1.55)}100%{transform:scale(1)}}
+.agt .badge.ping{animation:ping .7s cubic-bezier(.2,1.6,.4,1)}
+.agt .flash{position:absolute;inset:-9px;border-radius:50%;border:2px solid var(--ac,#38d6e6);opacity:0;pointer-events:none}
+@keyframes fire{0%{opacity:.95;transform:scale(.5)}100%{opacity:0;transform:scale(2.1)}}
+.agt .flash.fire{animation:fire .9s ease-out}
+/* ---------- links ---------- */
+.lk{fill:none;stroke-linecap:round;opacity:0;pointer-events:none;transition:opacity .35s ease}
+/* R3（10-18 第十五轮）：持久亮线——新消息的链路以 .live 持续显示 LIVE_MS(60s) 或至滑出窗口，
+   与粒子动画解耦；到期静默撤。放在 .on/.hl/.lit 之前：悬停高亮与到达闪光仍可覆盖它。 */
+.lk.live{opacity:.8;stroke-width:2.1px;filter:drop-shadow(0 0 4px rgba(160,210,255,.45))}
+.lk.on{opacity:.62}
+.lk.hl{opacity:1;stroke-width:2.6px;filter:drop-shadow(0 0 5px rgba(160,210,255,.65))}
+.lk.temp{opacity:.5}
+.lk.lit{opacity:1;stroke-width:2.8px!important;transition:opacity .9s linear}
+.dot.glow{border-color:var(--ac,#38d6e6);filter:brightness(1.25) saturate(1.15)}
+.station .orb.glow{box-shadow:0 0 26px var(--scg,rgba(127,176,255,.5)),0 0 0 2px rgba(255,255,255,.5)}
+/* R6（10-17 第十轮）：钉选态按定稿改 1px 同色细描边＋轻微提亮（发光圈废除，全局无阴影） */
+.agt.pinned .dot{border-color:var(--ac,#38d6e6);filter:brightness(1.15)}
+.station.pinned .ring{opacity:.55}
+/* ---------- photon ---------- */
+.ph{position:absolute;width:10px;height:10px;margin:-5px 0 0 -5px;border-radius:50%;z-index:9;pointer-events:none;
+background:radial-gradient(circle,#fff,currentColor 55%,transparent 75%);box-shadow:0 0 12px 3px currentColor}
+.ph::before{content:"";position:absolute;left:50%;top:50%;width:5px;height:5px;margin:-2.5px;border-radius:50%;
+background:currentColor;opacity:.55;box-shadow:0 0 8px 2px currentColor}
+/* ---------- group card deck (vertical feather) ---------- */
+.dwrap{position:absolute;z-index:20;width:236px}
+.dkhit{position:absolute;z-index:0;pointer-events:auto}
+.gcard.hot{z-index:99}
+.dmore{position:absolute;width:auto;padding:2px 10px;border-radius:10px;font-size:calc(10.5px*var(--fs));color:#9fb4cc;background:rgba(13,20,32,.92);border:1px solid rgba(108,168,255,.35);font-family:ui-monospace,Consolas,monospace;letter-spacing:.05em}
+#legend{position:fixed;left:26px;bottom:92px;color:var(--mut);font-size:calc(11px*var(--fs));z-index:6;
+letter-spacing:.06em;display:flex;flex-direction:column;gap:5px;max-width:56vw}
+.lgrow{display:flex;flex-wrap:wrap;align-items:center;gap:5px}
+.lgsec{font-size:calc(10px*var(--fs));color:#4f6377;letter-spacing:.16em;margin-right:3px;flex:none}
+.lgi{display:inline-flex;align-items:center;gap:6px;cursor:pointer;padding:2px 9px;border-radius:11px;
+border:1px solid rgba(108,168,255,.22);background:rgba(9,14,23,.66);color:#a9bcd2;
+font-size:calc(10.5px*var(--fs));user-select:none;transition:all .15s}
+.lgi:hover{border-color:rgba(56,214,230,.7);color:#fff}
+.lgi.off{opacity:.4;text-decoration:line-through}
+.dotl{display:inline-block;width:8px;height:8px;border-radius:50%;flex:none}
+.station.hid,.agt.hid{display:none!important}
+.gcard{position:absolute;left:0;backdrop-filter:blur(8px);width:236px;height:70px;border-radius:10px;padding:7px 9px;cursor:pointer;
+background:rgba(11,17,28,.98);
+border:1px solid color-mix(in srgb,var(--gc) 50%,rgba(108,168,255,.2));border-left:3px solid var(--gc);
+box-shadow:0 0 20px -8px var(--gc),0 6px 18px rgba(0,0,0,.55);transform-origin:8% 90%;
+transition:transform .32s cubic-bezier(.2,.8,.25,1),top .32s cubic-bezier(.2,.8,.25,1),box-shadow .2s,filter .2s}
+.gcard .r1{display:flex;align-items:center;gap:8px}
+.gcard .cdot{width:7px;height:7px;border-radius:2px;background:var(--gc);box-shadow:0 0 6px var(--gc);flex:none}
+.gcard .cname{font-size:calc(13px*var(--fs));font-weight:700;color:#e6eefb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gcard .cnum{margin-left:auto;font-size:calc(10.5px*var(--fs));color:var(--gc);font-family:ui-monospace,Consolas,monospace;
+border:1px solid var(--gc);border-radius:9px;padding:1px 7px;opacity:.85;flex:none}
+.gcard .r2{font-size:calc(10.5px*var(--fs));color:#a9bad0;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gcard .r3{font-size:calc(10px*var(--fs));color:var(--mut);margin-top:3px;font-family:ui-monospace,Consolas,monospace;
+display:flex;justify-content:space-between}
+.gcard.hot{box-shadow:0 0 0 1.5px var(--gc),0 0 30px -6px var(--gc),0 14px 36px rgba(0,0,0,.75);z-index:99;filter:brightness(1.2)}
+.gcard.empty{opacity:.55;pointer-events:none}
+/* ---------- message viewer (big card) ---------- */
+#mask{position:fixed;inset:0;background:rgba(2,4,8,.72);backdrop-filter:blur(3px);z-index:48;display:none}
+/* R17（10-19）：任务流式视图——逐字渲染任务终态结果（WS 通道已有，补 /web 侧）。 */
+#stream{position:fixed;right:14px;bottom:72px;width:min(430px,46vw);max-height:46vh;display:flex;flex-direction:column;
+background:rgba(9,14,22,.92);border:1px solid var(--edge);border-radius:10px;z-index:47;font-size:calc(12px*var(--fs))}
+#st-hd{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--edge)}
+#st-hd .t{color:var(--cyan);letter-spacing:.12em}
+#st-hd input{flex:1;min-width:0;background:rgba(11,17,27,.7);border:1px solid var(--edge);border-radius:6px;
+color:#dce7f5;padding:4px 8px;font-family:ui-monospace,Consolas,monospace}
+#st-hd .btn{padding:4px 10px}
+#st-hd .s{color:#7f93ad;font-family:ui-monospace,Consolas,monospace}
+#st-out{margin:0;padding:10px;overflow:auto;white-space:pre-wrap;word-break:break-word;
+color:#cfe0f5;font-family:ui-monospace,Consolas,monospace;line-height:1.55;flex:1}
+#st-out .cur{color:var(--cyan)}
+#st-out .ok{color:#57e0a0}
+#st-out .bad{color:#ff7d8a}
+#viewer{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%) scale(.92);z-index:50;
+display:none;width:min(920px,92vw);height:min(600px,80vh);background:#0b1320;
+border:1.5px solid var(--vc,#38d6e6);border-radius:16px;overflow:hidden;
+box-shadow:0 0 44px -8px var(--vc,#38d6e6),0 30px 80px rgba(0,0,0,.8);
+transition:transform .28s cubic-bezier(.2,1.3,.4,1)}
+#viewer.show{display:flex;transform:translate(-50%,-50%) scale(1)}
+#vlist{width:280px;flex:none;border-right:1px solid var(--edge);background:rgba(6,10,17,.6);overflow-y:auto;padding:10px}
+#vlist .row{display:flex;gap:8px;align-items:center;padding:8px 9px;border-radius:8px;cursor:pointer;border:1px solid transparent;transition:border-color .15s,background .15s}
+#vlist .row:hover{background:rgba(108,168,255,.07)}
+#vlist .row.on{border-color:var(--vc);background:color-mix(in srgb,var(--vc) 9%,transparent)}
+#vlist .row .k{width:8px;height:8px;border-radius:2px;flex:none;box-shadow:0 0 6px var(--kc)}
+#vlist .row .t{font-size:calc(10px*var(--fs));color:var(--mut);flex:none;font-family:ui-monospace,Consolas,monospace}
+#vlist .row .s{font-size:calc(11px*var(--fs));color:#b7c6d9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:6px}
+/* R8（10-17 第十轮）：完整往来链里每条消息标注发件人 */
+#vlist .row .rf{font-size:calc(10px*var(--fs));color:#9fc3ef;flex:none;max-width:78px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,Consolas,monospace}
+#vmain{flex:1;padding:22px 26px 34px;overflow-y:auto;position:relative}
+/* R2（10-16 第五轮）：弹窗内滚动条深色定制——细窄圆角，thumb 随话题主题色 */
+#vlist,#vmain{scrollbar-width:thin;scrollbar-color:rgba(127,176,255,.32) rgba(255,255,255,.04)}
+#vlist::-webkit-scrollbar,#vmain::-webkit-scrollbar{width:9px;height:9px}
+#vlist::-webkit-scrollbar-track,#vmain::-webkit-scrollbar-track{background:rgba(255,255,255,.04);border-radius:8px}
+#vlist::-webkit-scrollbar-thumb,#vmain::-webkit-scrollbar-thumb{border-radius:8px;
+background:linear-gradient(180deg,color-mix(in srgb,var(--vc,#38d6e6) 42%,#16233a),color-mix(in srgb,var(--vc,#38d6e6) 22%,#16233a));
+border:2px solid transparent;background-clip:content-box}
+#vlist::-webkit-scrollbar-thumb:hover,#vmain::-webkit-scrollbar-thumb:hover{
+background:linear-gradient(180deg,color-mix(in srgb,var(--vc,#38d6e6) 65%,#1c2b40),color-mix(in srgb,var(--vc,#38d6e6) 40%,#1c2b40));
+background-clip:content-box}
+/* R2（10-16 第五轮）：上一组/下一组按钮移到弹窗外两侧（fixed，坐标由 posGNav 按窗体矩形贴外缘 12px；
+   空间不足才回退内侧贴边）。此前是 #viewer 内部悬浮、遮挡正文被否。 */
+.gn{position:fixed;top:50%;z-index:51;width:34px;height:56px;border-radius:10px;
+background:rgba(6,10,17,.8);border:1px solid color-mix(in srgb,var(--vc,#38d6e6) 50%,transparent);
+color:var(--vc,#38d6e6);font-size:26px;line-height:1;cursor:pointer;padding:0;display:none;
+align-items:center;justify-content:center;opacity:.82;transition:opacity .18s,box-shadow .18s,background .18s}
+.gn.show{display:flex}
+.gn:hover{opacity:1;background:rgba(13,20,32,.94);box-shadow:0 0 16px color-mix(in srgb,var(--vc,#38d6e6) 45%,transparent)}
+/* R13（10-17 第十三轮）：弹窗去掉话题标题行（#v-tp 废除）；序列号紧贴路由行上方 */
+#v-seq{font-size:calc(11px*var(--fs));color:var(--mut);margin:4px 0 10px;font-family:ui-monospace,Consolas,monospace}
+#v-hd{font-size:calc(12.5px*var(--fs));color:#9fb4cc;background:rgba(108,168,255,.06);border:1px dashed var(--edge);
+border-left:3px solid var(--vc);border-radius:8px;padding:7px 11px;margin-bottom:12px;
+display:flex;align-items:center;gap:12px}
+/* R13：路由胶囊行=左侧 A→B 胶囊 + 右侧元信息（原底部 #v-meta 并入，居右排列） */
+#v-caps{min-width:0;white-space:nowrap;overflow:hidden}
+#v-hmeta{margin-left:auto;display:inline-flex;align-items:center;gap:10px;white-space:nowrap;
+color:var(--mut);font-size:calc(11.5px*var(--fs));font-family:ui-monospace,Consolas,monospace}
+/* R1（10-17 第八轮）：弹窗路由=对话记录同款双层胶囊（CSS 与 src/api.rs 逐字一致） */
+.idc{display:inline-flex;align-items:center;justify-content:flex-end;background:var(--nc,#22344f);border-radius:13px;padding:2px 2px 2px 14px;margin-right:4px;vertical-align:middle;max-width:100%}
+.idc .idci{display:inline-block;border-radius:999px;padding:0 9px;font-weight:600;font-size:12px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;vertical-align:middle}
+/* R6（10-17 第十轮）：弹窗胶囊 hover 微动效与对话记录一致（cap-nudge keyframes 见上方 .agt 区，与 api.rs 逐字同源） */
+.idc:hover .idci{animation:cap-nudge .7s cubic-bezier(.34,1.2,.64,1) 1}
+@media (prefers-reduced-motion:reduce){.idc:hover .idci{animation:none}}
+.idn{opacity:.62;font-size:11px;margin-right:2px}
+.varr{opacity:.6;font-size:12px;padding:0 4px}
+#v-body{font-size:calc(14px*var(--fs));line-height:1.75;color:#eaf2fb;white-space:pre-wrap;word-break:break-all}
+#v-kind{border:1px solid var(--vc);color:var(--vc);border-radius:9px;padding:1px 9px}
+#v-x{position:absolute;top:10px;right:12px;font-size:calc(12px*var(--fs));color:var(--mut);cursor:pointer;z-index:2;padding:3px 10px;border:1px solid rgba(140,170,200,.35);border-radius:7px}
+#v-x:hover{color:#fff}
+#viewer .hint{position:absolute;bottom:8px;left:0;right:0;text-align:center;font-size:calc(10px*var(--fs));color:#3f5065;letter-spacing:.18em;pointer-events:none}
+/* ---------- bottom bar ---------- */
+#bar{position:fixed;left:0;right:0;bottom:0;height:58px;display:flex;align-items:center;gap:22px;padding:0 26px;z-index:30;
+background:linear-gradient(0deg,rgba(4,7,13,.85),transparent)}
+#bar .lbl{font-size:calc(11px*var(--fs));color:var(--mut);letter-spacing:.18em;white-space:nowrap}
+#win{-webkit-appearance:none;appearance:none;width:220px;height:3px;border-radius:2px;background:#1b2a40;outline:none;cursor:pointer}
+#win::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:var(--cyan);
+box-shadow:0 0 12px var(--cyan);cursor:pointer}
+#winv{font-size:calc(12px*var(--fs));color:var(--cyan);font-family:ui-monospace,Consolas,monospace;width:52px}
+/* R12（10-17 第十二轮）：实时按钮、时段弹出面板、时间区间文本全部废除——星图只提供实时视图 */
+#bar .btns{margin-left:auto;display:flex;gap:10px}
+.btn{font-size:calc(12px*var(--fs));color:#a9bcd2;border:1px solid var(--edge);border-radius:8px;padding:6px 14px;cursor:pointer;
+background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
+.btn:hover{color:#fff;border-color:var(--cyan);box-shadow:0 0 14px rgba(56,214,230,.3)}
+.btn.on{color:var(--cyan);border-color:var(--cyan)}
+</style>
+</head>
+<body>
+<div id="scan"></div>
+<div id="viewport"><div id="starfield"></div><div id="world">
+  <div id="stage" data-page="starmap">
+    <svg id="map"></svg>
+  </div>
+</div></div>
+<div id="topbar">
+  <div id="brand"><h1>AGENT<em>LINK</em> · 消息星图</h1></div>
+  <div id="hud"></div>
+</div>
+<div id="bar">
+  <span class="lbl">窗口长度</span><input id="win" type="range" min="60" max="3600" step="60" value="600"><span id="winv">10min</span>
+  <div class="btns">
+    <div class="btn" id="bReset">复位</div>
+    <div class="btn" id="bPause">流入</div>
+    <div class="btn" id="bSnap">截图</div>
+    <div class="btn" id="bRec">录屏</div>
+    <div class="btn" id="bFs">全屏</div>
+  </div>
+</div>
+<div id="mask"></div>
+<div id="stream" data-al-stream="panel">
+  <div id="st-hd">
+    <span class="t">任务流式视图</span>
+    <input id="st-tid" placeholder="task_id" autocomplete="off">
+    <button type="button" id="st-sub" class="btn">订阅</button>
+    <button type="button" id="st-clr" class="btn">清空</button>
+    <span id="st-st" class="s">待命</span>
+  </div>
+  <pre id="st-out" data-al-stream="out"></pre>
+</div>
+<div id="legend"></div>
+<div id="viewer">
+  <div id="vlist"></div>
+  <div id="vmain">
+   <span id="v-x">关闭</span>
+   <div id="v-seq"></div>
+   <div id="v-hd"><span id="v-caps"></span><span id="v-hmeta"><span id="v-time"></span><span id="v-kind"></span></span></div>
+   <div id="v-body"></div>
+  </div>
+  <div class="hint">点条目 / 滚轮 / ← → 翻页 · Shift+← → 换组 · ESC 关闭</div>
+</div>
+<button type="button" class="gn" id="gPrev" title="上一组话题（Shift+←）">‹</button>
+<button type="button" class="gn" id="gNext" title="下一组话题（Shift+→）">›</button>
+<script>
+
+const stageEl=document.getElementById("stage"),map=document.getElementById("map"),
+hud=document.getElementById("hud");
+let W=0,H=0;{const vr0=stageEl.getBoundingClientRect();W=vr0.width||innerWidth;H=vr0.height||innerHeight;}
+/* R2（10-17 第十轮）：偏左根因=W/H 在解析时取 innerWidth，iframe 首帧尺寸未定即全量落位错，
+   且 resize 缺 W0=0 时 rx=Infinity 打坏坐标。改为一律以 stage 实际 rect 为准，poll 开头 syncDims 对表自愈。 */
+const CUR={x:innerWidth/2,y:innerHeight/2};
+addEventListener("pointermove",e=>{CUR.x=e.clientX;CUR.y=e.clientY},{passive:true});
+function barH(){const b=document.getElementById("bar");return b?b.offsetHeight:56}
+// R5（10-16 第五轮）：节点圆缩小后，胶囊轨道同步收档（46–66 → 40–56）
+function orbR(){return Math.max(40,Math.min(56,(H-barH()-84)/7.2))}
+function staClamp(){const top=90,bot=Math.max(top+60,H-barH()-orbR()-30);return{top,bot}}
+const MACH={};let SELF=null,NODES=[],NAMES={},COLORS={},ST_ON=0,ST_ALL=0,AG_ALL=0;
+/* R6（10-16 第三轮）：图例点选显隐。hideNodes 按 node_id、hideAgt 按 agent_id 全局（与 R1 全局同色语义一致）；
+   统一在 activeMsgs 出口过滤 → 站台、卫星、卡组、徽章、HUD 一个口径，隐藏即整体从画面消失。localStorage 持久化。 */
+const hideNodes=new Set(),hideAgt=new Set();
+try{const _sh=JSON.parse(localStorage.getItem("starhide")||"{}");for(const x of(_sh.n||[]))hideNodes.add(x);for(const x of(_sh.a||[]))hideAgt.add(x);}catch(e){}
+function saveHide(){try{localStorage.setItem("starhide",JSON.stringify({n:[...hideNodes],a:[...hideAgt]}))}catch(e){}}
+function epHid(k){if(!k)return false;const i=k.indexOf("|");const m=k.slice(0,i),a=k.slice(i+1);
+ return hideNodes.has(m)||(a!=="@node"&&hideAgt.has(a));}
+/* R1（10-16 第五轮）：幽灵白名单——节点=本机∪/v1/peers，agent=/v1/fleet/agents 注册表。
+   历史里出现过的已消失 id 不再建站；指向幽灵端点的消息与 epHid 同口径在出口统一过滤
+   （HUD/徽章/卡组/弹窗/粒子一个口径，满足"宁可少显示不能显示错"）。 */
+const LIVE_N=new Set(),LIVE_A=new Map();
+function ghost(k){if(!k)return true;const i=k.indexOf("|");const n=k.slice(0,i),a=k.slice(i+1);
+ return !LIVE_N.has(n)||(a!=="@node"&&!(LIVE_A.get(n)||new Set()).has(a));}
+function esc(s){return String(s==null?"":s).replace(/[&<"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function fnv(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)>>>0;}return h;}
+function fm32(x){x^=x>>>16;x=Math.imul(x,0x85ebca6b);x^=x>>>13;x=Math.imul(x,0xc2b2ae35);x^=x>>>16;return x>>>0}
+// 节点配色：按 node_id 哈希固定（改名/刷新不漂移）；深档 nodeCol=胶囊包边，亮档 staCol=站台展示
+function nodeHue(n){return fnv("N|"+String(n))%360}
+function nodeCol(n){return COLORS["node:"+n]||("hsl("+nodeHue(n)+",46%,30%)")}
+function staCol(n){return COLORS["node:"+n]||("hsl("+nodeHue(n)+",58%,66%)")}
+function staGlow(n){return COLORS["node:"+n]?COLORS["node:"+n]+"88":("hsla("+nodeHue(n)+",58%,64%,.5)")}
+// agent 卫星/胶囊色（10-16 第三轮 R1）：全部通道只由 agent_id 哈希派生——同 id 全网同色；
+// S/L 扰动位让不同 id 撞同色相时仍可区分。与 src/api.rs 必须逐字一致。
+function agHue(a){return fm32(fnv("|uo"+String(a)))%360}
+function agSat(a){return 46+(fm32(fnv("S|"+String(a)))%28)}
+function agLit(a){return 56+(fm32(fnv("L|"+String(a)))%24)}
+function agCol(n,a){return COLORS["agent:"+n+"|"+a]||("hsl("+agHue(a)+","+agSat(a)+"%,"+agLit(a)+"%)")}
+function agGlow(n,a){return COLORS["agent:"+n+"|"+a]?COLORS["agent:"+n+"|"+a]+"99":("hsla("+agHue(a)+","+(agSat(a)+8)+"%,"+(agLit(a)-14)+"%,.6)")}
+function colFor(nid,a){return a?agCol(nid,a):staCol(nid)}
+// 手选色可能是深 hex——按亮度给胶囊内文字配可读前景（与 api.rs onCol 逐字一致）
+function onCol(c){if(typeof c==="string"&&c[0]==="#"&&c.length===7){const r=parseInt(c.substr(1,2),16),g=parseInt(c.substr(3,2),16),b=parseInt(c.substr(5,2),16);return (0.299*r+0.587*g+0.114*b)>150?"#0b1420":"#eef4fb";}return "#0b1420";}
+// 实体键 "<node>|<agent|@node>" → 双层胶囊（10-17 第八轮 R1：与对话记录 chip() 同构）
+function capHtml(k){const i=k.indexOf("|");const n=k.slice(0,i);const a=k.slice(i+1);
+ if(a==="@node")return `<span style="color:${staCol(n)}" title="${esc(n)}">●</span><span class="idn">${esc(nmOf(n))}</span>`;
+ const c=agCol(n,a);
+ return `<span class="idc" style="--nc:${nodeCol(n)}" title="${esc(n)} / ${esc(a)}"><span class="idci" style="background:${c};color:${onCol(c)}">${esc(a)}</span></span><span class="idn" style="color:${staCol(n)};opacity:.85" title="${esc(n)}">${esc(nmOf(n))}</span>`;}
+function routeHtml(m){return capHtml(m.f)+'<span class="varr">→</span>'+capHtml(m.to);}
+function who(nid){return NAMES[nid]||nid;}
+function nmOf(nid){return (MACH[nid]&&MACH[nid].lab)||who(nid)}
+const T=(id,name,color,msgs)=>({id,name,color,msgs});
+const M=(t,f,to,body,kind="msg")=>({t,f:a2k(f),to:a2k(to),body,kind});
+function a2k([m,a]){return m+"|"+a}
+let TOPICS=[];
+/* ---------- positions (draggable) ---------- */
+const STA={},AGTP={}; /* AGTP[key]={dx,dy} offset from station center */
+const AGP={};         /* 用户手动拖过的胶囊：initPos 重排时保留其位 */
+function initPos(){const cl=staClamp(),r=orbR()+44;for(const m in MACH){const c=MACH[m];if(!STA[m])STA[m]={x:c.x*W,y:Math.max(cl.top,Math.min(cl.bot,c.y*H))};
+ c.agents.forEach((a,i)=>{const k=a2k([m,a]);if(AGP[k])return;
+  const ang=Math.PI/2+i*(2*Math.PI/Math.max(c.agents.length,3));
+  AGTP[k]={dx:Math.cos(ang)*r,dy:Math.sin(ang)*r};});
+ if(!AGTP[a2k([m,"@node"])])AGTP[a2k([m,"@node"])]={dx:0,dy:0};}}
+/* R14-A（10-17 第十四轮）：agPos 出口叠加 AVO 临时避让偏移（不写 AGTP/AGP/STA，不持久化）。 */
+function agPos(k){const[m]=k.split("|");const s=STA[m],o=AGTP[k],v=AVO[k];return{x:s.x+o.dx+(v?v.x:0),y:s.y+o.dy+(v?v.y:0)};}
+/* ---------- time window ---------- */
+let winS=600;const T0=Date.now();
+/* R12（10-17 第十二轮）：时段模式废除——时间窗恒为跟随现在的滑窗（[now-winS, now]），窗口长度最大 1 小时。 */
+function wBounds(){return [Date.now()-winS*1000,Date.now()];}
+function activeMsgs(){const out=[],now=Date.now(),b=wBounds();for(const tp of TOPICS)for(const msg of tp.msgs){msg.t=-Math.round((now-msg.abs)/1000);if(msg.abs>=b[0]&&msg.abs<=b[1]&&!epHid(msg.f)&&!epHid(msg.to)&&!ghost(msg.f)&&!ghost(msg.to))out.push({...msg,tp});}return out;}
+function hashK(s){let h=17;for(const c of s)h=Math.imul(h^c.charCodeAt(0),2654435761);return Math.abs(h);}
+function qp(p1,p2,bow,u){const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2,dx=p2.x-p1.x,dy=p2.y-p1.y,L=Math.hypot(dx,dy)||1;
+ const qx=mx+(-dy/L)*bow,qy=my+(dx/L)*bow,it=1-u;
+ return{x:it*it*p1.x+2*it*u*qx+u*u*p2.x,y:it*it*p1.y+2*it*u*qy+u*u*p2.y};}
+function chanD(p1,p2,bow){const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2,dx=p2.x-p1.x,dy=p2.y-p1.y,L=Math.hypot(dx,dy)||1;
+ return`M ${p1.x} ${p1.y} Q ${mx+(-dy/L)*bow} ${my+(dx/L)*bow} ${p2.x} ${p2.y}`;}
+function bowOf(k){return 34+(hashK(k)%26);}
+/* ---------- stations & agents dom ---------- */
+const staEl={},agtEl={};
+function shortNm(lab,m){const s=String(lab||"").trim();if(!s)return m===SELF?"本机":"节点";if(s.length<=4)return s;if(s.length<=7)return `<span style="font-size:calc(6.5px*var(--fs));letter-spacing:.02em">${esc(s)}</span>`;return esc(s.slice(0,4))+"…";}
+function buildWorld(){
+ for(const m in MACH){const c=MACH[m];const d=document.createElement("div");d.className="station";
+ d.style.setProperty("--sc",c.col);d.style.setProperty("--scg",staGlow(m));
+ d.innerHTML=`<div class="ring"></div><div class="pulse"></div><div class="orb"></div><div class="glyph"><span>${shortNm(c.lab,m)}</span></div><div class="lab"><i>${esc(c.ip)}</i></div>`;
+ d.dataset.m=m;stageEl.appendChild(d);staEl[m]=d;
+ d.addEventListener("pointerdown",e=>startDrag(e,"station",m));}
+ for(const m in MACH){const k=a2k([m,"@node"]);
+  const w2=document.createElement("div");w2.className="dwrap";stageEl.appendChild(w2);dwraps[k]=w2;
+  const st=staEl[m];
+  st.addEventListener("pointerenter",()=>{hovSta=m;reveal(k);applyLanes();});
+  st.addEventListener("pointerleave",()=>scheduleHide(k));
+  w2.addEventListener("pointerenter",()=>{hovSta=m;cancelTomb(k);if(opentomb[k]){clearTimeout(opentomb[k]);opentomb[k]=null;}setDeckOpen(k,true);applyLanes();});
+  w2.addEventListener("pointerleave",()=>{clearOpenTomb(k);opentomb[k]=setTimeout(()=>{opentomb[k]=null;setDeckOpen(k,false);scheduleHide(k);},140);});}
+ for(const m in MACH)for(const a of MACH[m].agents){const k=a2k([m,a]);
+ const d=document.createElement("div");d.className="agt";d.style.setProperty("--ac",agCol(m,a));
+ d.style.setProperty("--acg",agGlow(m,a));d.style.setProperty("--acn",nodeCol(m));
+ d.innerHTML=`<div class="dot"><span class="in" style="color:${onCol(agCol(m,a))}">${esc(a)}</span></div><div class="flash"></div><div class="badge">0</div>`;
+ stageEl.appendChild(d);agtEl[k]=d;
+ d.addEventListener("pointerdown",e=>startDrag(e,"agent",k));
+ d.addEventListener("pointerenter",()=>{hovAgt=k;reveal(k);applyLanes();});
+ d.addEventListener("pointerleave",()=>scheduleHide(k));
+ const w=document.createElement("div");w.className="dwrap";stageEl.appendChild(w);dwraps[k]=w;
+ w.addEventListener("pointerenter",()=>{hovAgt=k;cancelTomb(k);if(opentomb[k]){clearTimeout(opentomb[k]);opentomb[k]=null;}setDeckOpen(k,true);applyLanes();});
+ w.addEventListener("pointerleave",()=>{clearOpenTomb(k);opentomb[k]=setTimeout(()=>{opentomb[k]=null;setDeckOpen(k,false);scheduleHide(k);},140);});}}
+function placeWorld(){
+ for(const m in MACH){const s=STA[m];staEl[m].style.left=s.x+"px";staEl[m].style.top=s.y+"px";}
+ for(const k in agtEl){const p=agPos(k);const e=agtEl[k];e.style.left=p.x+"px";e.style.top=p.y+"px";}}
+/* R14-A（10-17 第十四轮）：拖动避让——AVO 临时偏移层（stage 像素），agPos 出口叠加，
+   连线/粒子/卡组经 agPos 自动跟随；AVOT 为目标偏移，rAF 滑移动画，松手清零后回位。 */
+const AVO={},AVOT={},AGSZ={};
+function pillSize(k){const e=agtEl[k];if(!e)return{w:90,h:18};
+ if(!AGSZ[k]){const d=e.querySelector(".dot");AGSZ[k]={w:(d&&d.offsetWidth)||90,h:(d&&d.offsetHeight)||18};}return AGSZ[k];}
+function agBase(k){const[m]=k.split("|");const s=STA[m],o=AGTP[k];return{x:s.x+o.dx,y:s.y+o.dy};}
+function avoidTargets(){ /* 被拖胶囊为唯一斥力源：其余胶囊沿中心连线推出到矩形不相交（外扩 6px），单枚上限 120px */
+ if(!drag||drag.kind==="station")return;
+ const P=agPos(drag.id),sP=pillSize(drag.id);
+ for(const k in agtEl){
+  if(k===drag.id){delete AVOT[k];continue;}
+  const B=agBase(k),sQ=pillSize(k);
+  const dx=B.x-P.x,dy=B.y-P.y,L=Math.hypot(dx,dy);
+  const needX=sP.w/2+sQ.w/2+10,needY=sP.h/2+sQ.h/2+10;/* R14-A：留 10px 外扩（恰好贴边解在渲染舍入后仍会被判叠，实测已验） */
+  let t=0;
+  if(Math.abs(dx)<needX&&Math.abs(dy)<needY){ /* 两矩形（含外扩）相交才避让 */
+   const ux=L?dx/L:0,uy=L?dy/L:-1; /* 中心重合：向上推 */
+   let tx=Infinity,ty=Infinity;
+   if(Math.abs(ux)>1e-3)tx=(needX-Math.abs(dx))/Math.abs(ux);
+   if(Math.abs(uy)>1e-3)ty=(needY-Math.abs(dy))/Math.abs(uy);
+   t=Math.min(120,Math.max(tx,ty));if(!isFinite(t))t=120;}
+  AVOT[k]={x:(L?dx/L:0)*t,y:(L?dy/L:(dx?0:-1))*t};
+ }}
+let avRaf=null;
+function avTick(){
+ let busy=false;
+ for(const k in AVO){const tv=AVOT[k]||{x:0,y:0},v=AVO[k];
+  v.x+=(tv.x-v.x)*0.3;v.y+=(tv.y-v.y)*0.3;
+  if(Math.abs(tv.x-v.x)<0.3&&Math.abs(tv.y-v.y)<0.3){v.x=tv.x;v.y=tv.y;
+   if(tv.x===0&&tv.y===0)delete AVO[k];}else busy=true;}
+ for(const k in AVOT){if(!AVO[k]){const tv=AVOT[k];if(tv.x===0&&tv.y===0){delete AVOT[k];continue;}
+  AVO[k]={x:0,y:0};}}
+ placeWorld();renderLinks();for(const k in dwraps)posDwrap(k);
+ avRaf=busy?requestAnimationFrame(avTick):null;}
+function avKick(){if(avRaf===null)avRaf=requestAnimationFrame(avTick);}
+/* R14-A（10-17 第十四轮）：拖动中瞬时到位（滑移追不上快拖会残留叠帧，实测 CDP 路径验证）；滑移只用于松手回位。 */
+function avSnap(){for(const k in AVO){const t=AVOT[k];if(!t||(t.x===0&&t.y===0))delete AVO[k];else{const v=AVO[k];v.x=t.x;v.y=t.y;}}
+ for(const k in AVOT){const t=AVOT[k];if(t&&(t.x!==0||t.y!==0)&&!AVO[k])AVO[k]={x:t.x,y:t.y};}}
+function avoidClear(){for(const o of[AVO,AVOT,AGSZ])for(const k in o)delete o[k];}
+/* ---------- drag ---------- */
+let drag=null;
+function startDrag(e,kind,id){
+ e.preventDefault();
+ const base=kind==="station"?{sx:STA[id].x,sy:STA[id].y}:{sx:AGTP[id].dx,sy:AGTP[id].dy};
+ drag={kind,id,ox:e.clientX,oy:e.clientY,moved:false,...base};
+ if(kind!=="station")drag.r=Math.hypot(AGTP[id].dx,AGTP[id].dy)||orbR();
+ (kind==="station"?staEl[id]:agtEl[id]).classList.add("drag");}
+addEventListener("pointermove",e=>{
+ if(!drag)return;const dx=e.clientX-drag.ox,dy=e.clientY-drag.oy;
+ if(Math.abs(dx)+Math.abs(dy)>3)drag.moved=true;
+ if(!drag.moved)return;
+ if(drag.kind==="station"){const s=STA[drag.id];
+  s.x=Math.max(110,Math.min(W-110,drag.sx+dx));const cl=staClamp();s.y=Math.max(cl.top,Math.min(cl.bot,drag.sy+dy));
+ }else{const o=AGTP[drag.id];const st=STA[drag.id.split("|")[0]];
+  const ang=Math.atan2(e.clientY-st.y,e.clientX-st.x);
+  o.dx=Math.cos(ang)*drag.r;o.dy=Math.sin(ang)*drag.r;
+  avoidTargets();avSnap();}
+ placeWorld();renderLinks();for(const k in dwraps)posDwrap(k);});
+addEventListener("pointerup",()=>{
+ if(drag){const kind=drag.kind,id=drag.id,moved=drag.moved;
+  if(kind==="station")staEl[id].classList.remove("drag");else agtEl[id].classList.remove("drag");
+  drag=null;
+  /* R14-A（10-17 第十四轮）：拖拽结束清目标偏移，avTick 把被避让者滑回原位（station 拖拽不受影响）。 */
+  if(kind==="agent"){for(const k in AVOT)delete AVOT[k];avKick();}
+  if(moved&&kind!=="station")AGP[id]=1;
+  if(!moved){const t=kind==="station"?"sta":"agt",was=pinC&&pinC.t===t&&pinC.k===id;
+   clearPin();
+   if(!was){pinC={t,k:id};(kind==="station"?staEl[id]:agtEl[id]).classList.add("pinned");applyLanes();}}}});
+stageEl.addEventListener("pointerup",e=>{if(pinC&&!e.target.closest(".agt,.station,.dwrap"))clearPin();});
+/* ---------- links ---------- */
+let LINKS=[];
+function renderLinks(){
+ LINKS=[];const seen=new Set();
+ for(const m of activeMsgs()){const key=m.f+"=>"+m.to+"#"+m.tp.id;
+  if(seen.has(key))continue;seen.add(key);
+  LINKS.push({key,f:m.f,t:m.to,color:m.tp.color,first:m});}
+ /* R-fix（10-17）：innerHTML 全量替换会顺手抹掉飞行中粒子的 temp 连线——poke 400ms 快轮询
+    正好发生在 1.7s 飞行窗口内，线被抹、粒子裸飞、到达又整体重建，用户看不见连线。
+    保留尚未被永久线集合覆盖的 temp 线（同一 key 已有永久线则丢弃旧的，避免叠线）。 */
+ const temps=[...map.querySelectorAll(".lk.temp")].filter(t=>!seen.has(t.getAttribute("data-k")));
+ map.innerHTML=LINKS.map(l=>{const p1=agPos(l.f),p2=agPos(l.t);
+  return`<path class="lk" data-k="${l.key}" d="${chanD(p1,p2,bowOf(l.key))}" stroke="${l.color}" stroke-width="1.5"/>`;}).join("");
+ for(const t of temps)map.appendChild(t);
+ /* 飞行中的线在整体重建后须连续点亮（旧永久线节点被替换、闭包里的 ln 已脱离 DOM）：
+    把飞行实体重新绑到新节点并补 lit，避免"线亮→中途暗一截→到达才重新亮"的闪烁。 */
+ for(const e of liveAnims){if(!e.ln||e.ln.parentNode!==map){
+  const n=map.querySelector(`[data-k="${CSS.escape(e.key)}"]`);
+  if(n){e.rebind(n);n.classList.add("lit");}}}
+ paintLive(); /* R3：innerHTML 全量重建后给在期新消息链路补回 .live */
+ applyLanes();renderBadges();renderHud();}
+function lightLink(key){const p=map.querySelector(`[data-k="${CSS.escape(key)}"]`);if(!p)return;
+ p.classList.add("lit");setTimeout(()=>p.classList.remove("lit"),1200);}
+let hovAgt=null,hovSta=null,gTopic=null,gOwnerK=null,pinC=null,WSOK=false;
+function applyLanes(){const agts=new Set(),stas=new Set(),tps=new Set();
+ /* R3（10-17 第十轮）：轮询重建卡组会移除正被悬停的卡片，pointerleave 永不触发 → gTopic 残留，
+    之后所有悬停都被劫持进旧话题分支（"有卡片没连线"）。归属卡组不在悬停态即清除焦点。 */
+ if(gTopic){const od=gOwnerK?dwraps[gOwnerK]:null;if(!od||!od.matches(":hover")){gTopic=null;gOwnerK=null;}}
+ if(gTopic||VT){/* card/viewer focus: ONLY the relevant topic lanes + endpoints */
+  if(gTopic)tps.add(gTopic);if(VT)tps.add(VT.tp.id);}
+ else{if(hovAgt)agts.add(hovAgt);if(hovSta)stas.add(hovSta);
+  if(pinC){if(pinC.t==="agt")agts.add(pinC.k);else stas.add(pinC.k);}}
+ const glow=new Set();
+ for(const l of map.querySelectorAll(".lk:not(.temp)")){
+  const pk=l.getAttribute("data-k").split("#"),ends=pk[0].split("=>"),tpId=pk[1];
+  const a=ends[0],b=ends[1],sa=a.split("|")[0],sb=b.split("|")[0];
+  const hi=tps.has(tpId);
+  const byA=agts.has(a)||agts.has(b),byS=stas.has(sa)||stas.has(sb);
+  l.classList.toggle("on",!!(hi||byA||byS));l.classList.toggle("hl",!!(hi||byA||byS));
+  if(hi){glow.add(a);glow.add(b);}
+  else if(byA)glow.add(agts.has(a)?b:a);
+  else if(byS&&sa!==sb)glow.add(stas.has(sa)?b:a);}
+ for(const k in agtEl){const d=agtEl[k].querySelector(".dot");if(d)d.classList.toggle("glow",glow.has(k));}
+ for(const m in staEl){const o=staEl[m].querySelector(".orb");
+  if(o)o.classList.toggle("glow",[...glow].some(k=>k.split("|")[0]===m&&k.endsWith("@node")));}
+ /* R3（10-16 第四轮）：悬停/钉选节点 → 该节点全部 agent 胶囊提亮 */
+ const litSta=hovSta||(pinC&&pinC.t==="sta"?pinC.k:null);
+ for(const k in agtEl){const e=agtEl[k];if(e)e.classList.toggle("lit",!!litSta&&k.split("|")[0]===litSta);}}
+function hlLinks(){applyLanes();}
+function clearPin(){const had=pinC;pinC=null;document.querySelectorAll(".pinned").forEach(e=>e.classList.remove("pinned"));if(had)applyLanes();}
+/* ---------- badges / hud ---------- */
+function recvCount(k){let n=0;for(const m of activeMsgs())if(m.to===k)n++;return n;}
+function renderBadges(){for(const k in agtEl){const n=recvCount(k);const b=agtEl[k].querySelector(".badge");
+ b.textContent=n;b.classList.toggle("zero",n===0);}}
+function renderHud(){const ms=activeMsgs();
+ const recent=ms.filter(m=>m.t>=-30).length;
+ const push=WSOK?"实时":"轮询5s",pc=WSOK?"#43d97b":"#ffb347";
+ hud.innerHTML=`<span>窗口内 <b>${ms.length}</b></span><span>近30s <b>${recent}</b></span><span>节点 <b>${ST_ON}/${ST_ALL}</b></span><span>agents <b>${AG_ALL}</b></span><span>推送 <b style="color:${pc}">${push}</b></span>`;}
+/* ---------- per-agent topic decks ---------- */
+const dwraps={},deckOpen={},hideTimers={},opentomb={},dwAnchor={};
+function clearOpenTomb(k){if(opentomb[k]){clearTimeout(opentomb[k]);opentomb[k]=null;}}
+function cancelTomb(k){if(hideTimers[k]){clearTimeout(hideTimers[k]);hideTimers[k]=null;}}
+function scheduleHide(k){cancelTomb(k);hideTimers[k]=setTimeout(()=>{const dw=dwraps[k];
+ if(dw.matches(":hover")||opentomb[k])return;
+ dw.dataset.vis="0";deckOpen[k]=false;dw.style.display="none";
+ if(hovAgt===k)hovAgt=null;if(k.endsWith("@node")&&hovSta===k.split("|")[0])hovSta=null;applyLanes();},600);}
+function hlLinks(k,on){for(const l of map.querySelectorAll(".lk")){
+ const kf=l.getAttribute("data-k").split("=>")[0];
+ l.classList.toggle("hl",!!on&&kf===k);}}
+function groupsFor(k){const g=new Map(),tot={};
+ for(const m of activeMsgs()){tot[m.tp.id]=(tot[m.tp.id]||0)+1;if(m.to!==k&&m.f!==k)continue;
+  const r=g.get(m.tp.id)||{tp:m.tp,n:0,last:m,first:m,recv:0,lastRecv:null};
+  r.n++;r.last=m;if(m.t<r.first.t)r.first=m;
+  if(m.to===k){r.recv++;if(!r.lastRecv||m.t>r.lastRecv.t)r.lastRecv=m;}
+  g.set(m.tp.id,r);}
+ const out=[...g.values()].filter(r=>r.recv>0);
+ for(const r of out)r.tot=tot[r.tp.id]||r.n;
+ return out.sort((a,b)=>b.lastRecv.t-a.lastRecv.t);}
+/* R8（10-17 第十轮）：弹窗展示话题完整往来链——窗口/隐藏/幽灵过滤不变，但不再按实体切片，
+   该话题里所有发、收、第三方消息全部入列；与卡片「N 条」(=话题窗口内总条数) 同口径 */
+function chainFor(tpid){const tp=TOPICS.find(t=>t.id===tpid);if(!tp)return[];const now=Date.now(),b=wBounds();
+ const out=tp.msgs.filter(m=>{m.t=-Math.round((now-m.abs)/1000);
+  return m.abs>=b[0]&&m.abs<=b[1]&&!epHid(m.f)&&!epHid(m.to)&&!ghost(m.f)&&!ghost(m.to)});
+ out.sort((a,b)=>a.t-b.t);return out;}
+function lastInvolvedIdx(chain,k){for(let j=chain.length-1;j>=0;j--)if(chain[j].to===k||chain[j].f===k)return j;return chain.length-1;}
+function buildDeck(k){const dw=dwraps[k];const g=groupsFor(k);
+ dw.innerHTML=g.length?g.map((r,i)=>{const mins=Math.round(-r.lastRecv.t/60);
+  return`<div class="gcard" data-tp="${r.tp.id}" style="--gc:${r.tp.color};z-index:${i+1}">
+   <div class="r1"><span class="cdot"></span><span class="cname">${esc(r.tp.name)}</span><span class="cnum">${r.tot} 条</span></div>
+   <div class="r2">${esc(r.lastRecv.body)}</div>
+   <div class="r3"><span>${r.lastRecv.f.split("|")[1].replace("@node","node")} → ${r.lastRecv.to.split("|")[1].replace("@node","node")}</span><span>${mins}min 前</span></div></div>`;}).join(""):"";
+ dw.style.display=(g.length&&dw.dataset.vis==="1")?"block":"none";
+ dw.querySelectorAll(".gcard").forEach(c=>{
+  c.addEventListener("pointerenter",()=>{c.classList.add("hot");c.style.zIndex=99;gTopic=c.dataset.tp;gOwnerK=k;applyLanes();});
+  c.addEventListener("pointerleave",()=>{c.classList.remove("hot");
+   c.style.zIndex=[...dw.querySelectorAll(".gcard")].indexOf(c)+1;
+   if(gTopic===c.dataset.tp){gTopic=null;gOwnerK=null;}applyLanes();});
+  const openG=()=>{const tp=TOPICS.find(t=>t.id===c.dataset.tp);
+   const chain=chainFor(c.dataset.tp);
+   if(!chain.length)return;openViewer(tp,chain,lastInvolvedIdx(chain,k),k);};
+  c.addEventListener("click",openG);});
+ layoutDeck(k);}
+function layoutDeck(k){const dw=dwraps[k];const cards=[...dw.querySelectorAll(".gcard")];
+ const open=deckOpen[k];const ch1=cards[0]?cards[0].offsetHeight:72;const step=open?ch1+6:24;cards.forEach((c,i)=>{
+  c.style.display=(!open&&i>=4)?"none":"block";
+  c.style.top=(-(i*step))+"px";c.style.transform="none";});
+ let hit=dw.querySelector(".dkhit");
+ if(!hit){hit=document.createElement("div");hit.className="dkhit";dw.prepend(hit);}
+ const vis=cards.filter(c=>c.style.display!=="none");
+ const ch0=vis[0]?vis[0].offsetHeight:72,nn=Math.max(vis.length,1);
+ // hit zone must cover BOTH compact peek span and full open span, so gaps never fire pointerleave
+ const span=(open?ch1+6:24)*(nn-1);
+ hit.style.top=(-span-14)+"px";hit.style.left="-10px";hit.style.width=(236+20)+"px";
+ hit.style.height=(span+ch0+28)+"px";
+ let ch=dw.querySelector(".dmore");
+ if(!ch&&cards.length>4){ch=document.createElement("div");ch.className="dmore";dw.appendChild(ch);}
+ if(ch){ch.textContent=`+${cards.length-4} 个话题`;ch.style.display=open?"none":"block";ch.style.top=(-(4*24)-10)+"px";ch.style.left="12px";}
+ posDwrap(k);}
+// R2/R3（10-16 第三轮）：卡组锚定在 reveal() 时快照的光标位置，后续一切重排只读快照；
+// 水平=光标右侧 20px（右侧放不下才翻左，判定由快照坐标决定、重算结果恒定）；
+// 纵向=整叠卡组摆在光标右下方（露出的顶层边距光标 14px，不遮锚点胶囊），下方放不下才整体翻上方；
+// 两侧都放不下时钳进视口。光标移动/轮询重建均不重算锚点 → 零抖动。
+function posDwrap(k){const dw=dwraps[k];
+ const cards=[...dw.querySelectorAll(".gcard")].filter(c=>c.style.display!=="none");
+ const n=Math.max(cards.length,1),cardH=cards[0]?cards[0].offsetHeight:72,step=deckOpen[k]?cardH+6:24;
+ const span=(n-1)*step,PW=236;
+ let an=dwAnchor[k];if(!an)an=dwAnchor[k]={x:CUR.x,y:CUR.y};
+ let x=an.x+20;
+ if(x+PW>W-10&&an.x-20-PW>=10)x=an.x-20-PW;
+ x=Math.max(10,Math.min(W-10-PW,x));
+ const lo=10+span,hi=Math.max(lo,H-barH()-16-cardH);
+ let t=an.y+14+span;
+ if(t+cardH>H-barH()-16)t=an.y-14-cardH;
+ t=Math.max(lo,Math.min(hi,t));
+ dw.style.left=x+"px";dw.style.top=t+"px";}
+function setDeckOpen(k,open){if(!dwraps[k]||dwraps[k].style.display==="none")return;
+ deckOpen[k]=open;layoutDeck(k);}
+function reveal(k){const dw=dwraps[k];cancelTomb(k);
+ // R3：锚点只在悬停开始的这一刻快照，之后光标移动/轮询重排都不再读实时 CUR
+ dwAnchor[k]={x:CUR.x,y:CUR.y};
+ buildDeck(k);
+ /* R3（10-16 第五轮）：先建自己的卡组——若该实体一个卡片都没有，直接返回、不收任何别人的卡组。
+    修复"卡组摊在节点上方，鼠标路过节点感应区就把目标卡组误收掉、点不中"的问题。 */
+ if(!dw.querySelector(".gcard"))return;
+ // 悬停有卡片的实体时，无关卡组收起（改走 600ms 墓碑宽限而非瞬时隐藏：路过误触可被
+ // 原卡组的 pointerenter 撤销，真正走开才收，保持"无关卡片立收"观感）
+ for(const o in dwraps){if(o!==k&&dwraps[o].style.display!=="none"){cancelTomb(o);clearOpenTomb(o);scheduleHide(o);}}
+ dw.dataset.vis="1";dw.style.display="block";deckOpen[k]=false;layoutDeck(k);}
+function renderAllDecks(){for(const k in dwraps){const dw=dwraps[k];
+ /* R3：悬停展开中的卡组不重建——卡片 .hot 态与焦点不闪，离开后下轮自然更新 */
+ if(dw.style.display!=="none"&&dw.matches(":hover"))continue;buildDeck(k);}}
+/* ---------- viewer (big card) ---------- */
+const mask=document.getElementById("mask"),viewer=document.getElementById("viewer");
+let VT=null;
+function setVc(c){viewer.style.setProperty("--vc",c);for(const b of document.querySelectorAll(".gn"))b.style.setProperty("--vc",c);}
+/* R2（10-16 第五轮）：‹ › 贴弹窗外侧 12px。按窗体尺寸公式计算（窗恒居中），不读动画中的
+   getBoundingClientRect；某一侧窗外空间放不下才回退贴该侧内缘。 */
+function posGNav(){if(!VT)return;
+ const w=Math.min(920,innerWidth*.92),h=Math.min(600,innerHeight*.8);
+ const l=(innerWidth-w)/2,r=(innerWidth+w)/2,tp=(innerHeight-h)/2+h/2-28;
+ const bw=34,gap=12;
+ const prev=document.getElementById("gPrev"),next=document.getElementById("gNext");
+ let pl=l-gap-bw,pr=r+gap;
+ if(pl<6)pl=l+10;
+ if(pr+bw>innerWidth-6)pr=r-10-bw;
+ prev.style.left=pl+"px";prev.style.top=tp+"px";
+ next.style.left=pr+"px";next.style.top=tp+"px";
+ prev.style.right=next.style.right="";}
+function openViewer(tp,chain,i,k){if(!chain.length)return;VT={tp,chain,i,k:k||null};applyLanes();
+ setVc(tp.color);drawViewer();
+ mask.style.display="block";viewer.classList.add("show");updateGNav();}
+function drawViewer(){const m=VT.chain[VT.i];document.getElementById("vmain").scrollTop=0;
+ const vl=document.getElementById("vlist");
+ vl.innerHTML=VT.chain.map((x,idx)=>{const c=agCol(x.f.split("|")[0],x.f.split("|")[1]);
+  const snd=x.f.split("|")[1].replace("@node","整机");
+  return`<div class="row${idx===VT.i?' on':''}" data-i="${idx}" style="--kc:${c}"><span class="k" style="background:${c}"></span><span class="t">${fmtHM(x.t)}</span><span class="rf">${esc(snd)}</span><span class="s">${esc(x.body)}</span></div>`;}).join("");
+ vl.scrollTop=Math.max(0,(VT.i)*38-vl.clientHeight/2);
+ document.getElementById("v-seq").textContent=(VT.i+1)+" / "+VT.chain.length;
+ document.getElementById("v-caps").innerHTML=routeHtml(m);
+ document.getElementById("v-body").textContent=m.body;
+ document.getElementById("v-time").textContent="T-" + (-m.t) + "s · " + fmtClock(m.t);
+ document.getElementById("v-kind").textContent={msg:"消息",file:"文件",sys:"系统"}[m.kind]||m.kind;}
+function fmtHM(t){const d=new Date(Date.now()+t*1000);
+ return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");}
+function fmtClock(t){const d=new Date(Date.now()+t*1000);
+ return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")+":"+String(d.getSeconds()).padStart(2,"0");}
+function mv(d){VT.i=(VT.i+d+VT.chain.length)%VT.chain.length;drawViewer();}
+document.getElementById("vlist").addEventListener("click",e=>{const r=e.target.closest(".row");if(r&&VT){VT.i=+r.dataset.i;drawViewer();}});
+/* R1（10-16 第四轮）：滚轮分区——左列表滚动即切上/下一条；右正文优先原生滚动，到边界才切。
+   累积器 53px + 500ms 窗口：一格滚轮只跳一条，防快速连跳。 */
+let wAcc=0,wLast=0;
+function wheelNav(){if(!VT)return; if(Math.abs(wAcc)<53)return;mv(wAcc>0?1:-1);wAcc=0;}
+/* 窗口重置必须发生在“累加之前”，否则首个滚轮格会被清零吃掉 */
+function wheelFeed(d){const now=performance.now();if(now-wLast>500)wAcc=0;wLast=now;wAcc+=d;wheelNav();}
+document.getElementById("vlist").addEventListener("wheel",e=>{if(VT){e.preventDefault();
+ wheelFeed(e.deltaY||e.deltaX);}},{passive:false});
+document.getElementById("vmain").addEventListener("wheel",e=>{if(!VT)return;const vm=e.currentTarget;
+ const sbl=vm.scrollHeight>vm.clientHeight+2;
+ const atTop=vm.scrollTop<=1,atBot=vm.scrollTop+vm.clientHeight>=vm.scrollHeight-1;
+ if(sbl&&!((e.deltaY>0&&atBot)||(e.deltaY<0&&atTop)))return;
+ e.preventDefault();wheelFeed(e.deltaY||e.deltaX);},{passive:false});
+/* R2：弹窗两侧上一组/下一组按钮——不关弹窗沿 groupsFor(k) 序列环绕换组 */
+function updateGNav(){const n=(VT&&VT.k)?groupsFor(VT.k).length:0;
+ document.getElementById("gPrev").classList.toggle("show",n>1);
+ document.getElementById("gNext").classList.toggle("show",n>1);posGNav();}
+function gotoGroup(d){if(!VT||!VT.k)return;const gs=groupsFor(VT.k);if(gs.length<2)return;
+ let idx=gs.findIndex(r=>r.tp.id===VT.tp.id);if(idx<0)idx=0;
+ for(let n=0;n<gs.length;n++){idx=(idx+d+gs.length)%gs.length;
+  const chain=chainFor(gs[idx].tp.id);
+  if(chain.length){VT={tp:gs[idx].tp,chain,i:lastInvolvedIdx(chain,VT.k),k:VT.k};gTopic=null;
+   setVc(gs[idx].tp.color);applyLanes();drawViewer();updateGNav();return;}}}
+document.getElementById("gPrev").onclick=()=>gotoGroup(-1);
+document.getElementById("gNext").onclick=()=>gotoGroup(1);
+function closeViewer(){mask.style.display="none";viewer.classList.remove("show");VT=null;
+ document.getElementById("gPrev").classList.remove("show");
+ document.getElementById("gNext").classList.remove("show");applyLanes();}
+mask.onclick=closeViewer;document.getElementById("v-x").onclick=closeViewer;
+addEventListener("keydown",e=>{if(e.key==="Escape"){closeViewer();clearPin();}
+ else if(VT&&e.key==="ArrowLeft")e.shiftKey?gotoGroup(-1):mv(-1);
+ else if(VT&&e.key==="ArrowRight")e.shiftKey?gotoGroup(1):mv(1);});
+/* ---------- data layer (real AgentLink bus) ---------- */
+const LS_KEY="al_token";let TOKEN="";try{TOKEN=sessionStorage.getItem(LS_KEY)||""}catch(e){}
+const HDR=()=>({"X-Auth-Token":TOKEN});
+async function J(u){const c=new AbortController(),tm=setTimeout(()=>c.abort(),8000);let r;
+ /* R-fix（10-17）：半死连接下 fetch 无超时会永远挂住，polling 恒 true、后续所有 poll 直接 return——
+    新消息永不连线、页面死卡到手动刷新。8s abort 让卡死的轮询下轮自愈。 */
+ try{r=await fetch(u,{headers:HDR(),signal:c.signal})}finally{clearTimeout(tm);}
+ if(r.status===401)throw new Error("未授权：请先在主控制台页面输入 token（同会话 sessionStorage 共享）");
+ if(!r.ok)throw new Error(u+" HTTP "+r.status);return r.json();}
+function setErr(t){const e=document.getElementById("err");if(!e)return;e.style.display=t?"block":"none";e.textContent=t||"";}
+function fmtSize(b){b=+b||0;if(b<1024)return b+" B";if(b<1048576)return (b/1024).toFixed(1)+" KB";return (b/1048576).toFixed(2)+" MB";}
+function payText(e){const p=e.payload;
+ if(p&&typeof p==="object"){if(typeof p.content==="string")return p.content;
+  if(p.file_name)return "文件 "+p.file_name+(p.size!==undefined?"（"+fmtSize(p.size)+"）":"");
+  try{return JSON.stringify(p)}catch(err){return String(p)}}
+ return String(p==null?(e.action||""):p);}
+const PAL=["#38d6e6","#43d97b","#ffb347","#c77dff","#7fb0ff","#ff5c7a","#8fd0ff","#e88fd0","#7ee7f2","#9adf8a","#f2c14e","#5ad1b4"];
+/* R4（10-16 第五轮）：默认布局=同心环贪心（外环优先；每环容量按"相邻圆心弦长≥最小间距"约束，
+   放满才进内环），保持"本机居中、众星拱之"语义且确定性可复现。
+   算法调研：①Fruchterman-Reingold 等力导向——迭代收敛依赖初值，5s 轮询重建世界会抖动，弃；
+   ②Poisson 盘/maximin 贪心——最大化最小间距但点位无规律、失去星图语义，弃；
+   ③黄金角向日葵螺旋——确定性均铺但近邻间距无硬保证，弃。 */
+function minSep(){return 2*(orbR()+44)+120;}
+function frSelf(){const cl=staClamp();return[.5,(cl.top+cl.bot)/2/H]}
+function layoutPlan(n){if(n<=0)return[];const cl=staClamp(),sep=minSep();
+ const cx=W/2,cy=(cl.top+cl.bot)/2;
+ const ax=Math.max(cx-110,150),ay=Math.max((cl.bot-cl.top)/2,110),eff=Math.min(ax,ay);
+ const pts=[];let left=n,ring=0;
+ for(const t of[1,0.62,0.40,0.25]){if(left<=0)break;
+  const rr=eff*t;let cap=3;
+  if(sep<2*rr)cap=Math.max(3,Math.floor(Math.PI/Math.asin(sep/(2*rr))));
+  const m=Math.min(cap,left);left-=m;
+  const ph=ring%2?Math.PI/m:0;
+  for(let i=0;i<m;i++){const a=-Math.PI/2+ph+i*2*Math.PI/m;
+   pts.push([(cx+ax*t*Math.cos(a))/W,(cy+ay*t*Math.sin(a))/H]);}
+  ring++;}
+ while(left-->0){const a=-Math.PI/2+left*1.7;
+  pts.push([(cx+ax*.25*Math.cos(a))/W,(cy+ay*.25*Math.sin(a))/H]);}
+ return pts;}
+function frNew(nid){if(nid===SELF)return frSelf();
+ const j=Object.keys(MACH).filter(k=>k!==SELF).length;return layoutPlan(Math.max(j+1,1))[j]||frSelf();}
+// 每轮 loadTopo 后按当前窗口重算默认位（分数坐标；用户拖拽位存 STA，不受影响）
+function applyDefaultLayout(){const others=NODES.filter(x=>x.id!==SELF);const plan=layoutPlan(others.length);
+ const fc=frSelf();
+ NODES.forEach(n=>{const m=MACH[n.id];if(!m)return;
+  if(n.id===SELF){m.x=fc[0];m.y=fc[1];}
+  else{const i=others.findIndex(x=>x.id===n.id);const p=plan[i];if(p){m.x=p[0];m.y=p[1];}}});}
+function ensureEnd(k){if(ghost(k))return;const[nid,a]=k.split("|");
+ if(!MACH[nid]){const f=frNew(nid);
+  MACH[nid]={lab:who(nid),ip:"?",x:f[0],y:f[1],col:colFor(nid,""),agents:[]};}
+ if(a!=="@node"&&!MACH[nid].agents.includes(a))MACH[nid].agents.push(a);}
+/* R1 补充：agent 胶囊名单 = 注册表 ∪ 窗口内活跃 agent。注册表是权威来源（fleet/agents
+   本身带 ghost guard），在册但闲置的 agent 不删；窗口外且未注册的历史 id 不补——
+   幽灵 agent 的胶囊不再出现，其消息也在出口统一被滤。 */
+function growLive(k){if(!k||ghost0(k))return;const i=k.indexOf("|"),n=k.slice(0,i),a=k.slice(i+1);
+ if(a==="@node")return;const s=LIVE_A.get(n)||new Set();s.add(a);LIVE_A.set(n,s);}
+function ghost0(k){const i=k.indexOf("|");return !LIVE_N.has(k.slice(0,i));}
+function mergeAgents(){for(const n of NODES){const mm=MACH[n.id];if(!mm)continue;
+ const set=new Set(mm.agents);for(const a of LIVE_A.get(n.id)||[])set.add(a);mm.agents=[...set].sort();}}
+async function loadTopo(){
+ if(!TOKEN){try{const _c=new AbortController(),_t=setTimeout(()=>_c.abort(),8000);
+   const r=await fetch("/web/setup",{signal:_c.signal});clearTimeout(_t);const d=await r.json();
+   if(d&&d.ok&&d.token){TOKEN=d.token;try{sessionStorage.setItem(LS_KEY,TOKEN)}catch(e){}}}catch(e){}}
+ const [st,pr,ag,co]=await Promise.all([J("/v1/status"),J("/v1/peers"),J("/v1/fleet/agents"),J("/v1/colors")]);
+ SELF=st.node_id;NAMES={};NODES=[{id:SELF,name:st.name||SELF,online:true,ip:"本机"}];
+ for(const p of(pr.peers||[]))NODES.push({id:p.node_id,name:p.name||p.node_id,online:!!p.online,ip:String(p.addr||"").split(":")[0]||"—"});
+ if(st.name)NAMES[SELF]=st.name;
+ for(const p of(pr.peers||[]))if(p.name)NAMES[p.node_id]=p.name;
+ COLORS=(co&&co.colors)||{};
+ const byNode={};for(const a of(ag.agents||[])){(byNode[a.node_id]=byNode[a.node_id]||new Set()).add(a.agent_id);if(a.node_name)NAMES[a.node_id]=a.node_name;}
+ ST_ON=NODES.filter(n=>n.online).length;ST_ALL=NODES.length;AG_ALL=[...new Set((ag.agents||[]).map(x=>x.node_id+"|"+x.agent_id))].length;
+ /* R1：每轮重建节点白名单，先删掉已从 peers 表消失的幽灵站台（连同其全部胶囊）；
+    agent 基础名单取注册表，窗口内活跃 agent 稍后在 poll 里并入（见 mergeAgents）。 */
+ LIVE_N.clear();LIVE_A.clear();
+ for(const n of NODES)LIVE_N.add(n.id);
+ for(const nid in byNode)LIVE_A.set(nid,new Set(byNode[nid]));
+ for(const nid in MACH)if(!LIVE_N.has(nid))delete MACH[nid];
+ NODES.forEach((n)=>{if(!MACH[n.id])MACH[n.id]={lab:n.name,ip:n.ip||"—",x:.5,y:.5,col:colFor(n.id,""),agents:[]};
+  const m=MACH[n.id];m.lab=n.name;m.online=n.online;if(n.ip&&n.ip!=="—")m.ip=n.ip;m.col=colFor(n.id,"");
+  m.agents=[...(LIVE_A.get(n.id)||[])].sort();});
+ applyDefaultLayout();
+}
+function msgOf(e){const abs=Date.parse(e.ts)||0,nid=(typeof e.node==="string"&&e.node)?e.node:SELF;
+ if(!MACH[nid]&&LIVE_N.has(nid)){const f=frNew(nid);
+  MACH[nid]={lab:who(nid),ip:"?",x:f[0],y:f[1],col:colFor(nid,""),agents:[]};}
+ const fk=String(e.from)+"|"+(e.from_agent||"@node"),tk=String(e.to)+"|"+(e.to_agent||"@node");
+ ensureEnd(fk);ensureEnd(tk);
+ return{id:e.msg_id,abs,f:fk,to:tk,body:payText(e),
+  kind:e.kind==="file"?"file":(e.kind==="sys"||e.kind==="control"||e.kind==="ack"?"sys":"msg")};}
+function buildTopics(ents){const byId={};for(const e of ents)byId[e.msg_id]=e;
+ const rootOf=e=>{let cur=e,g=0;while(cur&&cur.reply_to&&byId[cur.reply_to]&&g++<500)cur=byId[cur.reply_to];return cur;};
+ const groups={};
+ for(const e of ents){
+  /* R2（10-18 第十五轮）消息组：显式 thread 键优先归组（同 thread=同一张卡）；
+     无 thread 回退 reply_to 链根（旧行为不变）。组键加 t: 前缀 +
+     encodeURIComponent，避免与 msg_id 相撞、attribute 注入安全。 */
+  const thr=String(e.thread||"").trim();let rid,nm0;
+  if(thr){rid="t:"+encodeURIComponent(thr);nm0=thr;}
+  else{const r=rootOf(e);rid=(r&&r.msg_id)||e.reply_to||e.msg_id;nm0=r?payText(r):("话题 "+String(rid).slice(0,8));}
+  let tp=groups[rid];if(!tp){
+   tp=groups[rid]=T(rid,String(nm0).replace(/\s+/g," ").slice(0,26),PAL[hashK(rid)%PAL.length],[]);}
+  tp.msgs.push(msgOf(e));}
+ TOPICS=Object.values(groups);for(const tp of TOPICS)tp.msgs.sort((x,y)=>x.abs-y.abs);}
+const KNOWN=new Set();let WSIG="";
+let polling=false,pollAgain=false;
+async function poll(){if(polling){pollAgain=true;return;}polling=true;
+ try{sizeUp();await loadTopo();
+  const d=await J("/v1/history/search?limit=1500&max_mb=192&scope=all");
+  if(!d||d.ok!==true){await syncWorld();applyHide();setErr((d&&d.error==="history disabled")?"总线未启用历史记录（config history.enabled=false）":"查询失败："+((d&&d.error)||"未知"));renderLinks();renderAllDecks();return;}
+  setErr("");
+  buildTopics((d.matches||[]).slice().sort((x,y)=>String(x.ts).localeCompare(String(y.ts))));
+  /* R1 补充：窗口内活跃 agent 并入白名单，重算各站台胶囊名单（世界签名变化则自动重建） */
+  {const cut=wBounds()[0];
+   for(const tp of TOPICS)for(const m of tp.msgs)if(m.abs>=cut){growLive(m.f);growLive(m.to);}
+   mergeAgents();}
+  await syncWorld();applyHide(); /* world built AFTER msgs registered: agents from history+fleet in one shot */
+  renderLinks();renderAllDecks();
+ const edge=!paused;const fresh=[];
+  for(const tp of TOPICS)for(const m of tp.msgs)if(!KNOWN.has(m.id)){KNOWN.add(m.id);if(edge&&m.abs>=Date.now()-90000&&!epHid(m.f)&&!epHid(m.to)&&!ghost(m.f)&&!ghost(m.to))fresh.push([tp,m]);}
+  /* R1（10-17 第十轮）：flyIn 移到 renderLinks 之后——临时链路不再被重建清掉，
+   永久链路已存在时直接点亮；每轮最多 8 个粒子，超预算只做徽章 ping；
+   单轮新增 >60 视为突发（历史回填/高频风暴），不飞粒子——主线程不再被拖住 */
+  if(fresh.length>60){for(let i=0;i<Math.min(fresh.length,16);i++)deliver(fresh[i][1].to);}
+  else{let budget=8;for(const [tp,m] of fresh){if(budget-->0)flyIn(tp,m);else deliver(m.to);}}
+  /* R3（10-18 第十五轮）：粒子预算/突发降级只影响动画；亮线另走保活集合，同帧补齐 */
+  markFreshLive();
+ }catch(e){setErr(String(e.message||e));}
+ finally{flushLateLit();restoreHov();polling=false;if(pollAgain){pollAgain=false;poll();}}}
+function worldSig(){let s="";for(const m in MACH)s+=m+"|"+MACH[m].lab+"|"+MACH[m].ip+"|"+MACH[m].agents.join(",")+";";return s;}
+async function syncWorld(){const sg=worldSig();if(sg===WSIG)return;WSIG=sg;
+ avoidClear(); /* R14-A（10-17 第十四轮）：整体重建世界前作废 AVO 偏移与胶囊尺寸缓存（agtEl 将重填）。 */
+ if(Object.keys(STA).length){
+  /* R-fix（10-17）：整体换 DOM 会销毁鼠标下的胶囊/卡组，新元素对静止光标不会自发补发 pointerenter——
+     悬停断线断卡直到移动鼠标或刷新。快照悬停实体与卡组锚点，poll 尾部 restoreHov 补发；
+     飞行中粒子改走 cancelLiveAnims(false) 非静默取消，重建后由 flushLateLit 补放闪光。 */
+  hovPrev=null;
+  if(hovAgt)hovPrev={k:hovAgt,isSta:false,an:dwAnchor[hovAgt]?{x:dwAnchor[hovAgt].x,y:dwAnchor[hovAgt].y}:null};
+  else if(hovSta){const kk=a2k([hovSta,"@node"]);hovPrev={k:kk,isSta:true,an:dwAnchor[kk]?{x:dwAnchor[kk].x,y:dwAnchor[kk].y}:null};}
+  stageEl.innerHTML="";
+  /* R3-a（10-18 第十五轮）：svg#map 就住在 stage 里——整体清场把它连同连线宿主一起抹了，
+     此后 renderLinks/flyIn 全写进游离树：DOM 里 0 条 .lk、悬停有卡片没连线、HUD 照常计数，
+     只有刷新重载 HTML 才找回 svg——正是"连线偶发不出现、刷新才恢复"的主根因（名单一变必踩）。
+     清场后立刻把 svg 放回 stage（buildWorld 随后 appendChild，svg 仍在最底层）。 */
+  stageEl.appendChild(map);
+  for(const o of[dwraps,deckOpen,hideTimers,opentomb,dwAnchor,agtEl,staEl])for(const k in o)delete o[k];
+  hovAgt=hovSta=gTopic=gOwnerK=pinC=null;cancelLiveAnims(false);if(VT)closeViewer();}
+ initPos();buildWorld();placeWorld();}
+let hovPrev=null;
+function restoreHov(){const p=hovPrev;hovPrev=null;if(!p)return;
+ const dw=dwraps[p.k];if(!dw)return;
+ if(p.an&&Math.hypot(CUR.x-p.an.x,CUR.y-p.an.y)>320)return;
+ if(p.isSta)hovSta=p.k.split("|")[0];else hovAgt=p.k;
+ reveal(p.k);applyLanes();}
+function renderLegend(){const el=document.getElementById("legend");if(!el)return;const seen={};
+ for(const m in MACH)for(const a of MACH[m].agents)if(!(a in seen))seen[a]=agCol(m,a);
+ const nrow=Object.keys(MACH).filter(m=>m!=="*").map(m=>`<span class="lgi${hideNodes.has(m)?" off":""}" data-t="n" data-k="${esc(m)}"><span class="dotl" style="background:${staCol(m)}"></span>${esc(nmOf(m))}</span>`).join("");
+ const arow=Object.entries(seen).slice(0,16).map(([a,c])=>`<span class="lgi${hideAgt.has(a)?" off":""}" data-t="a" data-k="${esc(a)}"><span class="dotl" style="background:${c}"></span>${esc(a)}</span>`).join("");
+ el.innerHTML=`<div class="lgrow"><span class="lgsec">节点</span>${nrow}</div><div class="lgrow"><span class="lgsec">Agent</span>${arow}</div>`;
+ el.querySelectorAll(".lgi").forEach(s=>{s.onclick=()=>{const set=s.dataset.t==="n"?hideNodes:hideAgt,k=s.dataset.k;
+  if(set.has(k))set.delete(k);else set.add(k);saveHide();applyHide();};});}
+function applyHide(){renderLegend();
+ /* R-fix（10-17）：原来每轮 poll 无条件 cancelLiveAnims()——poke 400ms 快轮询正好落在 1.7s 飞行窗口内，
+    粒子被绞杀、连线永远不亮，且消息已入 KNOWN 不再重飞，只能刷新（清 KNOWN）才看得见——就是"新消息没有连线"。
+    现在只静默取消命中隐藏/幽灵端点的飞行，其余任其飞完。 */
+ for(const e of liveAnims.slice())if(epHid(e.f)||epHid(e.to)||ghost(e.f)||ghost(e.to))e.cancel(true);
+ for(const m in staEl){const h=hideNodes.has(m);staEl[m].classList.toggle("hid",h);
+  const w=dwraps[a2k([m,"@node"])];if(h&&w){w.style.display="none";w.dataset.vis="0";deckOpen[a2k([m,"@node"])]=false;}}
+ for(const k in agtEl){const h=epHid(k);agtEl[k].classList.toggle("hid",h);
+  const w=dwraps[k];if(h&&w){w.style.display="none";w.dataset.vis="0";deckOpen[k]=false;}}
+ if(hovAgt&&epHid(hovAgt))hovAgt=null;if(hovSta&&hideNodes.has(hovSta))hovSta=null;
+ renderLinks();}
+/* ---------- live flight: only real new messages animate ---------- */
+let paused=false;
+const liveAnims=[];
+/* R-fix（10-17）：取消飞行粒子分两种语义——silent（切时间窗/暂停/清理，规格要求静默取消，不补）；
+   非 silent（名单重建，消息是真的）只停粒子，进 lateLit 队列，由 poll 尾部 flushLateLit 补放连线闪光+徽标 ping。 */
+let lateLit=[];
+function cancelLiveAnims(silent){while(liveAnims.length){try{liveAnims[liveAnims.length-1].cancel(silent!==false);}catch(e){liveAnims.pop();}}}
+function flashDot(k,cls){const el=agtEl[k];if(!el)return;const f=el.querySelector("."+cls);
+ if(!f)return;f.classList.remove("fire");void f.offsetWidth;f.classList.add("fire");}
+function deliver(k){const el=agtEl[k];if(!el)return;const b=el.querySelector(".badge");
+ b.classList.remove("ping");void b.offsetWidth;b.classList.add("ping");}
+/* R-fix：名单重建（非静默取消）攒下的迟到闪光——重建与 renderLinks 之后统一补放，消息不再"无声吞线" */
+function flushLateLit(){if(!lateLit.length)return;const q=lateLit;lateLit=[];
+ for(const e of q){lightLink(e.key);deliver(e.to);}}
+/* ---------- R3（10-18 第十五轮）：持久亮线——连线可见性与粒子动画解耦 ----------
+   原病根：一条新消息的连线唯一可见载体是 1.7s temp 线 + 1.2s .lit 闪光，KNOWN 只做粒子去重
+   却顺带决定"这轮还认不认它是新消息"——后台标签页积压、单轮突发>60（只 ping 不飞）、名单重建
+   吞线这三类场景里，闪光与 temp 线要么根本没机会渲染、要么渲染在游离/不可见树上，用户从来看
+   不到线，只能刷新（清 KNOWN）重放。现在改为：窗口内每条新消息（90s 回看）进 LIVEM 保活集合，
+   其链路以 .live 类持续显示 60s 或至滑出窗口/端点隐身，到期由 3s 心跳 sweep 静默撤。
+   亮线只是给 renderLinks 已画好的永久 path 加类——合并入帧、无逐条动画，突发>60 也照补。
+   标记门控"页面可见且未暂停"：隐藏期间 poll 照常更新 KNOWN/徽章（粒子去重语义不变），但
+   不白闪；回前台 visibilitychange 立刻补一轮 poll，把"近90s 内未亮过"的消息统一补亮线，
+   不重飞粒子。KNOWN 语义保持不变（仅粒子去重），线可见性不再依赖它。 */
+const LIVEM=new Set(),LIVEK=new Map(),LITSEEN=new Set();
+const LIVE_MS=60000,LIT_BACK=90000;
+let liveTickT=null;
+function liveDisp(m){return !epHid(m.f)&&!epHid(m.to)&&!ghost(m.f)&&!ghost(m.to);}
+function markLive(m,tp){LITSEEN.add(m.id);LIVEM.add(m.id);LIVEK.set(m.id,{k:m.f+"=>"+m.to+"#"+tp.id,ts:m.abs});}
+function paintLive(){const ks=new Set();for(const id of LIVEM){const v=LIVEK.get(id);if(v)ks.add(v.k);}
+ for(const l of map.querySelectorAll(".lk"))l.classList.toggle("live",ks.has(l.getAttribute("data-k")));}
+function sweepLive(){liveTickT=null;const now=Date.now(),cut=wBounds()[0];
+ for(const[id,v]of[...LIVEK])if(now-v.ts>LIVE_MS||v.ts>now+60000){LIVEK.delete(id);LIVEM.delete(id);}
+ for(const tp of TOPICS)for(const m of tp.msgs)if(LIVEM.has(m.id)&&(m.abs<cut||!liveDisp(m)))LIVEM.delete(m.id);
+ paintLive();
+ if(LIVEK.size)liveTickT=setTimeout(sweepLive,3000);}
+function markFreshLive(){ /* poll 尾部调用：可见且未暂停才标记（隐藏积压留待回前台补） */
+ if(paused||document.visibilityState!=="visible")return;
+ const lo=Math.max(Date.now()-LIT_BACK,wBounds()[0]);
+ for(const tp of TOPICS)for(const m of tp.msgs)if(m.abs>=lo&&!LITSEEN.has(m.id)&&liveDisp(m))markLive(m,tp);
+ paintLive();
+ if(!liveTickT&&LIVEK.size)liveTickT=setTimeout(sweepLive,3000);}
+function flyIn(tp,msg){const f=msg.f,to=msg.to;
+ const key=f+"=>"+to+"#"+tp.id;
+ let ln=map.querySelector(`[data-k="${CSS.escape(key)}"]`);
+ if(!ln){ln=document.createElementNS("http://www.w3.org/2000/svg","path");
+  ln.setAttribute("class","lk temp");ln.setAttribute("data-k",key);ln.setAttribute("stroke",tp.color);
+  ln.setAttribute("stroke-width","1.8");ln.setAttribute("opacity",".4");
+  ln.setAttribute("d",chanD(agPos(f),agPos(to),bowOf(key)));map.appendChild(ln);}
+ let dead=false,done=false,ph;
+ const ent={key,f,to,ln,rebind(n){ln=n;ent.ln=n},cancel(silent){if(done||dead)return;dead=true;ln.remove();if(ph)ph.remove();
+  const i=liveAnims.indexOf(ent);if(i>=0)liveAnims.splice(i,1);
+  if(!silent)lateLit.push(ent);}};
+ liveAnims.push(ent);
+ ln.classList.add("lit");flashDot(f,"flash");
+ ph=document.createElement("div");ph.className="ph";ph.style.color=tp.color;stageEl.appendChild(ph);
+ const t0=performance.now(),dur=1700;
+ function arrive(){if(done||dead)return;done=true;ph.remove();ln.remove();
+  const i=liveAnims.indexOf(ent);if(i>=0)liveAnims.splice(i,1);
+  renderLinks();buildDeck(to);
+  const fl=map.querySelector(`[data-k="${CSS.escape(key)}"]`);
+  if(fl){fl.classList.add("lit");setTimeout(()=>fl.classList.remove("lit"),1200);}
+  flashDot(to,"flash");deliver(to);}
+ (function step(now){if(done||dead)return;const u=Math.min(1,(now-t0)/dur);
+  const pt=qp(agPos(f),agPos(to),bowOf(key),u);
+  ph.style.left=pt.x+"px";ph.style.top=pt.y+"px";
+  if(u<1)requestAnimationFrame(step);else arrive();})(t0);
+ setTimeout(arrive,4500);}
+/* ---------- bar ---------- */
+/* R12（10-17 第十二轮）：实时按钮/时段面板/区间文本废除——只剩实时视图与窗口长度滑杆（最大 1 小时）。 */
+const winEl=document.getElementById("win");
+winEl.oninput=()=>{winS=+winEl.value;
+ document.getElementById("winv").textContent=winS%60===0?(winS/60)+"min":winS+"s";
+ cancelLiveAnims();renderAllDecks();renderLinks();};
+// 字体滑条已移除：恒用 CSS 默认 --fs:1，并清掉历史 localStorage 残留，避免旧缩放值悄悄生效
+try{localStorage.removeItem("starfs");document.documentElement.style.removeProperty("--fs");}catch(e){}
+document.getElementById("bPause").onclick=e=>{paused=!paused;if(paused)cancelLiveAnims();
+ e.target.classList.toggle("on",paused);e.target.textContent=paused?"⏸︎流入":"流入";};
+document.getElementById("bReset").onclick=()=>{cancelLiveAnims();clearPin();
+ for(const o of[STA,AGTP])for(const k in o)delete o[k];
+ avoidClear(); /* R14-A（10-17 第十四轮）：复位同时清掉避让偏移与尺寸缓存。 */
+ applyDefaultLayout();initPos();placeWorld();renderLinks();renderAllDecks();};
+document.getElementById("bFs").onclick=()=>{
+ // 本页可能被总览 iframe 嵌入：全屏请求要打在宿主 iframe 元素上（iframe 内部对 body 发请求会被拒），
+ // 再点一次 = 退出当前全屏（无论全屏是本页还是外层按钮触发的）。
+ let fe=null;try{fe=window.frameElement}catch(e){}
+ const doc=fe?fe.ownerDocument:document;
+ if(doc.fullscreenElement){doc.exitFullscreen().catch(()=>{});return;}
+ const tgt=fe||document.documentElement;
+ let p=null;try{p=tgt.requestFullscreen()}catch(e){p=Promise.reject(e)}
+ if(p&&p.catch)p.catch(()=>{try{document.body.requestFullscreen().catch(()=>{})}catch(e){}});
+};
+document.getElementById("bSnap").onclick=()=>capShot().catch(e=>setErr("截图失败："+(e&&e.message||e)));
+/* ---------- R1（10-18 第十六轮）：所见即所得截图/录屏 ----------
+   旧实现是从数据模型重绘的简化示意（大六边形+散点），与真实界面完全不符——整段废弃。
+   管线：documentElement 深克隆 → 烘焙（:root 变量内联到克隆根——foreignObject 文档里 :root
+   命中的是 svg 不是 html，必须显式带上；页面 <style> 原样拷入；canvas 烘焙成同尺寸 img；
+   表单现值；CSS 动画用负 delay+paused 定格在当下相位，录制中每帧重算因此有连贯动画感）→
+   XMLSerializer 装入 SVG foreignObject → blob URL → Image.decode → canvas。
+   截图 = 单帧 2x 超采样出 PNG；录屏 = 常驻离屏 canvas captureStream(15fps)，每帧喂新画面，
+   录的同时真页面动画整体冻结（避免拍到的相位与用户看到的错位），再点「停止」出 webm；
+   450 帧（≈30s）硬上限自动收。弹窗/顶栏/底栏在 body 子树里，天然入画。 */
+let capSeq=0,capBusy=false,capRec=null,capTimer=null,capFrames=0,capPaused=[];
+const capcv=document.createElement("canvas");let capctx=capcv.getContext("2d");
+function bakeForm(el){if(el.tagName==="INPUT"){if(el.type==="checkbox"||el.type==="radio"){if(el.checked)el.setAttribute("checked","")}else el.setAttribute("value",el.value)}
+ else if(el.tagName==="TEXTAREA")el.textContent=el.value;
+ else if(el.tagName==="SELECT"){const o=el.options[el.selectedIndex];el.innerHTML="";if(o){const s=document.createElement("span");s.textContent=o.textContent;el.appendChild(s)}}}
+function rootVarsCss(){let t="";const cs=getComputedStyle(document.documentElement);
+ for(const k of cs){if(k.startsWith("--")){const v=cs.getPropertyValue(k).trim();if(v)t+=k+":"+v+";"}}return t}
+async function captureImg(dw,dh){
+const cap=String(++capSeq);
+const live=document.documentElement;
+const els=live.querySelectorAll("*");
+const clone=live.cloneNode(true);
+// 定格流程：先算出带 CSS 动画的真页面元素下标，再把 data-anim-cap 标记同步打到
+// 克隆树的同下标元素（cels 在删 script 前取，与 els 一一同构）。全程同步执行，真页面
+// 不留痕迹；克隆带标记进序列化，注入的 paused 规则只命中带标记元素。
+const animByEl=new Map();const idxMarked=[];
+for(let i=0;i<els.length;i++){const an=els[i].getAnimations&&els[i].getAnimations();
+ if(an&&an.length){animByEl.set(els[i],an[0]);idxMarked.push(i)}}
+const cels=Array.from(clone.querySelectorAll("*")); // 删 script 前先取：与 els 同下标同构
+for(const n of Array.from(clone.querySelectorAll("script,link,iframe,base")))n.remove();
+for(const i of idxMarked){if(cels[i])cels[i].setAttribute("data-anim-cap",cap)}
+clone.setAttribute("data-anim-root",cap);
+clone.style.cssText=rootVarsCss()+";margin:0;width:"+dw+"px;height:"+dh+"px;background:#04070d";
+for(const b of clone.querySelectorAll("body"))b.style.cssText+=";margin:0;width:"+dw+"px;height:"+dh+"px;overflow:hidden;background:#04070d";
+// 动画定格：冻结点 = 墙钟 − startTime（动画被 pause 后 currentTime 仍随墙钟走，不能直接取 currentTime），
+// 负 animation-delay 写进克隆元素的内联样式；注入规则统一 paused。
+const cmarked=Array.from(clone.querySelectorAll("[data-anim-cap]"));
+for(let j=0;j<cmarked.length;j++){const an=animByEl.get(els[idxMarked[j]]);if(!an)continue;
+ let ct=Number(an.currentTime);
+ if(!isFinite(ct)){const st=Number(an.startTime);ct=isFinite(st)?(document.timeline.currentTime||0)-st:0}
+ if(!isFinite(ct))ct=0;
+ cmarked[j].style.animationDelay=(-ct/1000)+"s"}
+if(idxMarked.length){const fr=document.createElement("style");
+ fr.textContent=`[data-anim-root="${cap}"] [data-anim-cap="${cap}"]{animation-play-state:paused!important}`;
+ clone.appendChild(fr)}
+ for(const st of Array.from(document.querySelectorAll("style"))){const st2=document.createElement("style");
+  st2.textContent=st.textContent.replace(/backdrop-filter\s*:[^;}]+/g,"none");clone.appendChild(st2)}
+ const srcCvs=live.querySelectorAll("canvas"),dstCvs=clone.querySelectorAll("canvas");
+ for(let i=0;i<dstCvs.length;i++){const s=srcCvs[i];if(!s)continue;const r=s.getBoundingClientRect();
+  let url="";try{url=s.toDataURL("image/png")}catch(e){}
+  const im=clone.createElement("img");if(url)im.src=url;
+  im.setAttribute("style","position:fixed;left:"+r.left+"px;top:"+r.top+"px;width:"+r.width+"px;height:"+r.height+"px");
+  dstCvs[i].replaceWith(im)}
+ for(const el of clone.querySelectorAll("input,textarea,select"))bakeForm(el);
+ const xml=new XMLSerializer().serializeToString(clone);
+ const body=/<html(\s[^>]*)?>/.test(xml)?xml.replace(/<html(\s[^>]*)?>/,m=>/xmlns=/.test(m)?m:m.replace("<html",'<html xmlns="http://www.w3.org/1999/xhtml"')):"<html>"+xml+"</html>";
+ const svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+dw+'" height="'+dh+'" viewBox="0 0 '+dw+' '+dh+'"><foreignObject x="0" y="0" width="100%" height="100%">'+body+"</foreignObject></svg>";
+ // 注意：本引擎系（含 Chrome 新版）会把 blob: URL 的 SVG 图判为跨源、画进 canvas 即中毒，
+ // toBlob/toDataURL 报 SecurityError；data: URL 载体不受影响。必须走 data URL。
+ try{const img=new Image();img.src="data:image/svg+xml;charset=utf-8,"+encodeURIComponent(svg);await img.decode();return img}
+ catch(e){throw new Error("画面解码失败："+(e&&e.message||e))}}
+function capDims(){return[Math.max(2,stageEl.clientWidth||innerWidth),Math.max(2,stageEl.clientHeight||innerHeight)]}
+async function capPauseAll(){for(const a of document.getAnimations()){try{if(a.play)a.pause()}catch(e){}}}
+function capResumeAll(){for(const a of capPaused){try{a.play()}catch(e){}}capPaused=[]}
+async function capFrame(){if(capBusy)return;capBusy=true;
+ try{const d=capDims();const img=await captureImg(d[0],d[1]);
+  const cw=Math.round(d[0]*devicePixelRatio),chh=Math.round(d[1]*devicePixelRatio);
+  if(capcv.width!==cw||capcv.height!==chh){capcv.width=cw;capcv.height=chh;capctx=capcv.getContext("2d")}
+  capctx.drawImage(img,0,0,cw,chh)}
+ finally{capBusy=false}}
+async function capShot(){if(capBusy){setErr("录制进行中，请先停止录屏再截图");return}
+ const d=capDims();const img=await captureImg(d[0],d[1]);
+ const cv=document.createElement("canvas");cv.width=d[0]*2;cv.height=d[1]*2;
+ cv.getContext("2d").drawImage(img,0,0,cv.width,cv.height);
+ const blob=await new Promise(res=>cv.toBlob(res,"image/png"));
+ if(!blob){setErr("截图生成失败");return}
+ const a=document.createElement("a");a.download="agentlink-star-"+Date.now()+".png";
+ a.href=URL.createObjectURL(blob);a.click();setTimeout(()=>URL.revokeObjectURL(a.href),8000);setErr("")}
+function capMime(){if(typeof MediaRecorder==="undefined"||!MediaRecorder.isTypeSupported)return"";
+ for(const m of["video/webm;codecs=vp9","video/webm;codecs=vp8","video/webm"])
+  if(MediaRecorder.isTypeSupported(m))return m;return""}
+function capRecStop(){if(capTimer){clearInterval(capTimer);capTimer=null}
+ const rs=capRec;capRec=null;capFrames=0;capResumeAll();
+ const btn=document.getElementById("bRec");btn.classList.remove("on");btn.textContent="录屏";
+ if(rs&&rs.state!=="inactive"){try{rs.stop()}catch(e){}}}
+document.getElementById("bRec").onclick=async e=>{const btn=e.currentTarget;
+ if(capRec){capRecStop();return}
+ if(capBusy)return;
+ await capPauseAll();
+ try{await capFrame()}catch(err){capResumeAll();setErr("录屏启动失败："+(err&&err.message||err));return}
+ capPaused=Array.from(document.getAnimations());for(const a of capPaused){try{if(a.play)a.pause()}catch(e){}}
+ let stream=null;try{stream=capcv.captureStream(15)}catch(err){capResumeAll();setErr(String(err.message||err));return}
+ const mime=capMime();let rec=null;try{rec=mime?new MediaRecorder(stream,{mimeType:mime}):new MediaRecorder(stream)}
+ catch(err){capResumeAll();setErr(String(err.message||err));return}
+ const chunks=[];
+ rec.ondataavailable=ev=>{if(ev.data&&ev.data.size)chunks.push(ev.data)};
+ rec.onstop=()=>{const a=document.createElement("a");a.download="agentlink-star-"+Date.now()+".webm";
+  a.href=URL.createObjectURL(new Blob(chunks,{type:"video/webm"}));a.click();setTimeout(()=>URL.revokeObjectURL(a.href),8000)};
+ capRec=rec;capFrames=0;try{rec.start(1000)}catch(err){capRec=null;capResumeAll();setErr(String(err.message||err));return}
+ btn.classList.add("on");btn.textContent="停止";setErr("");
+ capTimer=setInterval(()=>{if(!capRec)return;
+  if(++capFrames>450){capRecStop();return} // 450 帧 ≈ 30s 硬上限
+  capFrame().catch(()=>{})},66)};
+/* ---------- boot ---------- */
+let W0=0,H0=0;
+/* R2（10-17 第十轮）：偏左根因=解析时 innerWidth 可能是 iframe 首帧(300x150)或隐藏态(0)，
+   全量按错尺寸落位；且 W0=0 时 rx=Infinity 把 STA 打坏，只能整页重载。
+   改法：一律以 stage 实际 rect 计量；上一尺寸为 0/非有限时不再缩放，改按 MACH 分数坐标重建
+   （reAnchor，保留用户拖过的胶囊）；每轮 poll 开头 sizeUp() 对表——resize 事件缺失也 5s 内自愈。 */
+function viewport(){const r=stageEl.getBoundingClientRect();return[r.width||innerWidth,r.height||innerHeight];}
+function reAnchor(){const cl=staClamp(),r=orbR()+44;for(const m in MACH){const c=MACH[m];
+ STA[m]={x:c.x*W,y:Math.max(cl.top,Math.min(cl.bot,c.y*H))};
+ c.agents.forEach((a,i)=>{const k=a2k([m,a]);if(AGP[k])return;
+  const ang=Math.PI/2+i*(2*Math.PI/Math.max(c.agents.length,3));
+  AGTP[k]={dx:Math.cos(ang)*r,dy:Math.sin(ang)*r};});
+ if(!AGTP[a2k([m,"@node"])])AGTP[a2k([m,"@node"])]={dx:0,dy:0};}}
+function sizeUp(){const vp=viewport(),nw=vp[0],nh=vp[1];
+ if(!Object.keys(STA).length){W=nw;H=nh;W0=nw;H0=nh;return;}
+ if(nw===W0&&nh===H0&&W0>0&&H0>0)return;
+ const bad=!W0||!H0||!isFinite(nw/W0)||!isFinite(nh/H0);
+ const rx=nw/(W0||1),ry=nh/(H0||1);W=nw;H=nh;W0=nw;H0=nh;
+ if(bad)reAnchor();
+ else{for(const m in STA){STA[m].x*=rx;STA[m].y*=ry;}
+  const cl=staClamp(),r=orbR();
+  for(const m in STA)STA[m].y=Math.max(cl.top,Math.min(cl.bot,STA[m].y));
+  for(const k in AGTP){const mag=Math.hypot(AGTP[k].dx,AGTP[k].dy)||1;AGTP[k].dx*=r/mag;AGTP[k].dy*=r/mag;}}
+ placeWorld();renderLinks();renderAllDecks();}
+function buildStars(){const sf=document.getElementById("starfield");
+ for(let i=0;i<110;i++){const t=document.createElement("i");const sz=1+Math.random()*1.8;
+  t.style.cssText=`left:${Math.random()*100}%;top:${Math.random()*100}%;width:${sz}px;height:${sz}px;--d:${(2+Math.random()*4).toFixed(1)}s;animation-delay:${(-Math.random()*5).toFixed(1)}s`;sf.appendChild(t);}}
+async function boot(){buildStars();await poll();}
+addEventListener("resize",sizeUp);
+addEventListener("resize",posGNav); /* R2：窗口尺寸变了，‹ › 的外贴坐标要重算（世界布局由 sizeUp 与下轮 poll 处理） */
+/* R1（10-17 第十轮）：实时通道——/v1/ws 不带 client 即观察者连接（服务端本轮起放行本机全部
+   事件，含定向消息），任一事件 400ms 合并触发一次 poll；断线指数退避 2s→30s 重连；
+   5s 兜底轮询保留：WS 不可用时退回"轮询5s"（HUD 推送灯可见状态）。主控制台发信成功或点
+   「刷新」会 postMessage {al:'poke'}，出站单播也秒级上屏。手工时段模式下动画冻结、数据照常刷新。 */
+/* AL-STREAM-BEGIN —— 任务流式视图纯逻辑（可被 node 提取做单测；勿改名） */
+function alStreamInit(tid){return {tid:tid||"",seq:null,topic:"",lines:[],buf:"",shown:"",done:false,failed:false};}
+function alStreamResultText(result){
+ if(result==null)return "";
+ if(typeof result==="string")return result;
+ try{return JSON.stringify(result);}catch(e){return String(result);}
+}
+function alStreamReduce(state,env){
+ const p=(env&&env.payload)||{},tid=p.task_id||"";
+ if(!state||!tid||tid!==state.tid||!p.topic)return {state:state,changed:false};
+ if(p.seq!=null&&state.seq!=null&&p.seq<=state.seq)return {state:state,changed:false};
+ const st=Object.assign({},state,{lines:state.lines.slice()});
+ if(p.seq!=null)st.seq=p.seq;
+ st.topic=p.topic;
+ if(p.topic==="task_accepted")st.lines.push("✓ 已认领");
+ else if(p.topic==="task_progress")st.lines.push("· "+(p.stage||p.state||"进度")+(p.seq!=null?" #"+p.seq:""));
+ else if(p.topic==="task_succeeded"){st.done=true;st.lines.push("✔ 成功");st.buf=alStreamResultText(p.result);}
+ else if(p.topic==="task_failed"){st.done=true;st.failed=true;st.lines.push("✘ 失败: "+(p.error||""));}
+ else if(p.topic==="task_declined"){st.done=true;st.failed=true;st.lines.push("⊘ 拒绝: "+(p.reason||""));}
+ else if(p.topic==="task_cancelled"){st.done=true;st.lines.push("⊘ 已取消");}
+ else if(p.topic==="task_rolled_back"){st.done=true;st.lines.push("⊘ 已回滚");}
+ else return {state:state,changed:false};
+ return {state:st,changed:true};
+}
+/* 逐字推进：shown 每拍最多长出 chars 个字符，永不超出 target。 */
+function alStreamStep(shown,target,chars){
+ const t=target||"",s=shown||"",n=chars>0?chars:1;
+ return s.length>=t.length?t:t.slice(0,Math.min(t.length,s.length+n));
+}
+/* AL-STREAM-END */
+/* ---- 流式视图接线（面板/渲染/逐字节拍/观察者 WS 喂数） ---- */
+let STREAM=null;
+const stOut=document.getElementById("st-out"),stSt=document.getElementById("st-st"),
+      stTid=document.getElementById("st-tid");
+function stRender(){
+ if(!STREAM){stOut.innerHTML="";stSt.textContent="待命";return;}
+ const cls=STREAM.failed?"bad":(STREAM.done?"ok":"");
+ const body=STREAM.lines.map(esc).join("\n");
+ const cursor=(STREAM.buf&&STREAM.shown.length<STREAM.buf.length)?'<span class="cur">▍</span>':"";
+ stOut.innerHTML=(body?body+"\n":"")+'<span class="'+cls+'">'+esc(STREAM.shown)+cursor+'</span>';
+ stOut.scrollTop=stOut.scrollHeight;
+ stSt.textContent=(STREAM.done?(STREAM.failed?"已结束·失败":"已结束"):"流式中")+" · seq="+(STREAM.seq==null?"-":STREAM.seq);
+}
+function stTick(){if(STREAM&&STREAM.shown.length<STREAM.buf.length){STREAM.shown=alStreamStep(STREAM.shown,STREAM.buf,2);stRender();}}
+document.getElementById("st-sub").onclick=()=>{STREAM=alStreamInit(stTid.value.trim());stRender();};
+document.getElementById("st-clr").onclick=()=>{STREAM=null;stRender();};
+setInterval(stTick,24);
+window.__alStream={init:alStreamInit,reduce:alStreamReduce,step:alStreamStep,text:alStreamResultText};
+
+let ws=null,wsRetry=2000,pokeT=null;
+function pokePoll(){if(pokeT)return;pokeT=setTimeout(()=>{pokeT=null;poll();},400);}
+function connectWS(){if(!TOKEN){setTimeout(connectWS,2000);return;}
+ let sk=null;try{sk=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/v1/ws?token="+encodeURIComponent(TOKEN))}catch(e){return;}
+ ws=sk;
+ sk.onopen=()=>{WSOK=true;wsRetry=2000;renderHud();};
+ sk.onmessage=(e)=>{pokePoll();
+  /* 流式视图：复用本观察者连接（无 client = 可见本机全部事件含定向帧）。 */
+  if(STREAM){let env=null;try{env=JSON.parse(e.data);}catch(err){}
+   if(env){const r=alStreamReduce(STREAM,env);if(r.changed){STREAM=r.state;stRender();}}}};
+ sk.onerror=()=>{try{sk.close();}catch(e){}};
+ sk.onclose=()=>{WSOK=false;if(ws===sk)ws=null;renderHud();setTimeout(connectWS,wsRetry);wsRetry=Math.min(wsRetry*2,30000);};}
+addEventListener("message",e=>{if(e.data&&e.data.al==="poke")pokePoll();});
+boot().then(connectWS);setInterval(poll,5000);
+/* R3-c（10-18 第十五轮）：回前台立刻补一轮 poll——markFreshLive 给"近90s 内未亮过"的消息
+   补持久亮线（不重飞粒子，KNOWN 语义不变）；后台积压期间被 KNOWN 吞掉的线从此找得回来。 */
+addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")poll();});
+/* 诊断快照：外部检查器可读（不影响任何行为；WS 状态机排障用） */
+window.__al={get wsok(){return WSOK},get live(){return true},/* R12：时段模式废除，恒为实时 */get polling(){return polling},get tok4(){return (TOKEN||"").slice(0,4)},get livem(){return LIVEM.size},get seen(){return LITSEEN.size},get known(){return KNOWN.size}};
+
+</script>
+</body>
+</html>

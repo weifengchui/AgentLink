@@ -1,0 +1,35 @@
+[workspace]
+members = ["crates/agentlink-core"]
+
+[package]
+name = "agentlink"
+version = "0.6.1"
+edition = "2021"
+description = "AgentLink - LAN message bus for AI agents"
+license = "Apache-2.0"
+
+[[bin]]
+name = "agentlink"
+path = "src/main.rs"
+
+[features]
+default = []
+mdns = ["agentlink-core/mdns"]
+
+[dependencies]
+agentlink-core = { path = "crates/agentlink-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "io-util", "fs", "macros"] }
+axum = { version = "0.7", features = ["ws"] }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true
+panic = "abort"
