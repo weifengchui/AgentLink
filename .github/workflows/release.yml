@@ -39,8 +39,9 @@ jobs:
           cp README.md NOTICE LICENSE "$DIR/"
           cp deploy/* "$DIR/deploy/"
           cp scripts/task-proto/* "$DIR/scripts/task-proto/"
-          tar czf "$DIR.tar.gz" "$DIR"
-          echo "ARTIFACT=$DIR.tar.gz" >> "$GITHUB_ENV"
+          # 资产固定名（不带版本）：宣传页 latest/download/<name> 链接永不因升版失效
+          tar czf "agentlink-${{ matrix.pkg }}.tar.gz" "$DIR"
+          echo "ARTIFACT=agentlink-${{ matrix.pkg }}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
@@ -53,8 +54,8 @@ jobs:
           Copy-Item README.md, NOTICE, LICENSE $dir
           Copy-Item "deploy/*" "$dir/deploy/"
           Copy-Item "scripts/task-proto/*" "$dir/scripts/task-proto/"
-          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
-          "ARTIFACT=$dir.zip" >> $env:GITHUB_ENV
+          Compress-Archive -Path $dir -DestinationPath "agentlink-win-x64.zip"
+          "ARTIFACT=agentlink-win-x64.zip" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:
