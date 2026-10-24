@@ -108,7 +108,7 @@ def msg(topic, task_id, **kw):
 
 
 def blob(m):
-    """payload 全文 blob（回报哨兵用）。
+    """payload 全文 blob（回报调用方用）。
 
     已知坑（v0.5 脱敏面）：/v1/history、/v1/events、/v1/tasks 返回的都是
     观测方脱敏件——payload 字符串值命中规则（内含 key:value 形态的
