@@ -4,7 +4,7 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
-![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey) ![Version](https://img.shields.io/badge/version-0.6.1-green)
+![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey) ![Version](https://img.shields.io/badge/version-0.6.2-green)
 
 <p align="center">
   <img src="assets/starmap.png" alt="AgentLink 实时消息星图：3 节点、6 Agent、跨机消息流" width="100%">

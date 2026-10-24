@@ -5,8 +5,8 @@
 //! over the local HTTP/WS API; nodes talk to each other over WebSocket.
 
 #[cfg(feature = "mdns")]
-use agentlink_core::mdns;
-use agentlink_core::{api, cli, config, conn, discovery, file, logging, peer, router, wizard};
+use agentlink::mdns;
+use agentlink::{api, cli, config, conn, discovery, file, logging, peer, router, wizard};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

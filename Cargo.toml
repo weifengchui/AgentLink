@@ -2,8 +2,9 @@
 members = ["crates/agentlink-core"]
 
 [package]
-name = "agentlink"
-version = "0.6.1"
+name = "agentlink-node"
+version = "0.6.2"
+publish = false
 edition = "2021"
 description = "AgentLink - LAN message bus for AI agents"
 license = "Apache-2.0"
@@ -14,10 +15,10 @@ path = "src/main.rs"
 
 [features]
 default = []
-mdns = ["agentlink-core/mdns"]
+mdns = ["agentlink/mdns"]
 
 [dependencies]
-agentlink-core = { path = "crates/agentlink-core" }
+agentlink = { path = "crates/agentlink-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "io-util", "fs", "macros"] }
 axum = { version = "0.7", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }

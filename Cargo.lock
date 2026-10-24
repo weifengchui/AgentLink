@@ -4,22 +4,7 @@ version = 4
 
 [[package]]
 name = "agentlink"
-version = "0.6.1"
-dependencies = [
- "agentlink-core",
- "anyhow",
- "axum",
- "clap",
- "clap_complete",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "agentlink-core"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -45,6 +30,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "agentlink-node"
+version = "0.6.2"
+dependencies = [
+ "agentlink",
+ "anyhow",
+ "axum",
+ "clap",
+ "clap_complete",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
