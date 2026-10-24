@@ -1,0 +1,77 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            pkg: linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            pkg: macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            pkg: win-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          set -euo pipefail
+          DIR="agentlink-${GITHUB_REF_NAME}-${{ matrix.pkg }}"
+          mkdir -p "$DIR/scripts/task-proto" "$DIR/deploy"
+          cp "target/${{ matrix.target }}/release/agentlink" "$DIR/"
+          cp README.md NOTICE LICENSE "$DIR/"
+          cp deploy/* "$DIR/deploy/"
+          cp scripts/task-proto/* "$DIR/scripts/task-proto/"
+          tar czf "$DIR.tar.gz" "$DIR"
+          echo "ARTIFACT=$DIR.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME
+          $dir = "agentlink-$ver-win-x64"
+          New-Item -ItemType Directory -Force -Path "$dir/scripts/task-proto", "$dir/deploy" | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/agentlink.exe" $dir
+          Copy-Item README.md, NOTICE, LICENSE $dir
+          Copy-Item "deploy/*" "$dir/deploy/"
+          Copy-Item "scripts/task-proto/*" "$dir/scripts/task-proto/"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          "ARTIFACT=$dir.zip" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.pkg }}
+          path: ${{ env.ARTIFACT }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" agentlink-*.tar.gz agentlink-*.zip \
+            --title "AgentLink $GITHUB_REF_NAME" \
+            --generate-notes
