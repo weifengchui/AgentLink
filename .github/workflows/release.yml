@@ -71,6 +71,7 @@ jobs:
       - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release create "$GITHUB_REF_NAME" agentlink-*.tar.gz agentlink-*.zip \
             --title "AgentLink $GITHUB_REF_NAME" \
