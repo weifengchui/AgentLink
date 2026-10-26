@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentlink"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "agentlink-node"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "agentlink",
  "anyhow",
