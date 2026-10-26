@@ -536,6 +536,30 @@ pub(super) async fn send_file(
     }
 }
 
+/// 解码 percent-encoding（前端 encodeURIComponent 产物）。
+/// HTTP 头只允许 ISO-8859-1，非 ASCII 文件名必须编码后传输；
+/// 不含 `%` 或序列非法时原样返回，兼容直接发明文头名的旧客户端。
+fn percent_decode(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Browser-style file upload: raw bytes in the body, file name in `X-File-Name`.
 #[derive(Debug, Deserialize)]
 pub(super) struct UploadParams {
@@ -588,8 +612,8 @@ pub(super) async fn send_file_upload(
     let raw_name = headers
         .get("x-file-name")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("upload.bin")
-        .to_string();
+        .map(percent_decode)
+        .unwrap_or_else(|| "upload.bin".to_string());
     let Some(name) = crate::file::sanitize_name(&raw_name) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -2496,7 +2520,7 @@ async function doSendAll(sfx){
   let okn=0;
   for(let i=0;i<atts.length;i++){const att=atts[i];const q=new URLSearchParams({to:tgt.to});if(tgt.to_agent)q.set('to_agent',tgt.to_agent);if(fam)q.set('from_agent',fam);
     res.textContent=`上传附件 ${i+1}/${atts.length}：${att.name}（${fmtSize(att.size)}）`;
-    try{const d=await j('/v1/send-file-upload?'+q,{method:'POST',headers:{'X-File-Name':att.name},body:att});
+    try{const d=await j('/v1/send-file-upload?'+q,{method:'POST',headers:{'X-File-Name':encodeURIComponent(att.name)},body:att});
       okn++;done.push('📎'+att.name+' ok'+(d.file_id?' #'+String(d.file_id).slice(0,8):''));}
     catch(e){done.push('📎'+att.name+' 失败: '+(e.message||e));}}
   if(atts.length)clearAtt(sfx);
@@ -2964,4 +2988,31 @@ pub(super) fn namespace_global_read_forbidden(
             })),
         )
     })
+}
+
+#[cfg(test)]
+mod name_header_tests {
+    use super::percent_decode;
+
+    #[test]
+    fn decodes_utf8_percent_encoded_name() {
+        // 前端 encodeURIComponent("任务拆解.md") 的产物
+        assert_eq!(
+            percent_decode("%E4%BB%BB%E5%8A%A1%E6%8B%86%E8%A7%A3.md"),
+            "任务拆解.md"
+        );
+    }
+
+    #[test]
+    fn plain_ascii_name_passes_through() {
+        assert_eq!(percent_decode("report.pdf"), "report.pdf");
+        assert_eq!(percent_decode("a b"), "a b"); // 未编码空格原样保留
+    }
+
+    #[test]
+    fn malformed_sequences_pass_through() {
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%2"), "%2");
+    }
 }
