@@ -47,12 +47,12 @@ def api(path, body=None, method=None, token=TOKEN):
     with urllib.request.urlopen(req, timeout=8) as r:
         return json.loads(r.read().decode())
 
-def run_cli(*args, cwd=None, cfg=CFG):
+def run_cli(*args, cwd=None, cfg=CFG, env=None):
     parts = [BIN]
     if cfg:
         parts += ["--config", cfg]
     parts += list(args)
-    p = subprocess.run(parts, cwd=cwd, capture_output=True, text=True, timeout=60)
+    p = subprocess.run(parts, cwd=cwd, capture_output=True, text=True, timeout=60, env=env)
     return p.returncode, p.stdout, p.stderr
 
 def start_node():
@@ -206,8 +206,11 @@ def main():
         follow = None
 
         # S8 无配置文件：友好错误提示 agentlink init
+        # 用一次性空 HOME 隔离稳定配置位置（~/.config/agentlink），
+        # 否则本机装过节点时 CLI 会回退到稳定配置、测不到"无配置"路径。
         os.makedirs(EMPTY_DIR, exist_ok=True)
-        rc, out, err = run_cli("get", "nodes", cfg=None, cwd=EMPTY_DIR)
+        bare_env = {**os.environ, "HOME": tempfile.mkdtemp(prefix="al-smoke-home-")}
+        rc, out, err = run_cli("get", "nodes", cfg=None, cwd=EMPTY_DIR, env=bare_env)
         check("S8 缺配置友好报错提示 agentlink init",
               rc != 0 and "agentlink init" in (err + out),
               f"rc={rc} err={err[:200]}")

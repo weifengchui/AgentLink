@@ -2466,6 +2466,7 @@ async function j(p,opt){const o=opt||{};const h={...HDR(),...(o.headers||{})};if
   try{const rr=await fetch('/v1/auth/oidc/refresh',{method:'POST',headers:HDR()});
    if(rr.ok){const rd=await rr.json();if(rd&&rd.ok)return await j(p,{...o,__retried:true});}}catch(e){}}
  sessionStorage.removeItem(LS_KEY);needToken();throw new Error('401');}if(!r.ok)throw new Error('HTTP '+r.status+' '+((d&&(d.error||d.err))||txt.slice(0,200)||r.statusText));return d;}
+async function upFile(p,file,onprog){return await new Promise((res,rej)=>{const x=new XMLHttpRequest();x.open('POST',p);for(const kv of Object.entries(HDR()))x.setRequestHeader(kv[0],kv[1]);x.setRequestHeader('X-File-Name',encodeURIComponent(file.name));x.upload.onprogress=e=>{if(e.lengthComputable&&onprog)onprog(e.loaded,e.total);};x.timeout=600000;x.onload=()=>{let d={};try{d=JSON.parse(x.responseText||'{}');}catch{d={error:(x.responseText||'').slice(0,200)};}if(x.status===401){sessionStorage.removeItem(LS_KEY);needToken();rej(new Error('401'));return;}if(x.status>=200&&x.status<300){res(d);return;}rej(new Error('HTTP '+x.status+' '+((d&&(d.error||d.err))||'').slice(0,200)));};x.ontimeout=()=>rej(new Error('上传超时'));x.onerror=()=>rej(new Error('network error'));x.send(file);});}
 function show(panel){document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.p===panel));document.querySelectorAll('.content>section').forEach(s=>s.classList.add('hidden'));$('p-'+panel).classList.remove('hidden');if(panel==='config')renderColorCfg();if(panel==='tasks')loadTasks(true);}
 function input(id){return ($(id)&&$(id).value||'').trim();}
 function el(id){return document.getElementById(id);}
@@ -2519,8 +2520,9 @@ async function doSendAll(sfx){
     catch(e){res.textContent='发送失败: '+(e.message||e);return;}}
   let okn=0;
   for(let i=0;i<atts.length;i++){const att=atts[i];const q=new URLSearchParams({to:tgt.to});if(tgt.to_agent)q.set('to_agent',tgt.to_agent);if(fam)q.set('from_agent',fam);
-    res.textContent=`上传附件 ${i+1}/${atts.length}：${att.name}（${fmtSize(att.size)}）`;
-    try{const d=await j('/v1/send-file-upload?'+q,{method:'POST',headers:{'X-File-Name':encodeURIComponent(att.name)},body:att});
+    const pct=(ld,tt)=>{res.textContent=`上传附件 ${i+1}/${atts.length}：${att.name}（${fmtSize(ld)} / ${fmtSize(tt)} · ${Math.round(ld*100/tt)}%）`;};
+    res.textContent=`上传附件 ${i+1}/${atts.length}：${att.name}（${fmtSize(att.size)}，0%）`;
+    try{const d=await upFile('/v1/send-file-upload?'+q,att,pct);
       okn++;done.push('📎'+att.name+' ok'+(d.file_id?' #'+String(d.file_id).slice(0,8):''));}
     catch(e){done.push('📎'+att.name+' 失败: '+(e.message||e));}}
   if(atts.length)clearAtt(sfx);
