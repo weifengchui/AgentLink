@@ -2012,8 +2012,8 @@ tr:hover td{background:#131a24}
 select#to,select#to2{width:340px;max-width:340px}
 .ver-badge{font-size:11px;color:#a8cbff;background:#16233b;border:1px solid #26436f;border-radius:12px;padding:1px 9px;letter-spacing:.3px}
 .hide-in{position:absolute;left:-9999px;width:1px;height:1px;opacity:0}
-.dz{margin-top:8px;padding:10px 12px;border:1px dashed #2b3648;border-radius:10px;color:#7d8aa0;font-size:12px;text-align:center;transition:.15s}
-.dz.drag{border-color:#4f8cff;background:#12203a;color:#a8cbff}
+.dz{margin-top:8px;padding:10px 12px;border:1px dashed #2b3648;border-radius:10px;color:#7d8aa0;font-size:12px;display:flex;align-items:center;justify-content:center;gap:8px;transition:.15s}
+.dz .dzsep{color:#3d4a60}
 .card.drag{outline:2px dashed #4f8cff;outline-offset:-6px;border-radius:12px}
 .dz a{color:#7fb0ff}
 .att-chip{display:inline-flex;align-items:center;gap:7px;padding:2px 10px;border-radius:14px;background:#182238;color:#9db4dd;font-size:12px}
@@ -2159,7 +2159,7 @@ th.srt:hover{color:#dbe2ea}
                 <div class="row"><span class="lbl">发件身份</span><select id="from2" onchange="try{localStorage.fromagent=this.value}catch(e){}"></select><span class="hint">本机注册的 agent；出站消息与文件的历史记录带上它，对话记录里发端才会显示双层胶囊。选「整机」则只显节点名。</span></div>
         <div class="row"><span class="lbl">消息组</span><input id="grp2" placeholder="主题短名（可选，如 upgrade-v0.5.8；同组消息在星图归为一个话题）" style="flex:1"><span class="hint">留空则按 reply_to 链归组（旧行为不变）。</span></div>
         <div class="row"><textarea id="payload2" rows="2" placeholder='{"content":"你好"}　可只发附件；在卡片内任意处 Ctrl+V 可直接贴图'></textarea></div>
-        <div class="dz" id="dz2">📎 拖拽文件或文件夹到卡片任意位置　·　<button type="button" class="lk" onclick="el('file2').click()">选文件</button>　·　<button type="button" class="lk" onclick="el('dir2').click()">选目录（自动打包 zip）</button><input type="file" id="file2" class="hide-in" multiple><input type="file" id="dir2" class="hide-in" webkitdirectory multiple></div>
+        <div class="dz" id="dz2"><span>📎 拖拽文件或文件夹到卡片任意位置</span><span class="dzsep">·</span><button type="button" class="lk" onclick="el('file2').click()">选文件</button><span class="dzsep">·</span><button type="button" class="lk" onclick="el('dir2').click()">选目录（自动打包 zip）</button><input type="file" id="file2" class="hide-in" multiple><input type="file" id="dir2" class="hide-in" webkitdirectory multiple></div>
         <div class="row"><button class="primary" onclick="doSendAll('2')">发送</button><span id="attinfo2"></span></div>
         <div id="sendres2" class="hint"></div>
       </div>
@@ -2544,7 +2544,7 @@ async function packFromInput(inp,sfx,label){const fs=Array.from(inp.files||[]);i
     const blob=await zipStore(es);const zf=new File([blob],top+'.zip',{type:'application/zip'});zf.__zip=true;
     addAtt(sfx,[zf]);res.textContent=`已打包 ${es.length} 个文件 → ${top}.zip（${fmtSize(zf.size)}）`;}
   catch(e){res.textContent='打包失败: '+(e.message||e);}}
-async function onDrop(e,sfx){e.preventDefault();const dz=el('dz'+sfx);if(dz)dz.classList.remove('drag');const res=el('sendres'+sfx);
+async function onDrop(e,sfx){e.preventDefault();const res=el('sendres'+sfx);
   const its=(e.dataTransfer&&e.dataTransfer.items)?Array.from(e.dataTransfer.items):[];
   const ents=its.map(i=>i.webkitGetAsEntry?i.webkitGetAsEntry():null).filter(Boolean);
   const dirs=ents.filter(x=>x.isDirectory);
@@ -2563,7 +2563,7 @@ function bindPanel(sfx){
   const fi=el('file'+sfx);if(fi)fi.onchange=()=>{addAtt(sfx,Array.from(fi.files||[]));fi.value='';};
   const di=el('dir'+sfx);if(di)di.onchange=()=>packFromInput(di,sfx);
   const dz=el('dz'+sfx);const sc=el('sendcard'+sfx)||dz;
-  if(sc){const hi=on=>{sc.classList.toggle('drag',on);if(dz)dz.classList.toggle('drag',on);};
+  if(sc){const hi=on=>sc.classList.toggle('drag',on);
     ['dragenter','dragover'].forEach(ev=>sc.addEventListener(ev,e=>{e.preventDefault();hi(true);}));
     sc.addEventListener('dragleave',e=>{if(!sc.contains(e.relatedTarget))hi(false);});
     sc.addEventListener('drop',e=>{hi(false);onDrop(e,sfx);});}
