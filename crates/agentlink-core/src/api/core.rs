@@ -2014,6 +2014,7 @@ select#to,select#to2{width:340px;max-width:340px}
 .hide-in{position:absolute;left:-9999px;width:1px;height:1px;opacity:0}
 .dz{margin-top:8px;padding:10px 12px;border:1px dashed #2b3648;border-radius:10px;color:#7d8aa0;font-size:12px;text-align:center;transition:.15s}
 .dz.drag{border-color:#4f8cff;background:#12203a;color:#a8cbff}
+.card.drag{outline:2px dashed #4f8cff;outline-offset:-6px;border-radius:12px}
 .dz a{color:#7fb0ff}
 .att-chip{display:inline-flex;align-items:center;gap:7px;padding:2px 10px;border-radius:14px;background:#182238;color:#9db4dd;font-size:12px}
 .idc{display:inline-flex;align-items:center;justify-content:flex-end;background:var(--nc,#22344f);border-radius:13px;padding:2px 2px 2px 14px;margin-right:4px;vertical-align:middle;max-width:100%}
@@ -2153,12 +2154,12 @@ th.srt:hover{color:#dbe2ea}
       <div class="card"><h2>Agent（全网）</h2><table><thead><tr><th class="srt" onclick="aSortBy('node')">节点<span id="as-node"></span></th><th class="srt" onclick="aSortBy('id')">agent_id<span id="as-id"></span></th><th class="srt" onclick="aSortBy('name')">名字<span id="as-name"></span></th><th>能力</th><th class="srt" onclick="aSortBy('online')">状态<span id="as-online"></span></th><th>操作</th></tr></thead><tbody id="agents-body"></tbody></table></div>
     </section>
     <section id="p-chat" class="hidden">
-      <div class="card"><h2>发送消息 / 文件</h2>
+      <div class="card" id="sendcard2"><h2>发送消息 / 文件</h2>
                 <div class="row"><span class="lbl">目标</span><select id="to2"></select></div>
                 <div class="row"><span class="lbl">发件身份</span><select id="from2" onchange="try{localStorage.fromagent=this.value}catch(e){}"></select><span class="hint">本机注册的 agent；出站消息与文件的历史记录带上它，对话记录里发端才会显示双层胶囊。选「整机」则只显节点名。</span></div>
         <div class="row"><span class="lbl">消息组</span><input id="grp2" placeholder="主题短名（可选，如 upgrade-v0.5.8；同组消息在星图归为一个话题）" style="flex:1"><span class="hint">留空则按 reply_to 链归组（旧行为不变）。</span></div>
-        <div class="row"><textarea id="payload2" rows="2" placeholder='{"content":"你好"}　可只发附件；在框内 Ctrl+V 可直接贴图'></textarea></div>
-        <div class="dz" id="dz2">📎 拖拽文件或文件夹到此　·　<button type="button" class="lk" onclick="el('file2').click()">选文件</button>　·　<button type="button" class="lk" onclick="el('dir2').click()">选目录（自动打包 zip）</button><input type="file" id="file2" class="hide-in" multiple><input type="file" id="dir2" class="hide-in" webkitdirectory multiple></div>
+        <div class="row"><textarea id="payload2" rows="2" placeholder='{"content":"你好"}　可只发附件；在卡片内任意处 Ctrl+V 可直接贴图'></textarea></div>
+        <div class="dz" id="dz2">📎 拖拽文件或文件夹到卡片任意位置　·　<button type="button" class="lk" onclick="el('file2').click()">选文件</button>　·　<button type="button" class="lk" onclick="el('dir2').click()">选目录（自动打包 zip）</button><input type="file" id="file2" class="hide-in" multiple><input type="file" id="dir2" class="hide-in" webkitdirectory multiple></div>
         <div class="row"><button class="primary" onclick="doSendAll('2')">发送</button><span id="attinfo2"></span></div>
         <div id="sendres2" class="hint"></div>
       </div>
@@ -2559,13 +2560,15 @@ async function onDrop(e,sfx){e.preventDefault();const dz=el('dz'+sfx);if(dz)dz.c
 function bindPanel(sfx){
   const fi=el('file'+sfx);if(fi)fi.onchange=()=>{addAtt(sfx,Array.from(fi.files||[]));fi.value='';};
   const di=el('dir'+sfx);if(di)di.onchange=()=>packFromInput(di,sfx);
-  const dz=el('dz'+sfx);
-  if(dz){['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag');}));
-    ['dragleave','dragend'].forEach(ev=>dz.addEventListener(ev,()=>dz.classList.remove('drag')));
-    dz.addEventListener('drop',e=>onDrop(e,sfx));}
-  const ta=el('payload'+sfx);if(ta)ta.addEventListener('paste',e=>onPaste(e,sfx));
+  const dz=el('dz'+sfx);const sc=el('sendcard'+sfx)||dz;
+  if(sc){const hi=on=>{sc.classList.toggle('drag',on);if(dz)dz.classList.toggle('drag',on);};
+    ['dragenter','dragover'].forEach(ev=>sc.addEventListener(ev,e=>{e.preventDefault();hi(true);}));
+    sc.addEventListener('dragleave',e=>{if(!sc.contains(e.relatedTarget))hi(false);});
+    sc.addEventListener('drop',e=>{hi(false);onDrop(e,sfx);});}
   renderAtt(sfx);}
 bindPanel('');bindPanel('2');
+// 贴图升级为卡片级：对话面板可见时页面任意处 Ctrl+V（仅剪贴板含图片才拦截，文本粘贴不受影响）
+document.addEventListener('paste',e=>{const sec=el('p-chat');if(sec&&!sec.classList.contains('hidden'))onPaste(e,'2');});
 function renderAgents(){
   ['node','id','name','online'].forEach(k=>srtIcon('as-',ASORT,k));
   const rank=a=>(a.node_id===SELF?0:1);
