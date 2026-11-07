@@ -132,6 +132,11 @@ pub struct Hello {
     /// 加性字段；缺省 None（未启用准入/老节点）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot: Option<String>,
+    /// 本节点对外通告的可拨监听地址 `ip:port`（v0.6.9 地址漂移自愈）。加性
+    /// 字段；老节点不发则回落 TCP 观测地址。入站连接的源端口是临时的、不可
+    /// 回拨——目录/自愈要传播可拨地址，必须靠这里主动声明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
 }
 
 impl Hello {
@@ -149,6 +154,7 @@ impl Hello {
             mtls_enabled: false,
             hw_fp: None,
             boot: None,
+            listen: None,
         }
     }
 
@@ -156,6 +162,12 @@ impl Hello {
     pub fn with_mtls(mut self, ca_fp: Option<String>, mtls_enabled: bool) -> Self {
         self.ca_fp = ca_fp;
         self.mtls_enabled = mtls_enabled;
+        self
+    }
+
+    /// 附加本节点的可拨监听地址（v0.6.9 地址漂移自愈）。
+    pub fn with_listen(mut self, listen: Option<String>) -> Self {
+        self.listen = listen;
         self
     }
 

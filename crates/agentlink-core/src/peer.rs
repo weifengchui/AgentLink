@@ -80,11 +80,51 @@ pub struct PeerTable {
     /// is suppressed until the node contacts us with a successful handshake
     /// (a live handshake means it really is back) or the user un-forgets.
     forgotten: RwLock<std::collections::HashSet<String>>,
+    /// v0.6.9 活跃会话引用计数（ABA 保护）：同一 node_id 可能同时存在多条
+    /// 会话（out/in、旧进程残留连接）。仅最后一条结束时才判离线/注销，
+    /// 防止旧会话清理误杀同 node_id 的新会话（IP 漂移重启的典型竞态）。
+    sessions: RwLock<HashMap<String, u32>>,
 }
 
 impl PeerTable {
     pub fn new() -> Self {
         PeerTable::default()
+    }
+
+    /// 握手成功后登记一条活跃会话。
+    pub fn begin_session(&self, node_id: &str) {
+        *self
+            .sessions
+            .write()
+            .unwrap()
+            .entry(node_id.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// 会话结束一条；返回 true 表示该节点已无任何活跃会话（真离线）。
+    pub fn end_session(&self, node_id: &str) -> bool {
+        let mut map = self.sessions.write().unwrap();
+        match map.get_mut(node_id) {
+            Some(c) => {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    map.remove(node_id);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
+    }
+
+    pub fn session_count(&self, node_id: &str) -> u32 {
+        self.sessions
+            .read()
+            .unwrap()
+            .get(node_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Load the persisted suppress list (called once at startup).
@@ -169,7 +209,16 @@ impl PeerTable {
     }
 
     /// Mark a peer online / refresh identity after a successful handshake.
-    pub fn mark_online(&self, node_id: &str, name: &str, addr: &str, direction: &str) {
+    /// `announced` = true 时 `addr` 是对端在握手中主动声明的可拨监听地址
+    /// （v0.6.9 地址漂移自愈）；入站方向也允许覆盖旧地址。
+    pub fn mark_online(
+        &self,
+        node_id: &str,
+        name: &str,
+        addr: &str,
+        direction: &str,
+        announced: bool,
+    ) {
         // A live handshake overrides any earlier user "forget": the node
         // demonstrably exists again (e.g. config restored after re-init).
         self.forgotten.write().unwrap().remove(node_id);
@@ -188,8 +237,9 @@ impl PeerTable {
         entry.name = name.to_string();
         entry.direction = direction.to_string();
         // Prefer the discovered (advertised) address; for outbound dials the
-        // connected address is exactly the advertised one anyway.
-        if direction == "out" || entry.addr.is_empty() {
+        // connected address is exactly the advertised one anyway. 对端显式声明
+        // 监听地址时同样覆盖（入站源端口是临时的，声明地址才可拨）。
+        if announced || direction == "out" || entry.addr.is_empty() {
             entry.addr = addr.to_string();
         }
         entry.online = true;
@@ -268,7 +318,7 @@ mod tests {
     #[test]
     fn peer_view_load_is_additive() {
         let table = PeerTable::new();
-        table.mark_online("node-b", "peer-b", "127.0.0.1:9000", "out");
+        table.mark_online("node-b", "peer-b", "127.0.0.1:9000", "out", false);
         let view = table.snapshot().remove(0);
         let v = serde_json::to_value(&view).unwrap();
         assert!(v.get("load").is_none(), "default view must omit load: {v}");

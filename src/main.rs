@@ -61,7 +61,7 @@ enum Command {
         /// Overwrite an existing configuration file.
         #[arg(long)]
         force: bool,
-        /// Display name for this node (defaults to `agent-<hostname>`).
+        /// Display name for this node (默认取真实主机名，取不到回退 node_id).
         #[arg(long)]
         name: Option<String>,
         /// Set the cluster token directly (instead of generating a random one).

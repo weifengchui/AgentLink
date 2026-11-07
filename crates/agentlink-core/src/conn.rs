@@ -132,6 +132,83 @@ fn parse_static_peer(raw: &str) -> (String, Option<String>) {
     (raw.to_string(), None)
 }
 
+/// v0.6.9 地址漂移自愈：本节点对外声明的可拨监听地址（本机网卡 IP + 监听
+/// 端口，与 /v1/status 的 listen_addr 同源）。拿不到本机 IP 时返回 None，
+/// 对端回落 TCP 观测地址（与旧版行为一致）。
+fn advertised_listen(cfg: &crate::config::Config) -> Option<String> {
+    let ip = local_ip_address::local_ip().ok()?;
+    Some(format!("{ip}:{}", cfg.listen_port))
+}
+
+/// v0.6.9 地址漂移自愈：为对端挑选可拨地址。对端在 hello 声明了合法
+/// `ip:port`（非未指定地址）时优先采用并标记 announced——入站连接的临时源
+/// 端口不可回拨，声明地址才能进目录并被其他节点拨通。
+fn pick_peer_addr<'a>(announced: Option<&'a str>, observed: &'a str) -> (&'a str, bool) {
+    if let Some(a) = announced {
+        let ok = a
+            .parse::<std::net::SocketAddr>()
+            .map(|s| !s.ip().is_unspecified())
+            .unwrap_or(false);
+        if ok {
+            return (a, true);
+        }
+    }
+    (observed, false)
+}
+
+/// v0.6.9 地址漂移自愈：从收到的 `node_dir` 目录条目里，挑出「本节点已知、
+/// 当前离线、且目录给出的地址与本地记录不同」的节点，生成重拨事件。
+/// 这样只要集群里任一链路还活着（目录能到达），换了 IP 的节点就能被找回，
+/// 不再依赖过期的静态地址或同网段广播。
+///
+/// 规则与 conn manager 的去重一致：只有 node_id 字典序较小的一方发起拨号，
+/// 所以仅对 `self_id < peer_id` 的条目产事件；在线节点不动（其连接已权威）；
+/// 被遗忘的节点不在快照里，天然跳过。地址变化后旧的 mtls 端点多半同 IP
+/// 一起过期，故不带旧值——下次握手由对端 hello 重新广播（require 模式下
+/// 宁可拒拨明文也不误连）。
+fn dir_heal_events(
+    nodes: &[serde_json::Value],
+    self_id: &str,
+    known: &[crate::peer::PeerView],
+) -> Vec<DiscoveredPeer> {
+    let mut out = Vec::new();
+    for n in nodes {
+        let (Some(id), Some(addr)) = (
+            n.get("node_id").and_then(|v| v.as_str()),
+            n.get("addr").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        if id == self_id || self_id >= id || addr.is_empty() {
+            continue;
+        }
+        let Some(p) = known.iter().find(|x| x.node_id == id) else {
+            continue; // 未知节点交给常规发现，不凭目录盲拨
+        };
+        if p.online {
+            continue;
+        }
+        let mtls = n
+            .get("mtls_addr")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if p.addr == addr && p.mtls_addr == mtls {
+            continue; // 地址没变，旧拨号目标继续用
+        }
+        out.push(DiscoveredPeer {
+            node_id: id.to_string(),
+            name: n
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&p.name)
+                .to_string(),
+            addr: addr.to_string(),
+            mtls_addr: mtls,
+        });
+    }
+    out
+}
+
 /// Spawn a long-lived dialer that reconnects with exponential backoff.
 fn spawn_dialer(
     state: SharedState,
@@ -287,8 +364,10 @@ async fn session(
     // Always speak first: send our hello (含 mTLS 状态：CA 指纹 + 是否参与；
     // 含准入要素：硬件指纹 + 准入令牌 HMAC，v0.6 P1）。
     let mut hello_name = state.display_name();
+    let my_listen = advertised_listen(cfg);
     let mut hello = Hello::new(&cfg.node_id, &hello_name, &cfg.security.cluster_token)
-        .with_mtls(state.bridge().and_then(|b| b.tls_ca_fp()), cfg.mtls.enabled);
+        .with_mtls(state.bridge().and_then(|b| b.tls_ca_fp()), cfg.mtls.enabled)
+        .with_listen(my_listen.clone());
     if let Some(b) = state.bridge() {
         b.seal_hello(&mut hello);
     }
@@ -338,7 +417,8 @@ async fn session(
                 if cur != hello_name {
                     hello_name = cur;
                     let mut nh = Hello::new(&cfg.node_id, &hello_name, &cfg.security.cluster_token)
-                        .with_mtls(state.bridge().and_then(|b| b.tls_ca_fp()), cfg.mtls.enabled);
+                        .with_mtls(state.bridge().and_then(|b| b.tls_ca_fp()), cfg.mtls.enabled)
+                        .with_listen(my_listen.clone());
                     if let Some(b) = state.bridge() {
                         b.seal_hello(&mut nh);
                     }
@@ -352,9 +432,19 @@ async fn session(
     }
 
     if let Some(pid) = &peer_id {
-        state.peers.mark_offline(pid);
-        state.router.unregister_peer(pid);
-        tracing::info!(node_id = %pid, direction, "conn: peer offline");
+        // v0.6.9 ABA 保护：仅当该节点最后一条会话结束才判离线/注销，
+        // 旧进程（如换端口重启前的残留连接）的清理不会误杀新会话。
+        if state.peers.end_session(pid) {
+            state.peers.mark_offline(pid);
+            state.router.unregister_peer(pid);
+            tracing::info!(node_id = %pid, direction, "conn: peer offline");
+        } else {
+            tracing::info!(
+                node_id = %pid,
+                direction,
+                "conn: peer session closed (other live sessions remain)"
+            );
+        }
     }
     let _ = send.send(Frame::Close).await;
 }
@@ -435,15 +525,27 @@ async fn handle_text(
                 return false;
             }
             let changed = peer_id.as_deref() != Some(hello.node_id.as_str());
+            // v0.6.9 会话计数：首握手计数；同连接切换 node_id 时把计数迁移。
+            match peer_id.as_deref() {
+                None => state.peers.begin_session(&hello.node_id),
+                Some(old) if old != hello.node_id.as_str() => {
+                    state.peers.end_session(old);
+                    state.peers.begin_session(&hello.node_id);
+                }
+                Some(_) => {}
+            }
             *peer_id = Some(hello.node_id.clone());
+            // v0.6.9 地址漂移自愈：优先采用对端在 hello 中主动声明的可拨监听
+            // 地址；入站连接的临时源端口不可回拨，老版本无声明时维持原逻辑。
+            let (use_addr, announced) = pick_peer_addr(hello.listen.as_deref(), remote_addr);
             state
                 .peers
-                .mark_online(&hello.node_id, &hello.name, remote_addr, direction);
+                .mark_online(&hello.node_id, &hello.name, use_addr, direction, announced);
             if changed {
                 tracing::info!(
                     peer = %hello.name,
                     node_id = %hello.node_id,
-                    addr = remote_addr,
+                    addr = use_addr,
                     direction,
                     "conn: peer online"
                 );
@@ -469,7 +571,15 @@ async fn handle_text(
             }
             // v0.7 第二波：新 peer 注册后立刻推一份节点目录（spine 的目录
             // 含其它叶子；叶子收到即可在 /v1/peers 看到非直连节点）。
-            state.router.push_dir_to(&hello.node_id);
+            // v0.6.9 地址漂移自愈：对端上线/换址时改为向**所有**直连 peer
+            // 广播——否则离线节点只能等 relay 周期推送（relay 关闭时永远
+            // 等不到），换 IP 的节点无法经邻居目录被找回。新 peer 也在
+            // registry 里，广播天然覆盖它自己。
+            if changed {
+                state.router.sync_push_dir();
+            } else {
+                state.router.push_dir_to(&hello.node_id);
+            }
             // v0.6 P1 Lease：新对端注册后补推一次当前负载快照——lease 任务的
             // 每 ticker 首拍常发生在对端注册之前（阈值内静默期不再重发），
             // 若不补推，新入网节点要等下一次阈值跨越才可见负载。
@@ -543,7 +653,8 @@ async fn handle_text(
                         &state.display_name(),
                         &cfg.security.cluster_token,
                     )
-                    .with_mtls(state.bridge().and_then(|b| b.tls_ca_fp()), cfg.mtls.enabled);
+                    .with_mtls(state.bridge().and_then(|b| b.tls_ca_fp()), cfg.mtls.enabled)
+                    .with_listen(advertised_listen(cfg));
                     let _ = send_text(send, &nh).await;
                 }
                 CaAdopt::Same => {}
@@ -826,7 +937,13 @@ async fn handle_text(
                 .and_then(|v| v.as_str())
                 .unwrap_or(env.from.as_str())
                 .to_string();
-            state.router.on_node_drain(&target);
+            // v0.6.9：若该节点还有其他活跃会话（旧进程下线通告晚于新进程
+            // 重连），忽略这次 drain，避免把新实例误标离线。
+            if state.peers.session_count(&target) <= 1 {
+                state.router.on_node_drain(&target);
+            } else {
+                tracing::debug!(node_id = %target, "conn: drain ignored (other live sessions remain)");
+            }
             if cfg.relay.enabled {
                 state.router.relay_control(&env, peer_id.as_deref()).await;
             }
@@ -838,8 +955,31 @@ async fn handle_text(
             let Ok(env) = serde_json::from_value::<Envelope>(value.clone()) else {
                 return true;
             };
-            if state.router.on_node_dir(&env, peer_id.as_deref()) && cfg.relay.enabled {
-                state.router.relay_control(&env, peer_id.as_deref()).await;
+            tracing::debug!(from = %env.from, "conn: node_dir frame in");
+            if state.router.on_node_dir(&env, peer_id.as_deref()) {
+                // v0.6.9 地址漂移自愈：目录里"已知但离线、且地址已变"的节点，
+                // 立刻把新地址喂给拨号器——集群里任一链路活着即可找回换 IP 的节点。
+                if let Some(nodes) = env.payload.get("nodes").and_then(|v| v.as_array()) {
+                    let snap = state.peers.snapshot();
+                    let evs = dir_heal_events(nodes, &cfg.node_id, &snap);
+                    if !evs.is_empty() {
+                        tracing::info!(
+                            count = evs.len(),
+                            peers = %evs
+                                .iter()
+                                .map(|e| format!("{}@{}", e.node_id, e.addr))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            "conn: dir-heal re-dial events"
+                        );
+                    }
+                    for ev in evs {
+                        let _ = state.peer_tx.try_send(ev);
+                    }
+                }
+                if cfg.relay.enabled {
+                    state.router.relay_control(&env, peer_id.as_deref()).await;
+                }
             }
             true
         }
@@ -986,8 +1126,103 @@ fn bridge_ws(socket: WsStream, in_tx: mpsc::Sender<Frame>, mut out_rx: mpsc::Rec
 
 #[cfg(test)]
 mod tests {
-    use super::{dial_allowed, parse_static_peer, DialTarget};
+    use super::{dial_allowed, dir_heal_events, parse_static_peer, pick_peer_addr, DialTarget};
     use crate::config::MtlsConfig;
+    use crate::peer::PeerTable;
+    use crate::peer::PeerView;
+
+    /// v0.6.9：合法声明地址优先；未指定地址/非法串回落到观测地址。
+    #[test]
+    fn pick_peer_addr_prefers_valid_announcement() {
+        assert_eq!(
+            pick_peer_addr(Some("10.0.0.9:8765"), "127.0.0.1:44000"),
+            ("10.0.0.9:8765", true)
+        );
+        assert_eq!(
+            pick_peer_addr(None, "127.0.0.1:44000"),
+            ("127.0.0.1:44000", false)
+        );
+        assert_eq!(
+            pick_peer_addr(Some("0.0.0.0:8765"), "1.2.3.4:5"),
+            ("1.2.3.4:5", false)
+        );
+        assert_eq!(
+            pick_peer_addr(Some("not-an-addr"), "1.2.3.4:5"),
+            ("1.2.3.4:5", false)
+        );
+    }
+
+    /// v0.6.9 ABA 保护：同节点多条会话，仅最后一条结束时判离线。
+    #[test]
+    fn session_refcount_only_last_one_offlines() {
+        let t = PeerTable::new();
+        t.mark_online("b", "B", "10.0.0.2:8765", "in", true);
+        t.begin_session("b");
+        t.begin_session("b");
+        assert!(!t.end_session("b"), "旧会话结束但新会话仍在，不应判离线");
+        assert!(t.is_online("b"));
+        assert!(t.end_session("b"), "最后一条会话结束应判离线");
+        assert_eq!(t.session_count("b"), 0);
+    }
+
+    fn view(id: &str, addr: &str, online: bool) -> PeerView {
+        PeerView {
+            node_id: id.to_string(),
+            name: id.to_string(),
+            addr: addr.to_string(),
+            mtls_addr: None,
+            tags: vec![],
+            online,
+            last_seen_seconds_ago: 0,
+            direction: String::new(),
+            load: None,
+            relayed: None,
+            via: None,
+        }
+    }
+
+    /// v0.6.9 地址漂移自愈：仅"已知+离线+地址已变"触发重拨；在线/未变/未知/
+    /// 非本方拨号（self_id 较大）一律跳过。
+    #[test]
+    fn dir_heal_only_for_offline_changed_addrs() {
+        let nodes = serde_json::json!([
+            { "node_id": "bbb", "name": "B", "addr": "10.0.0.9:8765" }, // 离线且换址 → 自愈
+            { "node_id": "ccc", "name": "C", "addr": "10.0.0.3:8765" }, // 地址未变 → 跳过
+            { "node_id": "ddd", "name": "D", "addr": "10.0.0.4:8765" }, // 在线 → 跳过
+            { "node_id": "eee", "name": "E", "addr": "10.0.0.5:8765" }, // 未知 → 跳过
+            { "node_id": "aaa", "name": "A", "addr": "10.0.0.1:8765" }, // 自身 → 跳过
+            { "node_id": "fff", "name": "F", "addr": "" },              // 空址 → 跳过
+        ]);
+        let known = vec![
+            view("bbb", "10.0.0.8:8765", false),
+            view("ccc", "10.0.0.3:8765", false),
+            view("ddd", "10.0.0.4:8765", true),
+            view("aaa", "10.0.0.1:8765", false),
+        ];
+        let evs = dir_heal_events(nodes.as_array().unwrap(), "aaa", &known);
+        assert_eq!(evs.len(), 1, "只应产出 bbb：{evs:?}");
+        assert_eq!(evs[0].node_id, "bbb");
+        assert_eq!(evs[0].addr, "10.0.0.9:8765");
+        assert_eq!(evs[0].name, "B");
+        assert_eq!(evs[0].mtls_addr, None);
+    }
+
+    /// 目录条目若带 mtls 端点（未来扩展），自愈时原样透传。
+    #[test]
+    fn dir_heal_passes_mtls_when_advertised() {
+        let nodes = serde_json::json!([
+            { "node_id": "bbb", "addr": "10.0.0.9:8765", "mtls_addr": "10.0.0.9:8766" },
+        ]);
+        let evs = dir_heal_events(nodes.as_array().unwrap(), "aaa", &[]);
+        assert!(evs.is_empty(), "未知节点不凭目录盲拨");
+        let evs = dir_heal_events(
+            nodes.as_array().unwrap(),
+            "aaa",
+            &[view("bbb", "10.0.0.8:8765", false)],
+        );
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].mtls_addr.as_deref(), Some("10.0.0.9:8766"));
+    }
 
     #[test]
     fn static_peer_scheme_marks_mtls() {

@@ -1060,10 +1060,11 @@ impl Config {
         cluster_token: Option<String>,
         mode: Option<String>,
     ) -> Self {
+        let node_id = new_short_id();
         Config {
             v: CURRENT_CONFIG_VERSION,
-            node_id: new_short_id(),
-            name: name.unwrap_or_else(default_node_name),
+            node_id: node_id.clone(),
+            name: name.unwrap_or_else(|| default_node_name(&node_id)),
             listen_port: DEFAULT_LISTEN_PORT,
             data_dir: default_data_dir(),
             tags: Vec::new(),
@@ -1302,16 +1303,41 @@ pub fn new_secret() -> String {
     s
 }
 
-fn default_node_name() -> String {
-    // 节点名默认用本机局域网 IPv4，直观可辨；也可手动改 name。
-    if let Ok(ip) = local_ip_address::local_ip() {
-        return ip.to_string();
-    }
-    let host = std::env::var("COMPUTERNAME")
+fn default_node_name(node_id: &str) -> String {
+    // v0.6.9：默认优先取真实主机名（IP 会变、主机名相对稳定），取不到回落
+    // node_id（唯一且稳定）。不再用局域网 IP 当名字——换 IP 后名字即失真。
+    // 用户随时可通过 name 字段或控制台改名。
+    system_host_name().unwrap_or_else(|| node_id.to_string())
+}
+
+/// 尽力获取真实主机名：环境变量（Windows COMPUTERNAME / HOSTNAME）优先，
+/// Unix 再读 /etc/hostname；全部拿不到返回 None。
+fn system_host_name() -> Option<String> {
+    let from_env = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "host".to_string());
-    let host = host.split('.').next().unwrap_or("host").to_string();
-    format!("agent-{host}")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(h) = from_env {
+        let short = h.split('.').next().unwrap_or(h.as_str()).to_string();
+        if !short.is_empty() {
+            return Some(short);
+        }
+    }
+    #[cfg(unix)]
+    if let Ok(raw) = std::fs::read_to_string("/etc/hostname") {
+        let short = raw
+            .trim()
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !short.is_empty() {
+            return Some(short);
+        }
+    }
+    None
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -1388,6 +1414,19 @@ pub fn load_config(
 
 #[cfg(test)]
 mod tests {
+    /// v0.6.9：默认名优先真实主机名，取不到回落 node_id；绝不再用 IP。
+    #[test]
+    fn default_node_name_is_hostname_or_id_never_ip() {
+        let n = default_node_name("abcd1234");
+        assert!(!n.is_empty());
+        assert!(!n.contains(char::is_whitespace));
+        // IP 形态（全数字+点）不应作为默认名——除非主机名恰好如此，极罕见，
+        // 这里只断言不再是 local_ip 的 IPv4 串。
+        assert!(
+            n.parse::<std::net::Ipv4Addr>().is_err(),
+            "默认名不应是 IP：{n}"
+        );
+    }
 
     /// v1.0 包⑧：license 激活端点为 Admin 专属商务操作。
     #[test]

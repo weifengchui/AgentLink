@@ -2232,12 +2232,13 @@ impl Router {
                 if this.agent_ttl > 0 && counter.is_multiple_of(5) {
                     this.evict_stale_agents();
                 }
-                // v0.7 第二波：目录过期清理 + 中继周期推送（仅 spine 推送）。
+                // v0.7 第二波：目录过期清理 + 中继周期推送。
+                // v0.6.9 地址漂移自愈：周期推送不再门控 relay——离线检测
+                // （心跳超时）通常晚于邻居的上线广播，只靠注册事件推送会让
+                // 「先标离线、后收目录」的窗口错过自愈；小帧 5s 一级，代价可忽略。
                 if counter.is_multiple_of(DIR_SYNC_INTERVAL_SECS) {
                     this.dir_prune();
-                    if this.relay.enabled {
-                        this.sync_push_dir();
-                    }
+                    this.sync_push_dir();
                 }
                 if this.compact_due.swap(false, Ordering::Relaxed) {
                     this.compact_journal().await;
