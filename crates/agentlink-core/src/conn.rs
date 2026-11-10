@@ -349,6 +349,26 @@ fn dial_allowed(mtls: &MtlsConfig, use_tls: bool, target: &DialTarget) -> Result
 
 // ---- session ----------------------------------------------------------------
 
+/// v0.6.10 会话计数状态机（纯函数，便于单测）：握手成功后决定引用计数迁移。
+/// 返回 `(begin 目标, 需要 end 的旧 node_id)`。
+/// - 未计数过（`counted=false`）：首握手**无条件** begin——包括 expected_peer
+///   预置 peer_id 的出站拨号场景（v0.6.9 漏计数的根因）。
+/// - 已计数且同 node_id 重发 hello（改名重播）：不动计数。
+/// - 已计数且切换 node_id：旧计数 end、新计数 begin（迁移）。
+fn session_counting<'a>(
+    counted: bool,
+    prev: Option<&'a str>,
+    hello_id: &'a str,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if !counted {
+        return (Some(hello_id), None);
+    }
+    match prev {
+        Some(old) if old != hello_id => (Some(hello_id), Some(old)),
+        _ => (None, None),
+    }
+}
+
 /// Handshake, then pump frames until the connection closes or times out.
 async fn session(
     state: SharedState,
@@ -376,6 +396,10 @@ async fn session(
     }
 
     let mut peer_id: Option<String> = expected_peer;
+    // v0.6.10 会话计数修复：本会话是否已计入 PeerTable 引用计数。此前出站
+    // 拨号（expected 预置 peer_id）首握手会跳过 begin_session，导致
+    // teardown 的 end_session 恒判"最后一条会话"而误杀同 node_id 的活会话。
+    let mut counted = false;
     let mut last_recv = Instant::now();
     let heartbeat_secs = cfg.discovery.heartbeat_interval_seconds.max(1);
     let timeout = Duration::from_secs(cfg.discovery.offline_timeout_seconds.max(heartbeat_secs));
@@ -389,7 +413,8 @@ async fn session(
                     Frame::Text(text) => {
                         last_recv = Instant::now();
                         let keep = handle_text(
-                            &state, &text, &mut peer_id, direction, &remote_addr, strict, &send,
+                            &state, &text, &mut peer_id, &mut counted, direction, &remote_addr,
+                            strict, &send,
                         ).await;
                         if !keep {
                             break;
@@ -432,9 +457,17 @@ async fn session(
     }
 
     if let Some(pid) = &peer_id {
-        // v0.6.9 ABA 保护：仅当该节点最后一条会话结束才判离线/注销，
-        // 旧进程（如换端口重启前的残留连接）的清理不会误杀新会话。
-        if state.peers.end_session(pid) {
+        // v0.6.10：仅当本会话握手成功并计过数时才做 end_session/离线清理。
+        // 未计数的连接（拨号后握手从未完成，如超时断链、被拒）不得误杀同
+        // node_id 的活会话；活会话的离线判定由其自身 teardown 负责。
+        if !counted {
+            tracing::debug!(
+                node_id = %pid,
+                direction,
+                "conn: session closed without completed handshake (not counted)"
+            );
+        } else if state.peers.end_session(pid) {
+            // v0.6.9 ABA 保护：仅当该节点最后一条会话结束才判离线/注销。
             state.peers.mark_offline(pid);
             state.router.unregister_peer(pid);
             tracing::info!(node_id = %pid, direction, "conn: peer offline");
@@ -450,10 +483,12 @@ async fn session(
 }
 
 /// Handle a decoded text frame. Returns `false` if the connection must close.
+#[allow(clippy::too_many_arguments)]
 async fn handle_text(
     state: &SharedState,
     text: &str,
     peer_id: &mut Option<String>,
+    counted: &mut bool,
     direction: &'static str,
     remote_addr: &str,
     strict: bool,
@@ -525,14 +560,18 @@ async fn handle_text(
                 return false;
             }
             let changed = peer_id.as_deref() != Some(hello.node_id.as_str());
-            // v0.6.9 会话计数：首握手计数；同连接切换 node_id 时把计数迁移。
-            match peer_id.as_deref() {
-                None => state.peers.begin_session(&hello.node_id),
-                Some(old) if old != hello.node_id.as_str() => {
-                    state.peers.end_session(old);
-                    state.peers.begin_session(&hello.node_id);
-                }
-                Some(_) => {}
+            // v0.6.10 会话计数修复：首握手无条件计数——此前 expected_peer 预置
+            // peer_id 会让出站拨号会话漏计数（match Some(_) => {} 跳过
+            // begin_session），teardown 的 end_session 恒返回 true 而误杀同
+            // node_id 的其它活会话。同连接切换 node_id 时迁移计数。
+            let (begin_id, end_old) =
+                session_counting(*counted, peer_id.as_deref(), &hello.node_id);
+            if let Some(old) = end_old {
+                state.peers.end_session(old);
+            }
+            if let Some(id) = begin_id {
+                state.peers.begin_session(id);
+                *counted = true;
             }
             *peer_id = Some(hello.node_id.clone());
             // v0.6.9 地址漂移自愈：优先采用对端在 hello 中主动声明的可拨监听
@@ -1126,10 +1165,46 @@ fn bridge_ws(socket: WsStream, in_tx: mpsc::Sender<Frame>, mut out_rx: mpsc::Rec
 
 #[cfg(test)]
 mod tests {
-    use super::{dial_allowed, dir_heal_events, parse_static_peer, pick_peer_addr, DialTarget};
+    use super::{
+        dial_allowed, dir_heal_events, parse_static_peer, pick_peer_addr, session_counting,
+        DialTarget,
+    };
     use crate::config::MtlsConfig;
     use crate::peer::PeerTable;
     use crate::peer::PeerView;
+
+    /// v0.6.10 事故回归：出站拨号（expected 预置 peer_id）首握手必须计数，
+    /// 否则 teardown 的 end_session 恒判"最后一条"而误杀活会话。
+    #[test]
+    fn session_counting_counts_preset_expected_dialer() {
+        // 预置 expected 的首握手：无条件 begin（v0.6.9 漏计数的根因）。
+        assert_eq!(session_counting(false, Some("a"), "a"), (Some("a"), None));
+        // 入站首握手（无预置）同样 begin。
+        assert_eq!(session_counting(false, None, "a"), (Some("a"), None));
+        // 已计数后改名重播 hello：不动计数。
+        assert_eq!(session_counting(true, Some("a"), "a"), (None, None));
+        // 已计数后同连接切换身份：旧 end、新 begin（迁移）。
+        assert_eq!(
+            session_counting(true, Some("a"), "b"),
+            (Some("b"), Some("a"))
+        );
+    }
+
+    /// v0.6.10 回归：拨号会话计入后，第二条会话结束不再误杀第一条。
+    #[test]
+    fn counted_sessions_survive_sibling_teardown() {
+        let t = PeerTable::new();
+        // 模拟握手成功：两条会话（out 拨号 + in 入站）都 begin。
+        t.mark_online("a", "A", "10.0.0.1:8765", "out", true);
+        t.begin_session("a");
+        t.begin_session("a");
+        // 其一 teardown：end_session 返回 false → 不应 mark_offline/unregister。
+        assert!(!t.end_session("a"));
+        assert!(t.is_online("a"), "活会话仍在，不应被误标离线");
+        assert!(t.end_session("a"), "最后一条会话结束应判离线");
+        t.mark_offline("a");
+        assert!(!t.is_online("a"));
+    }
 
     /// v0.6.9：合法声明地址优先；未指定地址/非法串回落到观测地址。
     #[test]

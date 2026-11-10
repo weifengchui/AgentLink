@@ -2414,6 +2414,11 @@ impl Router {
         self.registry.len()
     }
 
+    /// v0.6.10：该 node_id 是否仍持有注册的活会话 sink（陈旧 bye 守卫用）。
+    pub fn has_peer(&self, node_id: &str) -> bool {
+        self.registry.get(node_id).is_some()
+    }
+
     /// v0.7 §6.3：当前降级模式（纯计算，不改状态）。
     /// 只读优先级最高；standalone 仅在「阈值 >0 且无直连对端且静默超时」时成立。
     pub fn mesh_mode(&self) -> MeshMode {

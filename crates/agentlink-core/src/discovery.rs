@@ -94,6 +94,12 @@ async fn send(socket: &UdpSocket, state: &SharedState, action: &str) {
     }
 }
 
+/// v0.6.10 陈旧 bye 判定（纯函数，便于单测）：只要该节点还有活会话
+/// （引用计数 >0 或 router 仍持有 sink），bye 视为陈旧/误发，忽略。
+fn bye_is_stale(session_count: u32, has_live_sink: bool) -> bool {
+    session_count > 0 || has_live_sink
+}
+
 fn handle_datagram(data: &[u8], src: SocketAddr, cfg: &Config, state: &SharedState) {
     let msg: DiscoveryMessage = match serde_json::from_slice(data) {
         Ok(m) => m,
@@ -110,6 +116,23 @@ fn handle_datagram(data: &[u8], src: SocketAddr, cfg: &Config, state: &SharedSta
     let mtls_addr = msg.mtls_port.map(|p| format!("{}:{}", src.ip(), p));
 
     if msg.action == "bye" {
+        // v0.6.10 陈旧 bye 守卫：bye 只在节点 shutdown 时广播一次，可能迟到
+        // 或误发（对端重启后旧进程的关机广播、同网段克隆身份）。只要本地仍有
+        // 该节点的活会话（引用计数 >0 或 router 仍持有 sink），就不标离线——
+        // 否则一次陈旧 bye 会把活节点永久钉成"离线"：mark_offline 之后没有
+        // 任何路径把 online 拨回 true（心跳只 touch last_seen），直到下次握手。
+        // 真离线由会话自身的 heartbeat timeout teardown 负责。
+        if bye_is_stale(
+            state.peers.session_count(&msg.node_id),
+            state.router.has_peer(&msg.node_id),
+        ) {
+            tracing::info!(
+                peer = %msg.name,
+                node_id = %msg.node_id,
+                "discovery: stale bye ignored (live session present)"
+            );
+            return;
+        }
         state.peers.mark_offline(&msg.node_id);
         tracing::info!(peer = %msg.name, node_id = %msg.node_id, "discovery: peer announced bye");
         // v0.6 P2 wake-kit 收敛：bye 不走 unregister_peer（registry 仍在
@@ -138,5 +161,24 @@ fn handle_datagram(data: &[u8], src: SocketAddr, cfg: &Config, state: &SharedSta
     };
     if let Err(e) = state.peer_tx.try_send(ev) {
         tracing::trace!(error = %e, "discovery: peer event dropped (channel full)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bye_is_stale;
+
+    /// v0.6.10 事故回归：活会话存在时 bye 必须判陈旧（否则把活节点钉成离线）。
+    #[test]
+    fn stale_bye_ignored_while_session_alive() {
+        assert!(bye_is_stale(1, false), "引用计数 >0 应忽略 bye");
+        assert!(bye_is_stale(0, true), "registry 仍有 sink 应忽略 bye");
+        assert!(bye_is_stale(2, true));
+    }
+
+    /// 无活会话时 bye 正常生效（真关机走这里标离线）。
+    #[test]
+    fn real_bye_applies_when_no_live_session() {
+        assert!(!bye_is_stale(0, false));
     }
 }
