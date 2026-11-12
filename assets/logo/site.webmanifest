@@ -2,7 +2,7 @@
   "name": "AgentLink",
   "short_name": "AgentLink",
   "description": "局域网里的 AI Agent 消息总线：单二进制、零运行时依赖。",
-  "start_url": "../../",
+  "start_url": "./",
   "display": "standalone",
   "background_color": "#06080f",
   "theme_color": "#06080f",

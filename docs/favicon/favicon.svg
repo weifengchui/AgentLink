@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="AgentLink">
+  <title>AgentLink · favicon（深空方底 + 长颈鹿微标）</title>
+  <defs>
+    <linearGradient id="fv-bus" x1="14" y1="58" x2="46" y2="2" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4f8cff"/>
+      <stop offset="1" stop-color="#38e1c6"/>
+    </linearGradient>
+    <radialGradient id="fv-bg" cx=".3" cy=".2" r="1.1">
+      <stop offset="0" stop-color="#13233f"/>
+      <stop offset="1" stop-color="#05070f"/>
+    </radialGradient>
+    <clipPath id="fv-clip"><rect width="64" height="64" rx="14.5"/></clipPath>
+  </defs>
+  <g clip-path="url(#fv-clip)">
+    <rect width="64" height="64" fill="url(#fv-bg)"/>
+    <g transform="translate(32 32) scale(.92) translate(-32 -32)">
+      <g fill="none" stroke="url(#fv-bus)" stroke-linecap="round">
+        <path d="M24 44.5 C22.4 33 25.4 24 31.4 19" stroke-width="11.5"/>
+        <path d="M21 46.5 H42.5" stroke-width="12"/>
+        <path d="M27 52 V57.5 M37 52 V57.5" stroke-width="5.6" opacity=".9"/>
+      </g>
+      <ellipse cx="35" cy="14" rx="8.8" ry="7.2" transform="rotate(-10 35 14)" fill="#0a1220" stroke="#38e1c6" stroke-width="3.9"/>
+      <circle cx="33.4" cy="12.6" r="2.6" fill="#eafcff"/>
+      <g fill="#38e1c6">
+        <circle cx="31.2" cy="3.8" r="3.2"/>
+        <circle cx="40.4" cy="4.2" r="3.2"/>
+      </g>
+      <g fill="#eafcff">
+        <circle cx="23.4" cy="36" r="3"/>
+        <circle cx="25.8" cy="26.8" r="3"/>
+      </g>
+    </g>
+  </g>
+</svg>
