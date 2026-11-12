@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>AgentLink · 消息星图 v5</title>
+<link rel="icon" type="image/svg+xml" href="__FAV__">
 <style>
 :root{--ink:#04070d;--panel:rgba(11,17,27,.88);--edge:rgba(108,168,255,.16);--txt:#d7e2ee;--mut:#6b7d94;
 --fs:1;--cyan:#38d6e6;--blue:#7fb0ff;--green:#43d97b;--amber:#ffb347;--violet:#c77dff;--red:#ff5c7a}
@@ -32,6 +33,7 @@ background:linear-gradient(180deg,rgba(4,7,13,.82),transparent)}
 #brand{display:flex;align-items:center;gap:14px}
 #brand h1{font-size:calc(20px*var(--fs));font-weight:600;letter-spacing:3px;color:#cfe4ff;margin:0}
 #brand h1 em{font-style:normal;color:var(--cyan)}
+#brand .mark{width:30px;height:30px;flex:0 0 auto;filter:drop-shadow(0 0 10px rgba(56,214,230,.45))}
 #brand .sub{font-size:calc(11px*var(--fs));color:var(--mut);letter-spacing:.6em;border-left:1px solid var(--edge);padding-left:14px;margin-top:4px}
 #hud{display:flex;gap:22px;font-size:calc(12px*var(--fs));color:var(--mut)}
 #hud b{color:var(--txt);font-size:calc(15px*var(--fs));font-family:ui-monospace,Consolas,monospace}
@@ -229,7 +231,7 @@ background:rgba(11,17,27,.7);letter-spacing:.12em;transition:all .18s}
   </div>
 </div></div>
 <div id="topbar">
-  <div id="brand"><h1>AGENT<em>LINK</em> · 消息星图</h1></div>
+  <div id="brand"><svg class="mark" viewBox="0 0 64 64" role="img" aria-label="AgentLink"><defs><linearGradient id="al-sm" x1="14" y1="58" x2="46" y2="2" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#4f8cff"/><stop offset="1" stop-color="#38e1c6"/></linearGradient></defs><g fill="none" stroke="url(#al-sm)" stroke-linecap="round"><path d="M24 44.5C22.4 33 25.4 24 31.4 19" stroke-width="11.5"/><path d="M21 46.5H42.5" stroke-width="12"/><path d="M27 52v5.5M37 52v5.5" stroke-width="5.6" opacity=".9"/></g><ellipse cx="35" cy="14" rx="8.8" ry="7.2" transform="rotate(-10 35 14)" fill="#0a1220" stroke="#38e1c6" stroke-width="3.9"/><circle cx="33.4" cy="12.6" r="2.6" fill="#eafcff"/><g fill="#38e1c6"><circle cx="31.2" cy="3.8" r="3.2"/><circle cx="40.4" cy="4.2" r="3.2"/></g><g fill="#eafcff"><circle cx="23.4" cy="36" r="3"/><circle cx="25.8" cy="26.8" r="3"/></g></svg><h1>AGENT<em>LINK</em> · 消息星图</h1></div>
   <div id="hud"></div>
 </div>
 <div id="bar">

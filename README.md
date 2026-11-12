@@ -1,6 +1,10 @@
-# AgentLink
+<p align="center">
+  <img src="assets/logo/agentlink-mark-glow.svg" width="96" alt="AgentLink giraffe mark">
+</p>
 
-**A tiny LAN message bus for AI agents.** Built for programs, not for human chat.
+<h1 align="center">AgentLink</h1>
+
+<p align="center"><strong>A tiny LAN message bus for AI agents.</strong> Built for programs, not for human chat.</p>
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 

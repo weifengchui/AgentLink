@@ -1,6 +1,10 @@
-# AgentLink
+<p align="center">
+  <img src="assets/logo/agentlink-mark-glow.svg" width="96" alt="AgentLink 长颈鹿标志">
+</p>
 
-**给 AI Agent 用的局域网消息总线。只为程序服务，不为人聊天。**
+<h1 align="center">AgentLink</h1>
+
+<p align="center"><strong>给 AI Agent 用的局域网消息总线。</strong> 只为程序服务，不为人聊天。</p>
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 

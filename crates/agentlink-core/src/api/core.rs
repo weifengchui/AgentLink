@@ -1922,6 +1922,17 @@ pub(super) async fn web_setup(
         .into_response()
 }
 
+/// 品牌图标：编译期内嵌进二进制，页面用 data URI 引用，省掉一次请求和一个资产目录。
+const FAVICON_SVG: &str = include_str!("../../web/favicon.svg");
+
+fn favicon_data_uri() -> String {
+    use base64::Engine;
+    format!(
+        "data:image/svg+xml;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(FAVICON_SVG)
+    )
+}
+
 /// Human-friendly dashboard page (no assets; token is entered in-session and
 /// sent via `X-Auth-Token` header, never in the URL).
 pub(super) async fn web_page(State(state): State<SharedState>) -> Response {
@@ -1944,7 +1955,7 @@ pub(super) async fn starmap_page() -> Response {
     (
         StatusCode::OK,
         headers,
-        Html(include_str!("../../web/starmap.html")),
+        Html(include_str!("../../web/starmap.html").replace("__FAV__", &favicon_data_uri())),
     )
         .into_response()
 }
@@ -1953,6 +1964,7 @@ pub(super) fn web_html(history_len: usize) -> String {
     const HTML: &str = r#"<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AgentLink · Console v__VER__</title>
+<link rel="icon" type="image/svg+xml" href="__FAV__">
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1962,7 +1974,7 @@ a{color:#4f8cff;text-decoration:none}
 #app{display:grid;grid-template-columns:var(--sw,220px) 8px 1fr;min-height:100vh}
 #sidebar{background:#0e1219;border-right:1px solid #1c2330;padding:16px 12px;position:sticky;top:0;height:100vh;overflow:auto}
 #logo{display:flex;align-items:center;gap:8px;padding:4px 8px 14px;font-weight:700;font-size:15px;letter-spacing:.2px}
-#logo .dot{width:10px;height:10px;border-radius:50%;background:#4f8cff;box-shadow:0 0 10px #4f8cff}
+#logo .mark{width:24px;height:24px;flex:0 0 auto;filter:drop-shadow(0 0 8px rgba(79,140,255,.5))}
 #sidebar .nav{margin:2px 0;padding:8px 10px;border-radius:8px;cursor:pointer;color:#9aa7b8;display:flex;align-items:center;gap:8px}
 #sidebar .nav:hover{background:#141b26;color:#e6edf5}
 #sidebar .nav.active{background:#16233b;color:#7fb0ff}
@@ -2114,7 +2126,7 @@ th.srt:hover{color:#dbe2ea}
 </div>
 <div id="app" class="hidden">
 <aside id="sidebar">
-  <div id="logo"><span class="dot"></span><span class="lgn">AgentLink</span> <span class="ver-badge" title="当前节点版本">v__VER__</span></div>
+  <div id="logo"><svg class='mark' viewBox='0 0 64 64' role='img' aria-label='AgentLink'><defs><linearGradient id='al-lg' x1='14' y1='58' x2='46' y2='2' gradientUnits='userSpaceOnUse'><stop offset='0' stop-color='#4f8cff'/><stop offset='1' stop-color='#38e1c6'/></linearGradient></defs><g fill='none' stroke='url(#al-lg)' stroke-linecap='round'><path d='M24 44.5C22.4 33 25.4 24 31.4 19' stroke-width='11.5'/><path d='M21 46.5H42.5' stroke-width='12'/><path d='M27 52v5.5M37 52v5.5' stroke-width='5.6' opacity='.9'/></g><ellipse cx='35' cy='14' rx='8.8' ry='7.2' transform='rotate(-10 35 14)' fill='#0a1220' stroke='#38e1c6' stroke-width='3.9'/><circle cx='33.4' cy='12.6' r='2.6' fill='#eafcff'/><g fill='#38e1c6'><circle cx='31.2' cy='3.8' r='3.2'/><circle cx='40.4' cy='4.2' r='3.2'/></g><g fill='#eafcff'><circle cx='23.4' cy='36' r='3'/><circle cx='25.8' cy='26.8' r='3'/></g></svg><span class="lgn">AgentLink</span> <span class="ver-badge" title="当前节点版本">v__VER__</span></div>
   <div class="nav active" data-p="overview" onclick="show('overview')"><span class="sho">总</span><span class="ful">总览</span></div>
   <div class="nav" data-p="nodes" onclick="show('nodes')"><span class="sho">节</span><span class="ful">节点</span></div>
   <div class="nav" data-p="agents" onclick="show('agents')"><span class="sho">智</span><span class="ful">Agent</span></div>
@@ -2757,6 +2769,7 @@ setInterval(()=>{if($('auto-refresh').checked){refresh();loadTasks(false);}},200
 </script></body></html>"#;
     HTML.replace("__LEN__", &history_len.to_string())
         .replace("__VER__", VERSION)
+        .replace("__FAV__", &favicon_data_uri())
 }
 
 // ---- local subscription -----------------------------------------------------
@@ -3021,5 +3034,38 @@ mod name_header_tests {
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz"), "%zz");
         assert_eq!(percent_decode("%2"), "%2");
+    }
+}
+
+#[cfg(test)]
+mod brand_assets_tests {
+    use super::{favicon_data_uri, web_html, FAVICON_SVG};
+
+    /// 品牌资产与编译期内嵌副本逐字节对齐（发布包只带 crate，资产不在则跳过）。
+    #[test]
+    fn embedded_favicon_matches_brand_asset() {
+        let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/logo/favicon/favicon.svg");
+        if !asset.exists() {
+            return;
+        }
+        assert_eq!(std::fs::read(&asset).unwrap(), FAVICON_SVG.as_bytes());
+    }
+
+    #[test]
+    fn console_page_has_giraffe_mark_and_favicon() {
+        let html = web_html(500);
+        assert!(html.contains(r#"href="data:image/svg+xml;base64,"#));
+        assert!(html.contains(r#"<svg class='mark'"#), "侧栏长颈鹿丢失");
+        assert!(!html.contains("__FAV__"), "favicon 占位符未替换");
+    }
+
+    #[test]
+    fn starmap_page_renders_favicon_placeholder() {
+        let rendered =
+            include_str!("../../web/starmap.html").replace("__FAV__", &favicon_data_uri());
+        assert!(rendered.contains(r#"href="data:image/svg+xml;base64,"#));
+        assert!(rendered.contains(r#"id="al-sm""#), "星图顶栏长颈鹿丢失");
+        assert!(!rendered.contains("__FAV__"), "favicon 占位符未替换");
     }
 }
