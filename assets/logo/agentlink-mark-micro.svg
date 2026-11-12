@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="AgentLink">
+  <title>AgentLink · 主 mark（micro 版）：16/32px、导航与 favicon 用；角柄/耳/尾/斑已收进粗描边</title>
+  <defs>
+    <linearGradient id="alm-bus" x1="14" y1="58" x2="46" y2="2" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4f8cff"/>
+      <stop offset=".55" stop-color="#5fc6ff"/>
+      <stop offset="1" stop-color="#38e1c6"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke="url(#alm-bus)" stroke-linecap="round">
+    <path d="M24 44.5 C22.4 33 25.4 24 31.4 19" stroke-width="11.5"/>
+    <path d="M21 46.5 H42.5" stroke-width="12"/>
+    <path d="M27 52 V57.5 M37 52 V57.5" stroke-width="5.6" opacity=".9"/>
+  </g>
+  <ellipse cx="35" cy="14" rx="8.8" ry="7.2" transform="rotate(-10 35 14)" fill="#0a1220" stroke="#38e1c6" stroke-width="3.9"/>
+  <circle cx="33.4" cy="12.6" r="2.6" fill="#eafcff"/>
+  <g fill="#38e1c6">
+    <circle cx="31.2" cy="3.8" r="3.2"/>
+    <circle cx="40.4" cy="4.2" r="3.2"/>
+  </g>
+  <g fill="#eafcff">
+    <circle cx="23.4" cy="36" r="3"/>
+    <circle cx="25.8" cy="26.8" r="3"/>
+  </g>
+</svg>

@@ -1,0 +1,14 @@
+{
+  "name": "AgentLink",
+  "short_name": "AgentLink",
+  "description": "局域网里的 AI Agent 消息总线：单二进制、零运行时依赖。",
+  "start_url": "../../",
+  "display": "standalone",
+  "background_color": "#06080f",
+  "theme_color": "#06080f",
+  "icons": [
+    { "src": "favicon/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "favicon/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "favicon/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

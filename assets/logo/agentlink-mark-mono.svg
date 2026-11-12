@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="AgentLink">
+  <title>AgentLink · 主 mark（单色版）：印刷/水印用，节点用镂空表达</title>
+  <defs>
+    <mask id="almo-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+      <rect width="64" height="64" fill="#fff"/>
+      <circle cx="23.2" cy="38.4" r="2.7" fill="#000"/>
+      <circle cx="24" cy="32" r="2.7" fill="#000"/>
+      <circle cx="25.6" cy="25.8" r="2.7" fill="#000"/>
+    </mask>
+  </defs>
+  <g fill="none" stroke="currentColor" stroke-linecap="round">
+    <path d="M23 44 C21.8 33 24.4 24.6 30 20" stroke-width="7" mask="url(#almo-cut)"/>
+    <path d="M22 46 H42" stroke-width="7.5"/>
+    <path d="M43 44.6 L47.6 40.4" stroke-width="3.6"/>
+    <path d="M27.5 50 V55 M38 50 V55" stroke-width="3.4"/>
+    <path d="M31 10.4 L30.2 5.8 M36.6 10 L37.6 5.8" stroke-width="2.6"/>
+    <path d="M28 12 L24.6 9.8" stroke-width="3.4"/>
+  </g>
+  <ellipse cx="33" cy="15.4" rx="6.6" ry="5.4" transform="rotate(-12 33 15.4)" fill="none" stroke="currentColor" stroke-width="2.3"/>
+  <g fill="currentColor">
+    <circle cx="31.6" cy="13.8" r="1.5"/>
+    <circle cx="30" cy="4.8" r="2"/>
+    <circle cx="38" cy="4.8" r="2"/>
+    <circle cx="48.6" cy="39.4" r="2"/>
+    <circle cx="27.5" cy="56.4" r="2.3"/>
+    <circle cx="38" cy="56.4" r="2.3"/>
+    <circle cx="23.2" cy="38.4" r="1.1"/>
+    <circle cx="24" cy="32" r="1.1"/>
+    <circle cx="25.6" cy="25.8" r="1.1"/>
+  </g>
+</svg>

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="AgentLink">
+  <title>AgentLink · D2 长颈鹿（颈上节点串 + 角尖端口）</title>
+  <defs>
+    <linearGradient id="an2-d" x1="16" y1="56" x2="42" y2="4" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4f8cff"/>
+      <stop offset=".55" stop-color="#5fc6ff"/>
+      <stop offset="1" stop-color="#38e1c6"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke="url(#an2-d)" stroke-linecap="round">
+    <path d="M23 44 C21.8 33 24.4 24.6 30 20" stroke-width="7"/>
+    <path d="M22 46 H42" stroke-width="7.5"/>
+    <path d="M43.4 44.6 C46.2 42.8 46.4 40 44.8 38" stroke-width="3.2" opacity=".8"/>
+    <path d="M27.5 50 V55 M38 50 V55" stroke-width="3.4" opacity=".8"/>
+    <path d="M31 10.4 L30.2 5.6 M36.6 10 L37.8 5.6" stroke-width="2.6"/>
+    <path d="M28.2 11.8 L23.8 9.4" stroke-width="3.2" opacity=".9"/>
+  </g>
+  <ellipse cx="33" cy="15.4" rx="6.6" ry="5.4" transform="rotate(-12 33 15.4)" fill="#0a1220" stroke="#38e1c6" stroke-width="2.3"/>
+  <g fill="#38e1c6">
+    <circle cx="30" cy="4.6" r="2"/>
+    <circle cx="38.2" cy="4.6" r="2"/>
+  </g>
+  <circle cx="31.6" cy="13.8" r="1.4" fill="#eafcff"/>
+  <circle cx="38" cy="16.4" r="1" fill="#5fc6ff"/>
+  <g fill="#eafcff" opacity=".92">
+    <circle cx="23.2" cy="38.4" r="1.8"/>
+    <circle cx="24" cy="32" r="1.8"/>
+    <circle cx="25.6" cy="25.8" r="1.8"/>
+  </g>
+  <g fill="#0b1a2c" opacity=".5">
+    <circle cx="30" cy="46" r="2.1"/>
+    <circle cx="37" cy="46" r="2.1"/>
+  </g>
+  <g fill="#4f8cff">
+    <circle cx="27.5" cy="56.4" r="2.3"/>
+    <circle cx="38" cy="56.4" r="2.3"/>
+  </g>
+</svg>

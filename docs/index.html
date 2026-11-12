@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AgentLink — 局域网里的 AI Agent 消息总线</title>
 <meta name="description" content="让多台机器上的 AI Agent 互相认识、可靠送货、协同干活。单 Rust 二进制、零运行时依赖，不装 etcd/Redis/Docker。实测空闲 CPU ≈0%、常驻内存 ≈13MB。">
+<link rel="icon" href="../assets/logo/favicon/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/logo/favicon/favicon.ico" sizes="48x48">
+<link rel="apple-touch-icon" href="../assets/logo/favicon/apple-touch-icon.png">
+<link rel="manifest" href="../assets/logo/site.webmanifest">
+<meta name="theme-color" content="#06080f">
 
 <style>
   :root {
@@ -40,10 +45,8 @@
   nav.scrolled { border-bottom-color: var(--line); }
   .nav-in { display: flex; align-items: center; gap: 34px; height: 64px; }
   .logo { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 17px; letter-spacing: .3px; }
-  .logo .mark {
-    width: 26px; height: 26px; border-radius: 8px; background: var(--grad);
-    display: grid; place-items: center; font-size: 14px; color: #06121f; font-weight: 900;
-  }
+  .logo .mark { width: 30px; height: 30px; display: block; flex: 0 0 auto; }
+  .logo .mark svg { width: 100%; height: 100%; display: block; filter: drop-shadow(0 0 8px rgba(79, 140, 255, .45)); }
   .nav-links { display: flex; gap: 26px; font-size: 14px; color: var(--dim); }
   .nav-links a:hover { color: var(--txt); }
   .nav-gh { margin-left: auto; font-size: 13.5px; color: var(--dim); }
@@ -247,9 +250,16 @@
 </head>
 <body>
 
+<!-- 品牌主 mark 的共享渐变（页内两处 logo 引用）；正本文件见 assets/logo/ -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <linearGradient id="al-brand-grad" x1="14" y1="58" x2="46" y2="2" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#4f8cff"/><stop offset=".55" stop-color="#5fc6ff"/><stop offset="1" stop-color="#38e1c6"/>
+  </linearGradient>
+</defs></svg>
+
 <nav id="nav">
   <div class="wrap nav-in">
-    <a class="logo" href="#top"><span class="mark">L</span>AgentLink</a>
+    <a class="logo" href="#top"><span class="mark"><svg viewBox="0 0 64 64" role="img" aria-label="AgentLink"><g fill="none" stroke="url(#al-brand-grad)" stroke-linecap="round"><path d="M24 44.5C22.4 33 25.4 24 31.4 19" stroke-width="11.5"/><path d="M21 46.5H42.5" stroke-width="12"/><path d="M27 52v5.5M37 52v5.5" stroke-width="5.6" opacity=".9"/></g><ellipse cx="35" cy="14" rx="8.8" ry="7.2" transform="rotate(-10 35 14)" fill="#0a1220" stroke="#38e1c6" stroke-width="3.9"/><circle cx="33.4" cy="12.6" r="2.6" fill="#eafcff"/><g fill="#38e1c6"><circle cx="31.2" cy="3.8" r="3.2"/><circle cx="40.4" cy="4.2" r="3.2"/></g><g fill="#eafcff"><circle cx="23.4" cy="36" r="3"/><circle cx="25.8" cy="26.8" r="3"/></g></svg></span>AgentLink</a>
     <div class="nav-links">
       <a href="#features">核心能力</a>
       <a href="#console">控制台</a>
@@ -480,7 +490,7 @@
 
 <footer>
   <div class="wrap foot">
-    <a class="logo" href="#top"><span class="mark">L</span>AgentLink</a>
+    <a class="logo" href="#top"><span class="mark"><svg viewBox="0 0 64 64" role="img" aria-label="AgentLink"><g fill="none" stroke="url(#al-brand-grad)" stroke-linecap="round"><path d="M24 44.5C22.4 33 25.4 24 31.4 19" stroke-width="11.5"/><path d="M21 46.5H42.5" stroke-width="12"/><path d="M27 52v5.5M37 52v5.5" stroke-width="5.6" opacity=".9"/></g><ellipse cx="35" cy="14" rx="8.8" ry="7.2" transform="rotate(-10 35 14)" fill="#0a1220" stroke="#38e1c6" stroke-width="3.9"/><circle cx="33.4" cy="12.6" r="2.6" fill="#eafcff"/><g fill="#38e1c6"><circle cx="31.2" cy="3.8" r="3.2"/><circle cx="40.4" cy="4.2" r="3.2"/></g><g fill="#eafcff"><circle cx="23.4" cy="36" r="3"/><circle cx="25.8" cy="26.8" r="3"/></g></svg></span>AgentLink</a>
     <span class="dim">局域网里的 AI Agent 消息总线 · 单二进制零依赖 · 数据不出内网</span>
     <a class="dim" href="https://github.com/weifengchui/AgentLink" target="_blank" rel="noopener">GitHub ↗</a>
     <span class="dim">© 2026 AgentLink</span>

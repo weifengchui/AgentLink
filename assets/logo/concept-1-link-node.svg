@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="AgentLink concept 1: Link Node">
+  <title>AgentLink · Concept 1 — Link Node（A 形链路）</title>
+  <g fill="none" stroke-linecap="round">
+    <!-- A 的两条腿 = 两台机器之间的链路 -->
+    <path d="M32 12 L13 50" stroke="#4f8cff" stroke-width="8"/>
+    <path d="M32 12 L51 50" stroke="#4f8cff" stroke-width="8"/>
+    <!-- 横梁 = 消息总线（青色高亮段是正在传输的一帧） -->
+    <path d="M21 38 L43 38" stroke="#1b6fd6" stroke-width="8"/>
+    <path d="M26 38 L36 38" stroke="#38e1c6" stroke-width="8"/>
+  </g>
+  <!-- 三个节点：agent / 本机节点 / 对端节点 -->
+  <g>
+    <circle cx="32" cy="12" r="6.5" fill="#0a1220" stroke="#38e1c6" stroke-width="3"/>
+    <circle cx="13" cy="50" r="6.5" fill="#38e1c6"/>
+    <circle cx="51" cy="50" r="6.5" fill="#e7ecf6"/>
+  </g>
+</svg>

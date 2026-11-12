@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="AgentLink app icon">
+  <title>AgentLink · 应用图标（圆角方底 + 星点 + 发光长颈鹿）</title>
+  <defs>
+    <radialGradient id="ali-bg" cx=".3" cy=".18" r="1.05">
+      <stop offset="0" stop-color="#13233f"/>
+      <stop offset=".55" stop-color="#0a1224"/>
+      <stop offset="1" stop-color="#04060d"/>
+    </radialGradient>
+    <linearGradient id="ali-bus" x1="16" y1="56" x2="42" y2="4" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4f8cff"/>
+      <stop offset=".55" stop-color="#63d2ff"/>
+      <stop offset="1" stop-color="#38e1c6"/>
+    </linearGradient>
+    <filter id="ali-glow" x="-70%" y="-70%" width="240%" height="240%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="1.6" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <clipPath id="ali-clip"><rect width="64" height="64" rx="14.5"/></clipPath>
+  </defs>
+  <g clip-path="url(#ali-clip)">
+    <rect width="64" height="64" fill="url(#ali-bg)"/>
+    <g fill="#8b97ad" opacity=".5">
+      <circle cx="8" cy="52" r=".9"/><circle cx="14" cy="58" r=".6"/><circle cx="55" cy="9" r=".9"/>
+      <circle cx="60" cy="20" r=".6"/><circle cx="52" cy="4" r=".5"/><circle cx="4" cy="11" r=".6"/>
+      <circle cx="26" cy="5" r=".5"/><circle cx="44" cy="58" r=".6"/>
+    </g>
+    <circle cx="32" cy="32" r="27" fill="none" stroke="#1b3a6b" stroke-width="1" opacity=".7"/>
+    <g transform="translate(32 32) scale(.78) translate(-32 -32)" filter="url(#ali-glow)">
+      <g fill="none" stroke="url(#ali-bus)" stroke-linecap="round">
+        <path d="M23 44 C21.8 33 24.4 24.6 30 20" stroke-width="7"/>
+        <path d="M22 46 H42" stroke-width="7.5"/>
+        <path d="M43 44.6 L47.6 40.4" stroke-width="3.6" opacity=".85"/>
+        <path d="M27.5 50 V55 M38 50 V55" stroke-width="3.4" opacity=".8"/>
+        <path d="M31 10.4 L30.2 5.8 M36.6 10 L37.6 5.8" stroke-width="2.6"/>
+        <path d="M28 12 L24.6 9.8" stroke-width="3.4" opacity=".9"/>
+      </g>
+      <ellipse cx="33" cy="15.4" rx="6.6" ry="5.4" transform="rotate(-12 33 15.4)" fill="#0a1220" stroke="#38e1c6" stroke-width="2.3"/>
+      <g fill="#38e1c6">
+        <circle cx="30" cy="4.8" r="2"/><circle cx="38" cy="4.8" r="2"/>
+      </g>
+      <circle cx="31.6" cy="13.8" r="1.5" fill="#f4fdff"/>
+      <circle cx="38" cy="16.4" r="1" fill="#5fc6ff"/>
+      <g fill="#eafcff">
+        <circle cx="23.2" cy="38.4" r="1.8"/><circle cx="24" cy="32" r="1.8"/><circle cx="25.6" cy="25.8" r="1.8"/>
+      </g>
+      <g fill="#dff2ff" opacity=".55">
+        <circle cx="31" cy="46" r="2"/><circle cx="37.5" cy="46" r="2"/>
+      </g>
+      <g fill="#6fa8ff">
+        <circle cx="48.6" cy="39.4" r="2"/><circle cx="27.5" cy="56.4" r="2.3"/><circle cx="38" cy="56.4" r="2.3"/>
+      </g>
+    </g>
+  </g>
+</svg>

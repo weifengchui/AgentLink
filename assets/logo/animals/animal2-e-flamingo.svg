@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="AgentLink">
+  <title>AgentLink · E2 火烈鸟（S 长颈 + 单足，最简笔）</title>
+  <defs>
+    <linearGradient id="an2-e" x1="10" y1="56" x2="42" y2="8" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4f8cff"/>
+      <stop offset=".55" stop-color="#5fc6ff"/>
+      <stop offset="1" stop-color="#38e1c6"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke="url(#an2-e)" stroke-linecap="round">
+    <path d="M14.5 43 C13 36 19 31 26 32.4 C32 33.6 35 37.6 34.4 42" stroke-width="7"/>
+    <path d="M14.5 43 C10.8 42.6 8.8 40 9.4 37" stroke-width="3.4" opacity=".85"/>
+    <path d="M33.6 39.4 C40 36 38.6 26 34 20.5 C30.6 16.4 26.4 16.4 24.8 20.4" stroke-width="5.5"/>
+    <path d="M37.6 31.4 V28" stroke="#eafcff" stroke-width="2.2"/>
+    <path d="M27.5 44.5 V55.5" stroke-width="3.4" opacity=".85"/>
+    <path d="M24 56.8 H31.5" stroke-width="3.2" opacity=".85"/>
+  </g>
+  <circle cx="24.2" cy="22" r="4.4" fill="#0a1220" stroke="#38e1c6" stroke-width="2.1"/>
+  <path d="M21.2 22.6 C18.4 24.2 16.4 26.2 15.4 28 C18 26.6 20.6 25.6 22.2 25.6 Z" fill="#38e1c6"/>
+  <circle cx="23.4" cy="21" r="1.25" fill="#eafcff"/>
+</svg>

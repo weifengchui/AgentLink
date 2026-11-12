@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="AgentLink concept 3: Bus L">
+  <title>AgentLink · Concept 3 — Bus L（字母 L = 链路总线）</title>
+  <!-- 字形 L：竖直 = 本机进程，水平 = 对端机器，直角 = 交换机 -->
+  <g fill="none" stroke-linecap="square" stroke-linejoin="miter">
+    <path d="M18 8 L18 46 L52 46" stroke="#4f8cff" stroke-width="10"/>
+  </g>
+  <!-- 高光段：一帧消息正沿总线走向对端 -->
+  <path d="M18 30 L18 46 L34 46" fill="none" stroke="#38e1c6" stroke-width="4" stroke-linecap="butt"/>
+  <!-- 分支：一条总线挂多台 agent -->
+  <g fill="none" stroke="#2a4f80" stroke-width="3" stroke-linecap="square">
+    <path d="M30 46 L30 56"/>
+    <path d="M42 46 L42 56"/>
+  </g>
+  <!-- 端点节点 -->
+  <g>
+    <circle cx="18" cy="8" r="5.5" fill="#0a1220" stroke="#38e1c6" stroke-width="2.5"/>
+    <circle cx="52" cy="46" r="5.5" fill="#e7ecf6"/>
+    <circle cx="30" cy="57.5" r="3" fill="#4f8cff"/>
+    <circle cx="42" cy="57.5" r="3" fill="#4f8cff"/>
+  </g>
+</svg>

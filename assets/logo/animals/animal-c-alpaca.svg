@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="AgentLink">
+  <title>AgentLink · C 羊驼（直颈总线 + 颈环链路）</title>
+  <defs>
+    <linearGradient id="ani-c" x1="14" y1="56" x2="34" y2="4" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4f8cff"/>
+      <stop offset=".55" stop-color="#5fc6ff"/>
+      <stop offset="1" stop-color="#38e1c6"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke="url(#ani-c)" stroke-linecap="round">
+    <path d="M20 19 V45" stroke-width="6.5"/>
+    <path d="M20.5 46.5 H40" stroke-width="7"/>
+    <path d="M41.5 45.6 C45 44 45.8 40.4 43.8 38.2" stroke-width="3.4" opacity=".85"/>
+    <path d="M26 50 V55 M35.5 50 V55" stroke-width="3.2" opacity=".8"/>
+    <path d="M19.6 8.8 L18 3.6 M24.6 8.4 L26.2 3.6" stroke-width="2.8"/>
+    <path d="M16.3 29 H23.7" stroke="#38e1c6" stroke-width="2.4"/>
+  </g>
+  <circle cx="22" cy="13.8" r="5.2" fill="#0a1220" stroke="#38e1c6" stroke-width="2.2"/>
+  <g fill="#eafcff">
+    <circle cx="20.2" cy="12.9" r="1.2"/>
+    <circle cx="24" cy="12.9" r="1.2"/>
+  </g>
+  <path d="M20.9 16 Q22.1 17.2 23.3 16" fill="none" stroke="#eafcff" stroke-width="1.2" stroke-linecap="round" opacity=".85"/>
+  <g fill="#4f8cff">
+    <circle cx="26" cy="56.4" r="2.2"/>
+    <circle cx="35.5" cy="56.4" r="2.2"/>
+  </g>
+</svg>
